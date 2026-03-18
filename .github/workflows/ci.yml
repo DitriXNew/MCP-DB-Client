@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build DLL (Release)
+        shell: bash
+        run: |
+          cd http-1c-dll
+          rm -rf build
+          mkdir build
+          cd build
+          cmake .. -G "Ninja" -DCMAKE_BUILD_TYPE=Release
+          cmake --build .
+
+      - name: Build tests
+        shell: bash
+        run: |
+          cd tests
+          rm -rf build
+          mkdir build
+          cd build
+          cmake .. -G "Ninja" -DCMAKE_BUILD_TYPE=Release
+          cmake --build .
+
+      - name: Run tests
+        shell: bash
+        run: |
+          cd tests/build
+          ./http1c_tests.exe

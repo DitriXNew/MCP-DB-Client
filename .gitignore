@@ -1,0 +1,56 @@
+.conf-editor/
+.vscode/
+.vs/
+.idea/
+
+# Local logs and caches
+*.log
+*.tmp
+*.cache
+http_debug.log
+
+# 1C package artifacts
+*.epf
+*.erf
+*.cf
+*.cfe
+*.cfu
+*.cfl
+*.dt
+
+# Native/CMake build artifacts
+*.obj
+*.obj.d
+*.o
+*.a
+*.lib
+*.so
+*.dll
+*.exp
+*.ilk
+*.pdb
+*.res
+*.manifest
+*.rsp
+
+# Downloaded build tools
+build/tools/
+
+# Packaged add-in artifacts
+build/artifacts/
+
+# CMake and out-of-source build directories
+http-1c-dll/build/
+http-1c-dll/artifacts/
+tests/build/
+build_dbg/
+bin/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+CMakeFiles/
+
+# OS-specific noise
+Thumbs.db
+.DS_Store
+/.claude

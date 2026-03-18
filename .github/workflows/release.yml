@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build DLL (Release)
+        shell: bash
+        run: |
+          cd http-1c-dll
+          rm -rf build
+          mkdir build
+          cd build
+          cmake .. -G "Ninja" -DCMAKE_BUILD_TYPE=Release
+          cmake --build .
+
+      - name: Build and run tests
+        shell: bash
+        run: |
+          cd tests
+          rm -rf build
+          mkdir build
+          cd build
+          cmake .. -G "Ninja" -DCMAKE_BUILD_TYPE=Release
+          cmake --build .
+          ./http1c_tests.exe
+
+      - name: Package add-in
+        shell: bash
+        run: bash build/package-http1c-addin.sh
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Rename artifacts with version
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          cp "build/artifacts/http1c-addin.zip" "build/artifacts/http1c-addin-v${VERSION}.zip"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "http1c v${{ steps.version.outputs.VERSION }}"
+          generate_release_notes: true
+          files: |
+            build/artifacts/http1c-addin-v${{ steps.version.outputs.VERSION }}.zip
