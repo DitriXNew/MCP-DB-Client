@@ -67,6 +67,14 @@ long DestroyObject(IComponentBase** pInterface)
 	return 0;
 }
 
+static AppCapabilities g_capabilities = eAppCapabilitiesInvalid;
+
+AppCapabilities SetPlatformCapabilities(const AppCapabilities capabilities)
+{
+	g_capabilities = capabilities;
+	return eAppCapabilitiesLast;
+}
+
 std::string WC2MB(const std::wstring& wstr)
 {
 	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;

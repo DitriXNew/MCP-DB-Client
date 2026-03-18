@@ -32,14 +32,15 @@ MCP Client ←→ Native DLL (C++ httplib) ←→ 1C:Enterprise (BSL via Externa
 - String conversion: `MB2WCHAR()` / `WCHAR2MB()` for UTF-8 ↔ UTF-16
 - Thread safety: Separate mutexes per resource (`toolsMutex`, `resourcesMutex`, `sessionMutex`, etc.)
 - Events to 1C: `ExtEvent(u"HttpServer", u"EventName", data)` 
-- Method registration: `AddProcedure()` / `AddFunction()` with EN/RU names
+- Method registration: `AddProcedure()` / `AddFunction()` / `AddProperty()` with EN/RU names
 - Version: Defined in `version.h` as `VERSION_SEMVER`
 
 ### BSL (http-1c-dp/http1c/Forms/Form/Ext/Form/Module.bsl)
 
-- All client-side handlers are `Async Procedure`
+- Client-side handlers are `&AtClient` procedures (no Async/Await)
 - Server calls for metadata/computation use `&AtServer` functions
-- Component interaction via `Await Component.MethodAsync()`
+- Component configuration via synchronous property assignments: `Component.PropertyName = Value`
+- Component methods via `BeginCalling<MethodName>` with `NotifyDescription` callbacks
 - DO NOT use reserved 1C names as local variables (`Catalogs`, `Documents`, `Metadata`, etc.)
 - JSON: `JSONReader`/`JSONWriter` + `ReadJSON()`/`WriteJSON()`
 - Error pattern: Try/Except → `SendToolError()` / `SendResourceError()` / `SendPromptError()`
@@ -82,7 +83,7 @@ Both scripts auto-detect Visual Studio Build Tools and CMake.
 ## Security
 
 - Origin validation: localhost, 127.0.0.1, [::1], vscode-* only
-- Bearer token auth: Optional, set via `SetAuthToken()`
+- Bearer token auth: Optional, set via `AuthToken` property
 - Rate limiting: Token bucket (60 burst, 20/sec)
 - Binding: 127.0.0.1 only (not 0.0.0.0)
 

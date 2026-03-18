@@ -159,10 +159,10 @@ Call `RegisterToolsAsync()` / `RegisterResourcesAsync()` / `RegisterPromptsAsync
 
 ```bsl
 // Set a bearer token (all requests must include Authorization: Bearer <token>)
-Await Component.SetAuthTokenAsync("my-secret-token");
+Component.AuthToken = "my-secret-token";
 
 // Remove authentication requirement
-Await Component.SetAuthTokenAsync("");
+Component.AuthToken = "";
 ```
 
 The component enforces:
@@ -180,13 +180,20 @@ Methods exposed to 1C (English / Russian names):
 | `StopListen()` / `ОстановитьПрослушивание` | Stop the server and unblock all pending requests |
 | `SendResponse(json)` / `ОтправитьОтвет` | Send the final response for a pending request |
 | `SendProgress(id, progress, total, message)` / `ОтправитьПрогресс` | Send a progress notification for a pending request |
-| `RegisterTools(json)` / `ЗарегистрироватьИнструменты` | Register/update the tool list |
-| `RegisterResources(json)` / `ЗарегистрироватьРесурсы` | Register/update the resource list |
-| `RegisterPrompts(json)` / `ЗарегистрироватьПромпты` | Register/update the prompt list |
-| `SetAuthToken(token)` / `УстановитьТокенАвторизации` | Set bearer token for authentication |
-| `SetTimeout(seconds)` / `УстановитьТаймаут` | Set response timeout (default: 30s) |
-| `GetStatus()` / `ПолучитьСтатус` | Returns JSON with server status |
-| `ConfigureLogging(enabled, path)` / `НастроитьЛогирование` | Configure runtime logging |
+
+Properties exposed to 1C:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `Status` / `Статус` | Read-only | Returns JSON with server status |
+| `Timeout` / `Таймаут` | Read/Write | Response timeout in seconds (default: 30) |
+| `AuthToken` / `ТокенАвторизации` | Write-only | Bearer token for authentication (empty = no auth) |
+| `LoggingEnabled` / `ЛогированиеВключено` | Read/Write | Whether runtime logging is active |
+| `LogPath` / `ПутьЛога` | Read/Write | Path to the log file |
+| `Tools` / `Инструменты` | Write-only | Register/update the tool list (JSON array) |
+| `Resources` / `Ресурсы` | Write-only | Register/update the resource list (JSON array) |
+| `Prompts` / `Промпты` | Write-only | Register/update the prompt list (JSON array) |
+| `Version` / `Версия` | Read-only | Component version string |
 
 ## ExternalEvent Types
 
@@ -437,12 +444,25 @@ http1c.epf
 - The current tool set mixes practical helpers with demo functionality such as `runLongTask`.
 - There is no packaging or deployment flow yet for distributing the add-in as a polished product.
 
+## Testing & Deployment Notes
+
+When updating the native add-in DLL during development:
+
+1. **Clear the component cache.** 1C caches native add-ins in a temporary directory. Delete the cache folder before loading a new version:
+   ```text
+   %APPDATA%\1C\1cv8\ExtCompT
+   ```
+2. **Restart the 1C session.** Close the 1C application completely and reopen it — a running session keeps the old DLL locked.
+3. **Disable dangerous action protection.** In the 1C user settings, uncheck *"Protection from dangerous actions"* (`Защита от опасных действий`). Otherwise the platform will block add-in attachment.
+
+Without these steps the platform may silently load an outdated DLL or refuse to attach the add-in.
+
 ## Version
 
 The native component version defined in the source is:
 
 ```text
-1.0.1
+1.3.0
 ```
 
 ## License
