@@ -4,6 +4,54 @@
 
 Use it as a template to expose any 1C business logic — catalogs, documents, reports, calculations — to AI applications like VS Code Copilot, Claude Desktop, and other MCP-compatible clients.
 
+## Core Concept
+
+The project is intentionally split into two layers with different responsibilities.
+
+### Native component responsibilities
+
+The DLL is the MCP engine. It handles protocol and transport details that should not be reimplemented in 1C business code:
+
+- HTTP/SSE transport
+- JSON-RPC request/response lifecycle
+- MCP session management
+- authentication, origin validation, and rate limiting
+- pagination, notifications, and progress streaming
+- converting 1C responses into valid MCP replies
+
+### 1C responsibilities
+
+The 1C side owns business logic. A 1C developer should work at the level of tools, resources, and prompts, not at the level of MCP internals:
+
+- describe a tool/resource/prompt in BSL
+- register it in the component
+- handle the incoming call in 1C
+- run any required client-side or server-side 1C logic
+- return the result or send progress updates
+
+### Why the project is designed this way
+
+The goal is to let a 1C developer publish almost any 1C functionality through MCP without having to understand HTTP, JSON-RPC, SSE, session handling, or MCP message formatting.
+
+In other words:
+
+- the component knows how to be an MCP server
+- 1C knows what the tool actually does
+
+This keeps the integration point simple. To add new functionality, a 1C developer does not need to change the native transport layer. They only add or update 1C definitions and handlers.
+
+### Mental model for a 1C developer
+
+From the 1C side, the workflow is intentionally simple:
+
+1. Define the MCP object in BSL.
+2. Register it in the component.
+3. Receive the request through `ExternalEvent`.
+4. Execute arbitrary 1C logic.
+5. Return the final result, and optionally send progress while the operation is running.
+
+This means the project is not a fixed set of built-in utilities. It is an MCP transport and protocol layer for 1C, with the actual application behavior defined in 1C code.
+
 ## Key Features
 
 - **Full MCP protocol support** — tools, resources, prompts with `listChanged` notifications
@@ -66,16 +114,46 @@ build/compile-http1c-epf.sh
 
 Add to your `.vscode/mcp.json`:
 
+**Without authentication:**
+
 ```json
 {
   "servers": {
     "1c-mcp-server": {
-      "type": "http",
+      "type": "sse",
       "url": "http://localhost:8888/mcp"
     }
   }
 }
 ```
+
+**With Bearer token authentication:**
+
+```json
+{
+  "servers": {
+    "1c-mcp-server": {
+      "type": "sse",
+      "url": "http://localhost:8888/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:mcpToken}"
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "mcpToken",
+      "type": "promptString",
+      "description": "Bearer token for the 1C MCP server",
+      "password": true
+    }
+  ]
+}
+```
+
+When using the `${input:...}` syntax, VS Code will prompt for the token each time the MCP server connection starts. The entered value is masked as a password.
+
+> **Important:** The token in VS Code must match the value set on the 1C side. If the server has no token configured (empty string), authentication is disabled and no `headers` are needed. If a token is set on the server but VS Code sends no `Authorization` header, the server responds with HTTP 401 and VS Code may try to start an OAuth flow — this is not supported; use the `headers` approach above instead.
 
 ## How to Build Your Own MCP Server from 1C
 
@@ -157,15 +235,29 @@ Call `RegisterToolsAsync()` / `RegisterResourcesAsync()` / `RegisterPromptsAsync
 
 ### Security Configuration
 
+The component supports optional Bearer token authentication. When a token is set, every HTTP request must include the `Authorization: Bearer <token>` header or it will be rejected with HTTP 401.
+
 ```bsl
-// Set a bearer token (all requests must include Authorization: Bearer <token>)
+// Enable authentication — all requests must include Authorization: Bearer my-secret-token
 Component.AuthToken = "my-secret-token";
 
-// Remove authentication requirement
+// Disable authentication — any request is accepted
 Component.AuthToken = "";
 ```
 
-The component enforces:
+**How it works:**
+
+| Server token | Client header | Result |
+|---|---|---|
+| Empty (default) | None needed | All requests accepted |
+| `"my-secret"` | `Authorization: Bearer my-secret` | Request accepted |
+| `"my-secret"` | Missing or wrong token | HTTP 401 Unauthorized |
+
+**Changing the token at runtime:** You can set or clear `AuthToken` while the server is running. The change takes effect immediately for all new requests — no restart needed.
+
+**VS Code note:** If the server returns 401, VS Code may attempt an OAuth 2.0 PKCE authorization flow (redirecting to `/authorize`). This is **not supported** by the component. Always configure the token in `.vscode/mcp.json` via the `headers` field (see [VS Code configuration](#5-vs-code-configuration) above).
+
+The component also enforces:
 - **Origin validation** — only requests from `localhost` / `127.0.0.1` / VS Code origins are accepted
 - **Rate limiting** — token-bucket algorithm (60 burst, 20/sec)
 - **Session management** — `Mcp-Session-Id` assigned on initialize, validated on subsequent requests
