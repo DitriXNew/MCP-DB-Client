@@ -311,15 +311,42 @@ HttpServerComponent::HttpServerComponent()
                 (double)total, (std::u16string)message);
         });
 
-    // Logging configuration that can be changed from the 1C form.
-    AddProcedure(u"ConfigureLogging", u"НастроитьЛогирование",
-        [&](VH enabled, VH path) {
-            this->doConfigureLogging((bool)enabled, (std::u16string)path);
+    // Whether logging is active (read/write property).
+    AddProperty(u"LoggingEnabled", u"ЛогированиеВключено",
+        [&](VH var) { var = this->loggingEnabled; },
+        [&](VH var) {
+            this->loggingEnabled = (bool)var;
+            {
+                std::lock_guard<std::mutex> lock(g_loggingMutex);
+                g_loggingEnabled = this->loggingEnabled;
+            }
+            logToFile("Logging " + std::string(this->loggingEnabled ? "enabled" : "disabled"));
         });
 
-    // Operational status of the native listener.
-    AddFunction(u"GetStatus", u"ПолучитьСтатус",
-        [&]() {
+    // Path for the log file (read/write property).
+    AddProperty(u"LogPath", u"ПутьЛога",
+        [&](VH var) {
+            std::lock_guard<std::mutex> lock(this->loggingMutex);
+            var = MB2WCHAR(this->logPath);
+        },
+        [&](VH var) {
+            std::u16string val = (std::u16string)var;
+            std::string utf8Path = WCHAR2MB(std::basic_string_view<WCHAR_T>(
+                reinterpret_cast<const WCHAR_T*>(val.data()), val.size()));
+            {
+                std::lock_guard<std::mutex> lock(this->loggingMutex);
+                this->logPath = utf8Path.empty() ? getDefaultLogPath() : utf8Path;
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_loggingMutex);
+                g_logPath = this->logPath;
+            }
+            logToFile("Log path set to: " + this->logPath);
+        });
+
+    // Operational status of the native listener (read-only property).
+    AddProperty(u"Status", u"Статус",
+        [&](VH var) {
             json status;
             status["running"] = running.load();
             status["port"] = listenPort;
@@ -353,54 +380,33 @@ HttpServerComponent::HttpServerComponent()
             }
             status["auth_enabled"] = !authToken.empty();
             status["version"] = VERSION_SEMVER;
-            this->result = MB2WCHAR(status.dump());
+            var = MB2WCHAR(status.dump());
         });
 
-    // Timeout applied to in-flight forwarded requests.
-    AddProcedure(u"SetTimeout", u"УстановитьТаймаут",
-        [&](VH val) { this->timeout = (int)(int64_t)val; },
-        {{0, (int64_t)30}});
+    // Timeout applied to in-flight forwarded requests (read/write property).
+    AddProperty(u"Timeout", u"Таймаут",
+        [&](VH var) { var = (int64_t)this->timeout; },
+        [&](VH var) { this->timeout = (int)(int64_t)var; });
 
-    // Tool registry cache pushed by 1C.
-    AddProcedure(u"RegisterTools", u"ЗарегистрироватьИнструменты",
-        [&](VH jsonStr) { this->doRegisterTools((std::u16string)jsonStr); });
+    // Tool definitions cache (write-only property; expects JSON array).
+    AddProperty(u"Tools", u"Инструменты",
+        nullptr,
+        [&](VH var) { this->doRegisterTools((std::u16string)var); });
 
-    // Resource registry cache pushed by 1C (MCP resources primitive).
-    AddProcedure(u"RegisterResources", u"ЗарегистрироватьРесурсы",
-        [&](VH jsonStr) { this->doRegisterResources((std::u16string)jsonStr); });
+    // Resource definitions cache (write-only property; expects JSON array).
+    AddProperty(u"Resources", u"Ресурсы",
+        nullptr,
+        [&](VH var) { this->doRegisterResources((std::u16string)var); });
 
-    // Prompt registry cache pushed by 1C (MCP prompts primitive).
-    AddProcedure(u"RegisterPrompts", u"ЗарегистрироватьПромпты",
-        [&](VH jsonStr) { this->doRegisterPrompts((std::u16string)jsonStr); });
+    // Prompt definitions cache (write-only property; expects JSON array).
+    AddProperty(u"Prompts", u"Промпты",
+        nullptr,
+        [&](VH var) { this->doRegisterPrompts((std::u16string)var); });
 
-    // Set bearer token for authentication (empty string = disable auth).
-    AddProcedure(u"SetAuthToken", u"УстановитьТокенАвторизации",
-        [&](VH token) { this->doSetAuthToken((std::u16string)token); });
-}
-
-void HttpServerComponent::doConfigureLogging(bool enabled, const std::u16string& path)
-{
-    std::string utf8Path = WCHAR2MB(std::basic_string_view<WCHAR_T>(
-        reinterpret_cast<const WCHAR_T*>(path.data()), path.size()));
-
-    {
-        std::lock_guard<std::mutex> lock(loggingMutex);
-        loggingEnabled = enabled;
-        if (!utf8Path.empty()) {
-            logPath = utf8Path;
-        } else {
-            logPath = getDefaultLogPath();
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_loggingMutex);
-        g_loggingEnabled = loggingEnabled;
-        g_logPath = logPath;
-    }
-
-    logToFile("Logging configured. enabled=" + std::string(loggingEnabled ? "true" : "false")
-        + " path=" + logPath);
+    // Bearer token for authentication (write-only property; empty = no auth).
+    AddProperty(u"AuthToken", u"ТокенАвторизации",
+        nullptr,
+        [&](VH var) { this->doSetAuthToken((std::u16string)var); });
 }
 
 HttpServerComponent::~HttpServerComponent() noexcept

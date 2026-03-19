@@ -1,4 +1,5 @@
 ﻿
+
 // ============================================================================
 // MCP Server Demo — 1C:Enterprise External Data Processor
 // ============================================================================
@@ -67,7 +68,7 @@ Var DefaultLogPath;
 //   Data   = JSON string with request details
 // ---------------------------------------------------------------------------
 &AtClient
-Async Procedure ExternalEvent(Source, Event, Data)
+Procedure ExternalEvent(Source, Event, Data)
 	
 	If Source <> "HttpServer" Then
 		Return;
@@ -106,26 +107,41 @@ Procedure Connect(Command)
 EndProcedure
 
 &AtClient
-Async Procedure Disconnect(Command)
+Procedure Disconnect(Command)
 	
 	If Component <> Undefined Then
-		Await Component.StopListenAsync();
-		Component = Undefined;
-		ResetRuntimeStatus();
-		ShowMessageBox(, "Server stopped.");
+		Component.BeginCallingStopListen(
+			New NotifyDescription("StopListenEnd", ThisObject));
 	EndIf;
 	
 EndProcedure
 
 &AtClient
-Async Procedure GetStatus(Command)
+Procedure StopListenEnd(ResultCall, ParametersCall, AdditionalParameters) Export
+	
+	Component = Undefined;
+	ResetRuntimeStatus();
+	ShowMessageBox(, "Server stopped.");
+	
+EndProcedure
+
+&AtClient
+Procedure GetStatus(Command)
 	
 	If Component = Undefined Then
 		ShowMessageBox(, "Component is not connected.");
 		Return;
 	EndIf;
 	
-	ShowMessageBox(, Await BuildCombinedStatusJSON());
+	BuildCombinedStatusJSON(
+		New NotifyDescription("GetStatusShowEnd", ThisObject));
+	
+EndProcedure
+
+&AtClient
+Procedure GetStatusShowEnd(StatusJson, AdditionalParameters) Export
+	
+	ShowMessageBox(, StatusJson);
 	
 EndProcedure
 
@@ -146,7 +162,7 @@ Procedure InstallAddInEnd(AdditionalParameters) Export
 EndProcedure
 
 &AtClient
-Async Procedure AttachAddInEnd(Connected, AdditionalParameters) Export
+Procedure AttachAddInEnd(Connected, AdditionalParameters) Export
 	
 	If Not Connected Then
 		ShowMessageBox(, "AttachAddIn failed. Source: " + AddInPath);
@@ -160,33 +176,48 @@ Async Procedure AttachAddInEnd(Connected, AdditionalParameters) Export
 		Return;
 	EndTry;
 
-	ApplyLoggingSettings();
-	
 	ResetRuntimeStatus();
+	EnsureLoggingDefaults();
 	
+	// All configuration via synchronous property assignments.
+	Try
+		Component.LoggingEnabled = EnableLogging;
+		Component.LogPath = LogPath;
+		Component.Timeout = 120;
+	Except
+		ShowMessageBox(, "Configuration failed: " + ErrorDescription());
+		Return;
+	EndTry;
+	
+	// Register MCP primitives (synchronous property assignments).
+	RegisterMCPTools();
+	RegisterMCPResources();
+	RegisterMCPPrompts();
+	
+	// Start listening (async — returns via callback).
 	PortValue = Port;
 	If PortValue = 0 Then
 		PortValue = 8888;
 	EndIf;
 	
 	Try
-		Await Component.SetTimeoutAsync(120);
-	Except
-		ShowMessageBox(, "SetTimeout failed: " + ErrorDescription());
-	EndTry;
-	
-	Try
-		Await Component.StartListenAsync(PortValue);
-		ShowMessageBox(, "MCP server started on port " + Format(PortValue, "NG=0"));
+		Component.BeginCallingStartListen(
+			New NotifyDescription("StartListenEnd", ThisObject),
+			PortValue);
 	Except
 		ShowMessageBox(, "StartListen failed: " + ErrorDescription());
-		Return;
 	EndTry;
 	
-	// Register all MCP primitives: tools, resources, prompts.
-	RegisterMCPTools();
-	RegisterMCPResources();
-	RegisterMCPPrompts();
+EndProcedure
+
+&AtClient
+Procedure StartListenEnd(ResultCall, ParametersCall, AdditionalParameters) Export
+	
+	PortValue = Port;
+	If PortValue = 0 Then
+		PortValue = 8888;
+	EndIf;
+	ShowMessageBox(, "MCP server started on port " + Format(PortValue, "NG=0"));
 	
 EndProcedure
 
@@ -231,13 +262,13 @@ EndProcedure
 //   1. Create a ToolXxx() function that returns the tool definition
 //   2. Add it to the Tools array in RegisterMCPTools()
 //   3. Add a handler in ProcessToolCall() dispatcher
-//   4. Implement HandleXxx() async procedure
+//   4. Implement HandleXxx() procedure with Begin* callbacks
 // ============================================================================
 
 #Region ToolDefinitions
 
 &AtClient
-Async Procedure RegisterMCPTools()
+Procedure RegisterMCPTools()
 	
 	Tools = New Array;
 	Tools.Add(ToolGetStatus());
@@ -246,11 +277,7 @@ Async Procedure RegisterMCPTools()
 	Tools.Add(ToolEvaluate());
 	Tools.Add(ToolRunLongTask());
 	
-	Try
-		Await Component.RegisterToolsAsync(SerializeToJson(Tools));
-	Except
-		ShowMessageBox(, "RegisterTools failed: " + ErrorDescription());
-	EndTry;
+	Component.Tools = SerializeToJson(Tools);
 	
 EndProcedure
 
@@ -465,7 +492,7 @@ EndFunction
 #Region ToolDispatcher
 
 &AtClient
-Async Procedure ProcessToolCall(Data)
+Procedure ProcessToolCall(Data)
 	
 	Try
 		JSONReader = New JSONReader;
@@ -534,7 +561,7 @@ EndProcedure
 #Region ResourceDefinitions
 
 &AtClient
-Async Procedure RegisterMCPResources()
+Procedure RegisterMCPResources()
 	
 	Resources = New Array;
 	
@@ -556,11 +583,7 @@ Async Procedure RegisterMCPResources()
 	Resource.Insert("mimeType", "application/json");
 	Resources.Add(Resource);
 	
-	Try
-		Await Component.RegisterResourcesAsync(SerializeToJson(Resources));
-	Except
-		ShowMessageBox(, "RegisterResources failed: " + ErrorDescription());
-	EndTry;
+	Component.Resources = SerializeToJson(Resources);
 	
 EndProcedure
 
@@ -594,7 +617,7 @@ EndProcedure
 #Region PromptDefinitions
 
 &AtClient
-Async Procedure RegisterMCPPrompts()
+Procedure RegisterMCPPrompts()
 	
 	Prompts = New Array;
 	
@@ -624,11 +647,7 @@ Async Procedure RegisterMCPPrompts()
 	Prompt.Insert("arguments", PromptArgs);
 	Prompts.Add(Prompt);
 	
-	Try
-		Await Component.RegisterPromptsAsync(SerializeToJson(Prompts));
-	Except
-		ShowMessageBox(, "RegisterPrompts failed: " + ErrorDescription());
-	EndTry;
+	Component.Prompts = SerializeToJson(Prompts);
 	
 EndProcedure
 
@@ -642,7 +661,7 @@ EndProcedure
 #Region ResourceDispatcher
 
 &AtClient
-Async Procedure ProcessResourceRead(Data)
+Procedure ProcessResourceRead(Data)
 	
 	Try
 		JSONReader = New JSONReader;
@@ -679,7 +698,7 @@ EndProcedure
 #Region PromptDispatcher
 
 &AtClient
-Async Procedure ProcessPromptGet(Data)
+Procedure ProcessPromptGet(Data)
 	
 	Try
 		JSONReader = New JSONReader;
@@ -717,10 +736,12 @@ EndProcedure
 #Region ToolHandlers
 
 &AtClient
-Async Procedure HandleGetStatus(RequestID)
+Procedure HandleGetStatus(RequestID)
 	
 	Try
-		SendToolResult(RequestID, Await BuildCombinedStatusJSON());
+		Context = New Structure("RequestID", RequestID);
+		BuildCombinedStatusJSON(
+			New NotifyDescription("HandleGetStatusEnd", ThisObject, Context));
 	Except
 		MarkRuntimeFailure("Status retrieval failed: " + ErrorDescription());
 		SendToolError(RequestID, RuntimeStatus.LastError);
@@ -729,7 +750,14 @@ Async Procedure HandleGetStatus(RequestID)
 EndProcedure
 
 &AtClient
-Async Procedure HandleOpenForm(RequestID, Arguments)
+Procedure HandleGetStatusEnd(StatusJson, AdditionalParameters) Export
+	
+	SendToolResult(AdditionalParameters.RequestID, StatusJson);
+	
+EndProcedure
+
+&AtClient
+Procedure HandleOpenForm(RequestID, Arguments)
 	
 	FormPath = GetArg(Arguments, "formPath");
 	If Not ValueIsFilled(FormPath) Then
@@ -756,7 +784,7 @@ Async Procedure HandleOpenForm(RequestID, Arguments)
 EndProcedure
 
 &AtClient
-Async Procedure HandleExecute(RequestID, Arguments)
+Procedure HandleExecute(RequestID, Arguments)
 	
 	Code = GetArg(Arguments, "code");
 	If Not ValueIsFilled(Code) Then
@@ -790,7 +818,7 @@ Function ExecuteCodeOnServer(Val Code)
 EndFunction
 
 &AtClient
-Async Procedure HandleEvaluate(RequestID, Arguments)
+Procedure HandleEvaluate(RequestID, Arguments)
 	
 	Expression = GetArg(Arguments, "expression");
 	If Not ValueIsFilled(Expression) Then
@@ -823,7 +851,7 @@ Function EvaluateOnServer(Val Expression)
 EndFunction
 
 &AtClient
-Async Procedure HandleRunLongTask(RequestID, Arguments)
+Procedure HandleRunLongTask(RequestID, Arguments)
 	
 	Steps = Max(1, NumberOrDefault(GetArg(Arguments, "steps"), 5));
 	IterationsPerStep = Max(1, NumberOrDefault(GetArg(Arguments, "iterationsPerStep"), 4000000));
@@ -879,7 +907,7 @@ EndFunction
 #Region ResourceHandlers
 
 &AtClient
-Async Procedure HandleReadCatalogs(RequestID, URI)
+Procedure HandleReadCatalogs(RequestID, URI)
 	
 	CatalogData = GetCatalogMetadataOnServer();
 	
@@ -917,7 +945,7 @@ Function GetCatalogMetadataOnServer()
 EndFunction
 
 &AtClient
-Async Procedure HandleReadDocuments(RequestID, URI)
+Procedure HandleReadDocuments(RequestID, URI)
 	
 	DocumentData = GetDocumentMetadataOnServer();
 	
@@ -972,7 +1000,7 @@ EndFunction
 #Region PromptHandlers
 
 &AtClient
-Async Procedure HandlePromptAnalyze(RequestID, Arguments)
+Procedure HandlePromptAnalyze(RequestID, Arguments)
 	
 	Topic = GetArg(Arguments, "topic");
 	If Not ValueIsFilled(Topic) Then
@@ -1026,7 +1054,7 @@ Function GetMetadataSummaryOnServer()
 EndFunction
 
 &AtClient
-Async Procedure HandlePromptGenerateCode(RequestID, Arguments)
+Procedure HandlePromptGenerateCode(RequestID, Arguments)
 	
 	Task = GetArg(Arguments, "task");
 	If Not ValueIsFilled(Task) Then
@@ -1040,7 +1068,7 @@ Async Procedure HandlePromptGenerateCode(RequestID, Arguments)
 		+ "Follow these coding conventions:"
 		+ Chars.LF + "- Use meaningful Russian or English variable names"
 		+ Chars.LF + "- Add comments explaining business logic"
-		+ Chars.LF + "- Use Async/Await for long operations"
+		+ Chars.LF + "- Use Begin* callback pattern for component calls"
 		+ Chars.LF + "- Handle errors with Try/Except"
 		+ Chars.LF + "- Separate server and client code with proper directives"
 		+ Chars.LF + Chars.LF
@@ -1165,7 +1193,8 @@ Procedure ApplyLoggingSettings()
 	EndIf;
 	
 	Try
-		Component.ConfigureLoggingAsync(EnableLogging, LogPath);
+		Component.LoggingEnabled = EnableLogging;
+		Component.LogPath = LogPath;
 	Except
 		ShowMessageBox(, "ConfigureLogging failed: " + ErrorDescription());
 	EndTry;
@@ -1173,7 +1202,7 @@ Procedure ApplyLoggingSettings()
 EndProcedure
 
 &AtClient
-Async Function BuildCombinedStatusJSON()
+Procedure BuildCombinedStatusJSON(Callback)
 	
 	EnsureRuntimeStatus();
 	
@@ -1181,16 +1210,28 @@ Async Function BuildCombinedStatusJSON()
 	StatusPayload.Insert("runtimeStatus", RuntimeStatus);
 	
 	If Component <> Undefined Then
-		ComponentStatusResult = Await Component.GetStatusAsync();
-		ComponentStatusJson = ComponentStatusResult.Value;
-		StatusPayload.Insert("componentStatus", ParseJsonArgument(ComponentStatusJson, ComponentStatusJson));
+		Context = New Structure("Callback,StatusPayload", Callback, StatusPayload);
+		Try
+			StatusJson = Component.Status;
+		Except
+			StatusJson = "";
+		EndTry;
+		BuildCombinedStatusEnd(StatusJson, Context);
 	Else
 		StatusPayload.Insert("componentStatus", New Structure("running", False));
+		ExecuteNotifyProcessing(Callback, SerializeToJson(StatusPayload));
 	EndIf;
 	
-	Return SerializeToJson(StatusPayload);
+EndProcedure
+
+&AtClient
+Procedure BuildCombinedStatusEnd(ResultCall, AdditionalParameters) Export
 	
-EndFunction
+	AdditionalParameters.StatusPayload.Insert("componentStatus",
+		ParseJsonArgument(ResultCall, ResultCall));
+	ExecuteNotifyProcessing(AdditionalParameters.Callback, SerializeToJson(AdditionalParameters.StatusPayload));
+	
+EndProcedure
 
 &AtServer
 Function GetDefaultAddInSource()
@@ -1225,7 +1266,7 @@ EndFunction
 // ---- Tool transport ----
 
 &AtClient
-Async Procedure SendToolResult(RequestID, Text)
+Procedure SendToolResult(RequestID, Text)
 	
 	If Component = Undefined Then
 		Return;
@@ -1236,7 +1277,7 @@ Async Procedure SendToolResult(RequestID, Text)
 EndProcedure
 
 &AtClient
-Async Procedure SendToolError(RequestID, ErrorText)
+Procedure SendToolError(RequestID, ErrorText)
 	
 	If Component = Undefined Then
 		Return;
@@ -1247,20 +1288,22 @@ Async Procedure SendToolError(RequestID, ErrorText)
 EndProcedure
 
 &AtClient
-Async Procedure SendToolProgress(RequestID, Progress, Total, Message)
+Procedure SendToolProgress(RequestID, Progress, Total, Message)
 	
 	If Component = Undefined Then
 		Return;
 	EndIf;
 	
-	Await Component.SendProgressAsync(RequestID, Progress, Total, Message);
+	Component.BeginCallingSendProgress(
+		New NotifyDescription("EmptyCallbackHandler", ThisObject),
+		RequestID, Progress, Total, Message);
 	
 EndProcedure
 
 // ---- Resource transport ----
 
 &AtClient
-Async Procedure SendResourceResult(RequestID, ResourceResult)
+Procedure SendResourceResult(RequestID, ResourceResult)
 	
 	If Component = Undefined Then
 		Return;
@@ -1271,7 +1314,7 @@ Async Procedure SendResourceResult(RequestID, ResourceResult)
 EndProcedure
 
 &AtClient
-Async Procedure SendResourceError(RequestID, ErrorText)
+Procedure SendResourceError(RequestID, ErrorText)
 	
 	If Component = Undefined Then
 		Return;
@@ -1286,7 +1329,7 @@ EndProcedure
 // ---- Prompt transport ----
 
 &AtClient
-Async Procedure SendPromptResult(RequestID, PromptResult)
+Procedure SendPromptResult(RequestID, PromptResult)
 	
 	If Component = Undefined Then
 		Return;
@@ -1297,7 +1340,7 @@ Async Procedure SendPromptResult(RequestID, PromptResult)
 EndProcedure
 
 &AtClient
-Async Procedure SendPromptError(RequestID, ErrorText)
+Procedure SendPromptError(RequestID, ErrorText)
 	
 	If Component = Undefined Then
 		Return;
@@ -1312,13 +1355,15 @@ EndProcedure
 // ---- Common ----
 
 &AtClient
-Async Procedure SendMCPResponse(RequestID, ResultStructure)
+Procedure SendMCPResponse(RequestID, ResultStructure)
 	
 	Response = New Structure;
 	Response.Insert("id", RequestID);
 	Response.Insert("body", SerializeToJson(ResultStructure));
 	
-	Await Component.SendResponseAsync(SerializeToJson(Response));
+	Component.BeginCallingSendResponse(
+		New NotifyDescription("EmptyCallbackHandler", ThisObject),
+		SerializeToJson(Response));
 	
 EndProcedure
 
@@ -1349,7 +1394,7 @@ EndFunction
 #Region LegacyHTTP
 
 &AtClient
-Async Procedure ProcessLegacyRequest(Data)
+Procedure ProcessLegacyRequest(Data)
 	
 	Try
 		JSONReader = New JSONReader;
@@ -1366,7 +1411,7 @@ Async Procedure ProcessLegacyRequest(Data)
 EndProcedure
 
 &AtClient
-Async Procedure SendHTTPResponse(ID, Status, ResponseData, ContentType = "application/json")
+Procedure SendHTTPResponse(ID, Status, ResponseData, ContentType = "application/json")
 	
 	If Component = Undefined Then
 		Return;
@@ -1378,7 +1423,9 @@ Async Procedure SendHTTPResponse(ID, Status, ResponseData, ContentType = "applic
 	Response.Insert("content_type", ContentType);
 	Response.Insert("body", SerializeToJson(ResponseData));
 	
-	Await Component.SendResponseAsync(SerializeToJson(Response));
+	Component.BeginCallingSendResponse(
+		New NotifyDescription("EmptyCallbackHandler", ThisObject),
+		SerializeToJson(Response));
 	
 EndProcedure
 
@@ -1386,6 +1433,11 @@ EndProcedure
 
 
 #Region Utilities
+
+&AtClient
+Procedure EmptyCallbackHandler(ResultCall, ParametersCall, AdditionalParameters) Export
+	// Fire-and-forget callback for BeginCalling* component method calls.
+EndProcedure
 
 &AtClient
 Function GetArg(Arguments, ParamName)

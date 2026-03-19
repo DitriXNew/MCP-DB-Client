@@ -155,7 +155,6 @@ private:
     void doSendResponse(const std::u16string& jsonStr);
     void doSendProgress(const std::u16string& requestId, double progress, double total,
         const std::u16string& message);
-    void doConfigureLogging(bool enabled, const std::u16string& path);
     void doRegisterTools(const std::u16string& jsonStr);
     void doRegisterResources(const std::u16string& jsonStr);
     void doRegisterPrompts(const std::u16string& jsonStr);
