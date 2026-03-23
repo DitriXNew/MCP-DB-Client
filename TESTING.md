@@ -400,11 +400,87 @@ curl -s -w "\nHTTP:%{http_code}" -X DELETE http://localhost:8888/mcp \
 
 ---
 
+## Test 24: takeScreenshot — Current Process (Base64)
+
+**Action:** Call the `takeScreenshot` tool with no arguments (or `pid`: `0`).
+
+**Expected result:** A multi-part MCP content response:
+- A text item: `"Captured N window(s) for PID ..."` where N ≥ 1
+- For each window:
+  - A text item with window title, dimensions, and flags (`[MAIN]` or `[MODAL]`)
+  - An image item with `type: "image"`, `data` (base64-encoded PNG), `mimeType: "image/png"`
+
+**Verify:**
+- At least one window is captured (the 1C main window)
+- The main window is tagged with `[MAIN]`
+- Image data is present and non-empty
+- The base64 data starts with the PNG signature when decoded (`iVBOR...`)
+
+---
+
+## Test 25: takeScreenshot — With Modal Dialog
+
+**Action:**
+1. First, open a modal dialog in 1C using the `execute` tool:
+   `code: "ShowMessageBox(, ""Test modal dialog for screenshot"");"`
+   (Note: this will block — use a timeout-aware approach or call `openForm` to trigger a modal)
+2. From another client or tool, call `takeScreenshot` with the 1C process PID.
+
+**Expected result:** Multiple windows captured:
+- The main 1C window tagged with `[MAIN]`
+- The modal dialog tagged with `[MODAL]`
+- Each has its own separate screenshot image
+
+**Verify:**
+- `windowCount` ≥ 2
+- At least one window has `[MODAL]` in its description
+- At least one window has `[MAIN]` in its description
+- Both windows have valid image data
+
+---
+
+## Test 26: takeScreenshot — PNG Format
+
+**Action:** Call `takeScreenshot` with `format`: `"png"`.
+
+**Expected result:** The response includes lossless PNG images instead of JPEG:
+- Each window has `mimeType: "image/png"`
+- Image data is valid base64 PNG (starts with `iVBOR` when decoded)
+
+**Verify:**
+- The response contains base64-encoded PNG images
+- mimeType is `image/png` for each window
+
+---
+
+## Test 27: takeScreenshot — Invalid PID
+
+**Action:** Call `takeScreenshot` with `pid`: `999999999` (a non-existent process).
+
+**Expected result:** The tool returns with `isError: true` and a message like `"No visible windows found for PID 999999999"`.
+
+**Verify:** The error is reported gracefully without crashing the server.
+
+---
+
+## Test 28: List Tools — Includes takeScreenshot
+
+**Action:** Ask Copilot to list the tools available from `1c-mcp-server`.
+
+**Expected:** Seven tools are listed (five original + `takeScreenshot` + `testScreenshot`):
+- `getStatus`, `openForm`, `execute`, `evaluate`, `runLongTask`, `takeScreenshot`, `testScreenshot`
+
+**Verify:**
+- `takeScreenshot` is present with description mentioning screenshots and modal dialogs
+- It has optional parameters `pid` (number), `format` (string), and `quality` (number)
+
+---
+
 ## Summary Checklist
 
 After completing all tests, verify:
 
-- [ ] All 5 tools are visible and callable
+- [ ] All 7 tools are visible and callable
 - [ ] `getStatus` returns valid status with correct counts
 - [ ] `evaluate` correctly computes expressions
 - [ ] `execute` runs BSL code and returns results
@@ -412,6 +488,10 @@ After completing all tests, verify:
 - [ ] `openForm` handles invalid forms gracefully
 - [ ] `openForm` successfully opens an existing form
 - [ ] `runLongTask` completes with progress and returns the expected step count
+- [ ] `takeScreenshot` captures the current process main window with base64 JPEG
+- [ ] `takeScreenshot` captures modal dialogs separately with `[MODAL]` tag
+- [ ] `takeScreenshot` supports PNG format when `format` is `"png"`
+- [ ] `takeScreenshot` handles invalid PID gracefully
 - [ ] Both resources are listed
 - [ ] Catalog metadata resource returns valid data
 - [ ] Document metadata resource returns valid data

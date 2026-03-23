@@ -48,8 +48,12 @@ if command -v zip &>/dev/null; then
     (cd "$STAGE_DIR" && zip -q "$PACKAGE_PATH" ./*)
 elif command -v 7z &>/dev/null; then
     (cd "$STAGE_DIR" && 7z a -tzip "$PACKAGE_PATH" ./* > /dev/null)
+elif command -v powershell &>/dev/null; then
+    STAGE_WIN=$(cygpath -w "$STAGE_DIR")
+    PACKAGE_WIN=$(cygpath -w "$PACKAGE_PATH")
+    powershell -NoProfile -Command "Compress-Archive -Path '$STAGE_WIN\\*' -DestinationPath '$PACKAGE_WIN' -Force"
 else
-    echo "No zip tool found (zip or 7z required)"
+    echo "No zip tool found (zip, 7z, or powershell required)"
     exit 1
 fi
 cp "$PACKAGE_PATH" "$TEMPLATE_PATH"

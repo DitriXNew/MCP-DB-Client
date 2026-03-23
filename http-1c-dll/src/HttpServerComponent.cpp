@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "HttpServerComponent.h"
+#include "ScreenCapture.h"
 
 #include "../version.h"
 
@@ -407,6 +408,32 @@ HttpServerComponent::HttpServerComponent()
     AddProperty(u"AuthToken", u"ТокенАвторизации",
         nullptr,
         [&](VH var) { this->doSetAuthToken((std::u16string)var); });
+
+    // Capture screenshots of all visible windows belonging to a process.
+    // pid=0 means current process. Returns base64-encoded images.
+    // format: "jpeg" (default, smaller for AI) or "png" (lossless).
+    // quality: 1-100 JPEG quality (default 80). Ignored for PNG.
+    AddFunction(u"TakeScreenshot", u"СделатьСкриншот",
+        [&](VH pid, VH format, VH quality) {
+            unsigned long targetPid = static_cast<unsigned long>((int64_t)pid);
+            std::u16string fmtU16 = (std::u16string)format;
+            std::string fmtUtf8 = WCHAR2MB(std::basic_string_view<WCHAR_T>(
+                reinterpret_cast<const WCHAR_T*>(fmtU16.data()), fmtU16.size()));
+            int q = static_cast<int>((int64_t)quality);
+            std::string jsonResult = CaptureWindowsByPid(targetPid, fmtUtf8, q);
+            this->result = MB2WCHAR(jsonResult);
+        },
+        {{1, std::u16string(u"jpeg")}, {2, (int64_t)80}});
+
+    // Return the process ID of the current 1C:Enterprise process.
+    AddFunction(u"GetProcessId", u"ПолучитьИдентификаторПроцесса",
+        [&]() {
+#ifdef _WINDOWS
+            this->result = static_cast<int64_t>(GetCurrentProcessId());
+#else
+            this->result = static_cast<int64_t>(getpid());
+#endif
+        });
 }
 
 HttpServerComponent::~HttpServerComponent() noexcept

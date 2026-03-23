@@ -51,6 +51,12 @@ Var RuntimeStatus;
 &AtClient
 Var DefaultLogPath;
 
+&AtClient
+Var ScreenshotDataArray;
+
+&AtClient
+Var ScreenshotCurrentIndex;
+
 #EndRegion
 
 
@@ -142,6 +148,173 @@ EndProcedure
 Procedure GetStatusShowEnd(StatusJson, AdditionalParameters) Export
 	
 	ShowMessageBox(, StatusJson);
+	
+EndProcedure
+
+&AtClient
+Procedure TakeScreenshot(Command)
+	
+	If Component = Undefined Then
+		ShowMessageBox(, "Component is not connected.");
+		Return;
+	EndIf;
+	
+	PID = ScreenshotPID;
+	Format = ScreenshotFormat;
+	If Not ValueIsFilled(Format) Then
+		Format = "jpeg";
+	EndIf;
+	Quality = ScreenshotQuality;
+	If Quality = 0 Then
+		Quality = 80;
+	EndIf;
+	
+	Try
+		Component.BeginCallingTakeScreenshot(
+			New NotifyDescription("TakeScreenshotFormEnd", ThisObject),
+			PID, Format, Quality);
+	Except
+		ShowMessageBox(, "Screenshot error: " + ErrorDescription());
+	EndTry;
+	
+EndProcedure
+
+&AtClient
+Procedure TakeScreenshotFormEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+	
+	Try
+		JSONReader = New JSONReader;
+		JSONReader.SetString(ResultJson);
+		CaptureResult = ReadJSON(JSONReader, True);
+	Except
+		ShowMessageBox(, "Failed to parse result: " + ErrorDescription());
+		Return;
+	EndTry;
+	
+	Windows = Undefined;
+	If TypeOf(CaptureResult) = Type("Map") Then
+		Windows = CaptureResult["windows"];
+	ElsIf TypeOf(CaptureResult) = Type("Structure") Then
+		CaptureResult.Property("windows", Windows);
+	EndIf;
+	
+	ScreenshotDataArray = New Array;
+	ScreenshotCurrentIndex = 0;
+	
+	If Windows = Undefined Or Windows.Count() = 0 Then
+		CaptureError = "";
+		If TypeOf(CaptureResult) = Type("Map") Then
+			CaptureError = CaptureResult["error"];
+		ElsIf TypeOf(CaptureResult) = Type("Structure") Then
+			CaptureResult.Property("error", CaptureError);
+		EndIf;
+		If Not ValueIsFilled(CaptureError) Then
+			CaptureError = "No windows captured";
+		EndIf;
+		ScreenshotInfo = CaptureError;
+		ScreenshotPicture = "";
+		Return;
+	EndIf;
+	
+	For Each Win In Windows Do
+		Title = "";
+		ImageData = "";
+		IsModal = False;
+		IsMainWin = False;
+		WinWidth = 0;
+		WinHeight = 0;
+		
+		If TypeOf(Win) = Type("Map") Then
+			Title = Win["title"];
+			ImageData = Win["image"];
+			IsModal = Win["isModal"];
+			IsMainWin = Win["isMainWindow"];
+			WinWidth = Win["width"];
+			WinHeight = Win["height"];
+		ElsIf TypeOf(Win) = Type("Structure") Then
+			Win.Property("title", Title);
+			Win.Property("image", ImageData);
+			Win.Property("isModal", IsModal);
+			Win.Property("isMainWindow", IsMainWin);
+			Win.Property("width", WinWidth);
+			Win.Property("height", WinHeight);
+		EndIf;
+		
+		If Not ValueIsFilled(Title) Then
+			Title = "(no title)";
+		EndIf;
+		
+		Info = Title + " (" + String(WinWidth) + "x" + String(WinHeight) + ")";
+		If IsModal = True Then
+			Info = Info + " [MODAL]";
+		EndIf;
+		If IsMainWin = True Then
+			Info = Info + " [MAIN]";
+		EndIf;
+		
+		PicAddress = "";
+		If ValueIsFilled(ImageData) Then
+			BinData = Base64Value(ImageData);
+			PicAddress = PutToTempStorage(BinData, ThisObject.UUID);
+		EndIf;
+		
+		Item = New Structure("Title,PictureAddress", Info, PicAddress);
+		ScreenshotDataArray.Add(Item);
+	EndDo;
+	
+	If ScreenshotDataArray.Count() > 0 Then
+		ScreenshotCurrentIndex = 0;
+		ShowScreenshotByIndex(ScreenshotCurrentIndex);
+	EndIf;
+	
+EndProcedure
+
+&AtClient
+Procedure ShowScreenshotByIndex(Index)
+	
+	If ScreenshotDataArray = Undefined Or ScreenshotDataArray.Count() = 0 Then
+		ScreenshotInfo = "No screenshots";
+		ScreenshotPicture = "";
+		Return;
+	EndIf;
+	
+	Item = ScreenshotDataArray[Index];
+	ScreenshotInfo = "[" + String(Index + 1) + "/" + String(ScreenshotDataArray.Count()) + "] " + Item.Title;
+	ScreenshotPicture = Item.PictureAddress;
+	
+EndProcedure
+
+&AtClient
+Procedure PrevScreenshot(Command)
+	
+	If ScreenshotDataArray = Undefined Or ScreenshotDataArray.Count() = 0 Then
+		Return;
+	EndIf;
+	
+	If ScreenshotCurrentIndex > 0 Then
+		ScreenshotCurrentIndex = ScreenshotCurrentIndex - 1;
+	Else
+		ScreenshotCurrentIndex = ScreenshotDataArray.Count() - 1;
+	EndIf;
+	
+	ShowScreenshotByIndex(ScreenshotCurrentIndex);
+	
+EndProcedure
+
+&AtClient
+Procedure NextScreenshot(Command)
+	
+	If ScreenshotDataArray = Undefined Or ScreenshotDataArray.Count() = 0 Then
+		Return;
+	EndIf;
+	
+	If ScreenshotCurrentIndex < ScreenshotDataArray.Count() - 1 Then
+		ScreenshotCurrentIndex = ScreenshotCurrentIndex + 1;
+	Else
+		ScreenshotCurrentIndex = 0;
+	EndIf;
+	
+	ShowScreenshotByIndex(ScreenshotCurrentIndex);
 	
 EndProcedure
 
@@ -276,6 +449,8 @@ Procedure RegisterMCPTools()
 	Tools.Add(ToolExecute());
 	Tools.Add(ToolEvaluate());
 	Tools.Add(ToolRunLongTask());
+	Tools.Add(ToolTakeScreenshot());
+	Tools.Add(ToolTestScreenshot());
 	
 	Component.Tools = SerializeToJson(Tools);
 	
@@ -486,6 +661,40 @@ Function ToolRunLongTask()
 	
 EndFunction
 
+&AtClient
+Function ToolTakeScreenshot()
+	
+	Tool = NewTool("takeScreenshot",
+		"Capture screenshots of all visible windows of the 1C:Enterprise process, including modal dialogs. Returns base64-encoded JPEG images by default (smaller size, optimal for AI). Supports PNG for lossless quality.");
+	AddToolParam(Tool, "pid", "number",
+		"Process ID of the target 1C:Enterprise instance. Use 0 or omit to capture the current process.", False);
+	AddToolParam(Tool, "format", "string",
+		"Image format: 'jpeg' (default, smaller size) or 'png' (lossless).", False);
+	AddToolParam(Tool, "quality", "number",
+		"JPEG compression quality 1-100 (default 80). Lower values = smaller files. Ignored for PNG.", False);
+	AddToolAnnotations(Tool, True);  // read-only, safe
+	
+	Return Tool;
+	
+EndFunction
+
+&AtClient
+Function ToolTestScreenshot()
+	
+	Tool = NewTool("testScreenshot",
+		"Test tool for capturing screenshots and returning them as MCP image content. Takes 3 required parameters.");
+	AddToolParam(Tool, "pid", "number",
+		"Process ID of the target process. Use 0 for the current 1C process.");
+	AddToolParam(Tool, "format", "string",
+		"Image format: 'jpeg' or 'png'.");
+	AddToolParam(Tool, "quality", "number",
+		"Compression quality 1-100 (for JPEG). Ignored for PNG.");
+	AddToolAnnotations(Tool, True);  // read-only, safe
+	
+	Return Tool;
+	
+EndFunction
+
 #EndRegion
 
 
@@ -521,6 +730,10 @@ Procedure ProcessToolCall(Data)
 			HandleEvaluate(RequestID, Arguments);
 		ElsIf ToolName = "runLongTask" Then
 			HandleRunLongTask(RequestID, Arguments);
+		ElsIf ToolName = "takeScreenshot" Then
+			HandleTakeScreenshot(RequestID, Arguments);
+		ElsIf ToolName = "testScreenshot" Then
+			HandleTestScreenshot(RequestID, Arguments);
 		Else
 			SendToolError(RequestID, "Unknown tool: " + ToolName);
 		EndIf;
@@ -888,11 +1101,304 @@ Function RunLongTaskStepOnServer(Val IterationsPerStep, Val StepIndex, Val Total
 	
 EndFunction
 
+&AtClient
+Procedure HandleTakeScreenshot(RequestID, Arguments)
+	
+	PID = NumberOrDefault(GetArg(Arguments, "pid"), 0);
+	
+	Format = "jpeg";
+	ArgFormat = GetArg(Arguments, "format");
+	If ValueIsFilled(ArgFormat) Then
+		Format = ArgFormat;
+	EndIf;
+	
+	Quality = NumberOrDefault(GetArg(Arguments, "quality"), 80);
+	
+	MarkRuntimeStart(RequestID, "takeScreenshot", 1);
+	SendToolProgress(RequestID, 0, 1, "Capturing screenshots...");
+	
+	Try
+		Context = New Structure("RequestID", RequestID);
+		Component.BeginCallingTakeScreenshot(
+			New NotifyDescription("HandleTakeScreenshotEnd", ThisObject, Context),
+			PID, Format, Quality);
+	Except
+		MarkRuntimeFailure("Screenshot capture failed: " + ErrorDescription());
+		SendToolError(RequestID, RuntimeStatus.LastError);
+	EndTry;
+	
+EndProcedure
+
+&AtClient
+Procedure HandleTakeScreenshotEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+	
+	RequestID = AdditionalParameters.RequestID;
+	
+	Try
+		JSONReader = New JSONReader;
+		JSONReader.SetString(ResultJson);
+		CaptureResult = ReadJSON(JSONReader, True);
+	Except
+		MarkRuntimeFailure("Failed to parse screenshot result: " + ErrorDescription());
+		SendToolError(RequestID, RuntimeStatus.LastError);
+		Return;
+	EndTry;
+	
+	CaptureError = Undefined;
+	If TypeOf(CaptureResult) = Type("Map") Then
+		CaptureError = CaptureResult["error"];
+	ElsIf TypeOf(CaptureResult) = Type("Structure") Then
+		CaptureResult.Property("error", CaptureError);
+	EndIf;
+	
+	Windows = Undefined;
+	If TypeOf(CaptureResult) = Type("Map") Then
+		Windows = CaptureResult["windows"];
+	ElsIf TypeOf(CaptureResult) = Type("Structure") Then
+		CaptureResult.Property("windows", Windows);
+	EndIf;
+	
+	If Windows = Undefined Or Windows.Count() = 0 Then
+		If Not ValueIsFilled(CaptureError) Then
+			CaptureError = "No windows captured";
+		EndIf;
+		MarkRuntimeFailure(CaptureError);
+		SendToolError(RequestID, CaptureError);
+		Return;
+	EndIf;
+	
+	// Build MCP content array with images and descriptions.
+	Content = New Array;
+	
+	PID = 0;
+	If TypeOf(CaptureResult) = Type("Map") Then
+		PID = CaptureResult["pid"];
+	ElsIf TypeOf(CaptureResult) = Type("Structure") Then
+		CaptureResult.Property("pid", PID);
+	EndIf;
+	
+	SummaryItem = New Structure("type,text", "text",
+		"Captured " + String(Windows.Count()) + " window(s) for PID " + String(PID));
+	Content.Add(SummaryItem);
+	
+	For Each Win In Windows Do
+		Title = "";
+		If TypeOf(Win) = Type("Map") Then
+			Title = Win["title"];
+		ElsIf TypeOf(Win) = Type("Structure") Then
+			Win.Property("title", Title);
+		EndIf;
+		If Not ValueIsFilled(Title) Then
+			Title = "(no title)";
+		EndIf;
+		
+		WinWidth = 0;
+		WinHeight = 0;
+		IsModal = False;
+		IsMainWin = False;
+		ImageData = "";
+		MimeType = "image/jpeg";
+		WinError = "";
+		
+		If TypeOf(Win) = Type("Map") Then
+			WinWidth = Win["width"];
+			WinHeight = Win["height"];
+			IsModal = Win["isModal"];
+			IsMainWin = Win["isMainWindow"];
+			ImageData = Win["image"];
+			MimeType = Win["mimeType"];
+			WinError = Win["error"];
+		ElsIf TypeOf(Win) = Type("Structure") Then
+			Win.Property("width", WinWidth);
+			Win.Property("height", WinHeight);
+			Win.Property("isModal", IsModal);
+			Win.Property("isMainWindow", IsMainWin);
+			Win.Property("image", ImageData);
+			Win.Property("mimeType", MimeType);
+			Win.Property("error", WinError);
+		EndIf;
+		
+		Info = Title + " (" + String(WinWidth) + "x" + String(WinHeight) + ")";
+		If IsModal = True Then
+			Info = Info + " [MODAL]";
+		EndIf;
+		If IsMainWin = True Then
+			Info = Info + " [MAIN]";
+		EndIf;
+		
+		TextItem = New Structure("type,text", "text", Info);
+		Content.Add(TextItem);
+		
+		If ValueIsFilled(ImageData) Then
+			ImageItem = New Structure("type,data,mimeType", "image", ImageData, MimeType);
+			Content.Add(ImageItem);
+		Else
+			If Not ValueIsFilled(WinError) Then
+				WinError = "Capture failed";
+			EndIf;
+			ErrItem = New Structure("type,text", "text", "Error: " + WinError);
+			Content.Add(ErrItem);
+		EndIf;
+	EndDo;
+	
+	MarkRuntimeProgress(1, 1, "Screenshot captured: " + String(Windows.Count()) + " window(s)");
+	SendToolProgress(RequestID, 1, 1, RuntimeStatus.ProgressMessage);
+	MarkRuntimeSuccess("Screenshot captured: " + String(Windows.Count()) + " window(s)");
+	
+	// Send custom content with images (bypassing SendToolResult which only creates text).
+	ToolResult = New Structure;
+	ToolResult.Insert("content", Content);
+	SendMCPResponse(RequestID, ToolResult);
+	
+EndProcedure
+
+&AtClient
+Procedure HandleTestScreenshot(RequestID, Arguments)
+	
+	PID = NumberOrDefault(GetArg(Arguments, "pid"), 0);
+	
+	Format = "jpeg";
+	ArgFormat = GetArg(Arguments, "format");
+	If ValueIsFilled(ArgFormat) Then
+		Format = ArgFormat;
+	EndIf;
+	
+	Quality = NumberOrDefault(GetArg(Arguments, "quality"), 80);
+	
+	MarkRuntimeStart(RequestID, "testScreenshot", 1);
+	SendToolProgress(RequestID, 0, 1, "Test: capturing screenshots...");
+	
+	Try
+		Context = New Structure("RequestID", RequestID);
+		Component.BeginCallingTakeScreenshot(
+			New NotifyDescription("HandleTestScreenshotEnd", ThisObject, Context),
+			PID, Format, Quality);
+	Except
+		MarkRuntimeFailure("Test screenshot failed: " + ErrorDescription());
+		SendToolError(RequestID, RuntimeStatus.LastError);
+	EndTry;
+	
+EndProcedure
+
+&AtClient
+Procedure HandleTestScreenshotEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+	
+	RequestID = AdditionalParameters.RequestID;
+	
+	Try
+		JSONReader = New JSONReader;
+		JSONReader.SetString(ResultJson);
+		CaptureResult = ReadJSON(JSONReader, True);
+	Except
+		MarkRuntimeFailure("Failed to parse test screenshot result: " + ErrorDescription());
+		SendToolError(RequestID, RuntimeStatus.LastError);
+		Return;
+	EndTry;
+	
+	CaptureError = Undefined;
+	If TypeOf(CaptureResult) = Type("Map") Then
+		CaptureError = CaptureResult["error"];
+	ElsIf TypeOf(CaptureResult) = Type("Structure") Then
+		CaptureResult.Property("error", CaptureError);
+	EndIf;
+	
+	Windows = Undefined;
+	If TypeOf(CaptureResult) = Type("Map") Then
+		Windows = CaptureResult["windows"];
+	ElsIf TypeOf(CaptureResult) = Type("Structure") Then
+		CaptureResult.Property("windows", Windows);
+	EndIf;
+	
+	If Windows = Undefined Or Windows.Count() = 0 Then
+		If Not ValueIsFilled(CaptureError) Then
+			CaptureError = "No windows captured";
+		EndIf;
+		MarkRuntimeFailure(CaptureError);
+		SendToolError(RequestID, CaptureError);
+		Return;
+	EndIf;
+	
+	Content = New Array;
+	
+	PID = 0;
+	If TypeOf(CaptureResult) = Type("Map") Then
+		PID = CaptureResult["pid"];
+	ElsIf TypeOf(CaptureResult) = Type("Structure") Then
+		CaptureResult.Property("pid", PID);
+	EndIf;
+	
+	SummaryItem = New Structure("type,text", "text",
+		"[TEST] Captured " + String(Windows.Count()) + " window(s) for PID " + String(PID));
+	Content.Add(SummaryItem);
+	
+	For Each Win In Windows Do
+		Title = "";
+		MimeType = "image/jpeg";
+		ImageData = "";
+		IsModal = False;
+		IsMainWin = False;
+		WinWidth = 0;
+		WinHeight = 0;
+		WinError = "";
+		
+		If TypeOf(Win) = Type("Map") Then
+			Title = Win["title"];
+			MimeType = Win["mimeType"];
+			ImageData = Win["image"];
+			IsModal = Win["isModal"];
+			IsMainWin = Win["isMainWindow"];
+			WinWidth = Win["width"];
+			WinHeight = Win["height"];
+			WinError = Win["error"];
+		ElsIf TypeOf(Win) = Type("Structure") Then
+			Win.Property("title", Title);
+			Win.Property("mimeType", MimeType);
+			Win.Property("image", ImageData);
+			Win.Property("isModal", IsModal);
+			Win.Property("isMainWindow", IsMainWin);
+			Win.Property("width", WinWidth);
+			Win.Property("height", WinHeight);
+			Win.Property("error", WinError);
+		EndIf;
+		
+		If Not ValueIsFilled(Title) Then
+			Title = "(no title)";
+		EndIf;
+		
+		Info = Title + " (" + String(WinWidth) + "x" + String(WinHeight) + ")";
+		If IsModal = True Then
+			Info = Info + " [MODAL]";
+		EndIf;
+		If IsMainWin = True Then
+			Info = Info + " [MAIN]";
+		EndIf;
+		
+		TextItem = New Structure("type,text", "text", Info);
+		Content.Add(TextItem);
+		
+		If ValueIsFilled(ImageData) Then
+			ImageItem = New Structure("type,data,mimeType", "image", ImageData, MimeType);
+			Content.Add(ImageItem);
+		Else
+			If Not ValueIsFilled(WinError) Then
+				WinError = "Capture failed";
+			EndIf;
+			ErrItem = New Structure("type,text", "text", "Error: " + WinError);
+			Content.Add(ErrItem);
+		EndIf;
+	EndDo;
+	
+	MarkRuntimeProgress(1, 1, "[TEST] Screenshot captured: " + String(Windows.Count()) + " window(s)");
+	SendToolProgress(RequestID, 1, 1, RuntimeStatus.ProgressMessage);
+	MarkRuntimeSuccess("[TEST] Screenshot captured: " + String(Windows.Count()) + " window(s)");
+	
+	ToolResult = New Structure;
+	ToolResult.Insert("content", Content);
+	SendMCPResponse(RequestID, ToolResult);
+	
+EndProcedure
+
 #EndRegion
-
-
-// ============================================================================
-// RESOURCE HANDLERS
 // ============================================================================
 //
 // Each handler reads data from the 1C infobase and sends it back in

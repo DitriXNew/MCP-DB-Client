@@ -10,6 +10,8 @@ add_library(${TARGET} SHARED
 		src/AddInNative.h
 		src/HttpServerComponent.cpp
 		src/HttpServerComponent.h
+		src/ScreenCapture.cpp
+		src/ScreenCapture.h
 		src/stdafx.h)
 
 target_compile_definitions(${TARGET} PRIVATE UNICODE _UNICODE
@@ -69,5 +71,5 @@ else(UNIX)
 	target_compile_definitions(${TARGET} PRIVATE _WINDOWS
 			_SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING)
 	target_compile_options(${TARGET} PRIVATE /utf-8)
-	target_link_libraries(${TARGET} PRIVATE ws2_32)
+	target_link_libraries(${TARGET} PRIVATE ws2_32 gdiplus ole32 dwmapi)
 endif(UNIX)

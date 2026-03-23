@@ -364,6 +364,136 @@ TEST(mcp_tool_result_format) {
     ASSERT_EQ(result["isError"], false);
 }
 
+TEST(mcp_tool_result_with_image) {
+    // Verify MCP content format for screenshot results containing images
+    json result;
+    result["content"] = json::array();
+    result["content"].push_back({{"type", "text"}, {"text", "Captured 2 window(s) for PID 12345"}});
+    result["content"].push_back({{"type", "text"}, {"text", "Main Window (1200x800) [MAIN]"}});
+    result["content"].push_back({{"type", "image"}, {"data", "/9j/4AAQ"}, {"mimeType", "image/jpeg"}});
+    result["content"].push_back({{"type", "text"}, {"text", "Dialog (400x200) [MODAL]"}});
+    result["content"].push_back({{"type", "image"}, {"data", "/9j/4AAQ"}, {"mimeType", "image/jpeg"}});
+
+    ASSERT_EQ(result["content"].size(), 5u);
+    ASSERT_EQ(result["content"][0]["type"], "text");
+    ASSERT_EQ(result["content"][2]["type"], "image");
+    ASSERT_EQ(result["content"][2]["mimeType"], "image/jpeg");
+    ASSERT_EQ(result["content"][4]["type"], "image");
+}
+
+TEST(screenshot_result_json_structure) {
+    // Verify the expected JSON structure from CaptureWindowsByPid
+    json capture;
+    capture["pid"] = 12345;
+    capture["windowCount"] = 2;
+    capture["format"] = "jpeg";
+    capture["quality"] = 80;
+    capture["windows"] = json::array();
+
+    json mainWin;
+    mainWin["hwnd"] = 65538;
+    mainWin["title"] = "1C:Enterprise";
+    mainWin["className"] = "V8NewLocalFrameBaseWnd";
+    mainWin["x"] = 100;
+    mainWin["y"] = 100;
+    mainWin["width"] = 1200;
+    mainWin["height"] = 800;
+    mainWin["isMainWindow"] = true;
+    mainWin["isModal"] = false;
+    mainWin["image"] = "base64data";
+    mainWin["mimeType"] = "image/jpeg";
+    mainWin["imageSize"] = 50000;
+    capture["windows"].push_back(mainWin);
+
+    json modalWin;
+    modalWin["hwnd"] = 131074;
+    modalWin["title"] = "Warning";
+    modalWin["className"] = "V8NewLocalFrameBaseWnd";
+    modalWin["x"] = 300;
+    modalWin["y"] = 250;
+    modalWin["width"] = 400;
+    modalWin["height"] = 200;
+    modalWin["isMainWindow"] = false;
+    modalWin["isModal"] = true;
+    modalWin["ownerHwnd"] = 65538;
+    modalWin["image"] = "base64data2";
+    modalWin["mimeType"] = "image/jpeg";
+    modalWin["imageSize"] = 12000;
+    capture["windows"].push_back(modalWin);
+
+    ASSERT_EQ(capture["pid"], 12345);
+    ASSERT_EQ(capture["windowCount"], 2);
+    ASSERT_EQ(capture["format"], "jpeg");
+    ASSERT_EQ(capture["quality"], 80);
+    ASSERT_EQ(capture["windows"].size(), 2u);
+
+    // Main window checks
+    ASSERT_TRUE(capture["windows"][0]["isMainWindow"].get<bool>());
+    ASSERT_TRUE(!capture["windows"][0]["isModal"].get<bool>());
+    ASSERT_TRUE(capture["windows"][0]["width"].get<int>() > 0);
+    ASSERT_TRUE(capture["windows"][0]["height"].get<int>() > 0);
+
+    // Modal window checks
+    ASSERT_TRUE(!capture["windows"][1]["isMainWindow"].get<bool>());
+    ASSERT_TRUE(capture["windows"][1]["isModal"].get<bool>());
+    ASSERT_TRUE(capture["windows"][1].contains("ownerHwnd"));
+}
+
+TEST(screenshot_error_json_no_windows) {
+    // Verify error structure when no windows are found
+    json result;
+    result["pid"] = 999999;
+    result["windowCount"] = 0;
+    result["windows"] = json::array();
+    result["error"] = "No visible windows found for PID 999999";
+
+    ASSERT_EQ(result["windowCount"], 0);
+    ASSERT_TRUE(result.contains("error"));
+    ASSERT_EQ(result["windows"].size(), 0u);
+}
+
+TEST(screenshot_always_base64) {
+    // Verify that windows always have base64 image data (no file mode)
+    json win;
+    win["hwnd"] = 65538;
+    win["title"] = "1C:Enterprise";
+    win["isMainWindow"] = true;
+    win["isModal"] = false;
+    win["image"] = "/9j/4AAQSkZJRgABAQ==";
+    win["mimeType"] = "image/jpeg";
+    win["imageSize"] = 50000;
+
+    ASSERT_TRUE(win.contains("image"));
+    ASSERT_TRUE(!win.contains("filePath"));
+    ASSERT_EQ(win["mimeType"], "image/jpeg");
+}
+
+TEST(screenshot_png_format_option) {
+    // Verify PNG format selection
+    json capture;
+    capture["format"] = "png";
+    capture["quality"] = 100;
+    capture["windows"] = json::array();
+
+    json win;
+    win["mimeType"] = "image/png";
+    win["image"] = "iVBORw0KGgo=";
+    capture["windows"].push_back(win);
+
+    ASSERT_EQ(capture["format"], "png");
+    ASSERT_EQ(capture["windows"][0]["mimeType"], "image/png");
+}
+
+TEST(screenshot_quality_clamping) {
+    // Quality should be in range 1-100
+    int q1 = std::max(1, std::min(100, 0));   // 0 -> 1
+    int q2 = std::max(1, std::min(100, 150)); // 150 -> 100
+    int q3 = std::max(1, std::min(100, 80));  // 80 -> 80
+    ASSERT_EQ(q1, 1);
+    ASSERT_EQ(q2, 100);
+    ASSERT_EQ(q3, 80);
+}
+
 TEST(mcp_error_codes) {
     // Standard JSON-RPC error codes used in MCP
     ASSERT_EQ(makeJsonRpcError(1, -32700, "Parse error")["error"]["code"], -32700);

@@ -39,6 +39,77 @@
 			<ContextMenu name="LogPathContextMenu" id="15"/>
 			<ExtendedTooltip name="LogPathExtendedTooltip" id="16"/>
 		</InputField>
+		<UsualGroup name="ScreenshotGroup" id="17">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Screenshots</v8:content>
+				</v8:item>
+			</Title>
+			<Group>Vertical</Group>
+			<Representation>NormalSeparation</Representation>
+			<ExtendedTooltip name="ScreenshotGroupExtendedTooltip" id="18"/>
+			<ChildItems>
+				<UsualGroup name="ScreenshotParamsGroup" id="19">
+					<Group>AlwaysHorizontal</Group>
+					<Representation>None</Representation>
+					<ExtendedTooltip name="ScreenshotParamsGroupExtendedTooltip" id="20"/>
+					<ChildItems>
+						<InputField name="ScreenshotPID" id="21">
+							<DataPath>ScreenshotPID</DataPath>
+							<ContextMenu name="ScreenshotPIDContextMenu" id="22"/>
+							<ExtendedTooltip name="ScreenshotPIDExtendedTooltip" id="23"/>
+						</InputField>
+						<InputField name="ScreenshotFormat" id="24">
+							<DataPath>ScreenshotFormat</DataPath>
+							<ContextMenu name="ScreenshotFormatContextMenu" id="25"/>
+							<ExtendedTooltip name="ScreenshotFormatExtendedTooltip" id="26"/>
+						</InputField>
+						<InputField name="ScreenshotQuality" id="27">
+							<DataPath>ScreenshotQuality</DataPath>
+							<ContextMenu name="ScreenshotQualityContextMenu" id="28"/>
+							<ExtendedTooltip name="ScreenshotQualityExtendedTooltip" id="29"/>
+						</InputField>
+						<Button name="TakeScreenshotButton" id="30">
+							<Type>CommandBarButton</Type>
+							<CommandName>Form.Command.TakeScreenshot</CommandName>
+							<ExtendedTooltip name="TakeScreenshotButtonExtendedTooltip" id="31"/>
+						</Button>
+					</ChildItems>
+				</UsualGroup>
+				<UsualGroup name="ScreenshotNavGroup" id="32">
+					<Group>AlwaysHorizontal</Group>
+					<Representation>None</Representation>
+					<ExtendedTooltip name="ScreenshotNavGroupExtendedTooltip" id="33"/>
+					<ChildItems>
+						<Button name="PrevScreenshotButton" id="34">
+							<Type>CommandBarButton</Type>
+							<CommandName>Form.Command.PrevScreenshot</CommandName>
+							<ExtendedTooltip name="PrevScreenshotButtonExtendedTooltip" id="35"/>
+						</Button>
+						<InputField name="ScreenshotInfoField" id="36">
+							<DataPath>ScreenshotInfo</DataPath>
+							<ReadOnly>true</ReadOnly>
+							<HorizontalStretch>true</HorizontalStretch>
+							<ContextMenu name="ScreenshotInfoFieldContextMenu" id="37"/>
+							<ExtendedTooltip name="ScreenshotInfoFieldExtendedTooltip" id="38"/>
+						</InputField>
+						<Button name="NextScreenshotButton" id="39">
+							<Type>CommandBarButton</Type>
+							<CommandName>Form.Command.NextScreenshot</CommandName>
+							<ExtendedTooltip name="NextScreenshotButtonExtendedTooltip" id="40"/>
+						</Button>
+					</ChildItems>
+				</UsualGroup>
+				<PictureField name="ScreenshotPictureField" id="41">
+					<DataPath>ScreenshotPicture</DataPath>
+					<PictureSize>Proportionally</PictureSize>
+					<HorizontalStretch>true</HorizontalStretch>
+					<VerticalStretch>true</VerticalStretch>
+					<Height>15</Height>
+				</PictureField>
+			</ChildItems>
+		</UsualGroup>
 	</ChildItems>
 	<Attributes>
 		<Attribute name="Object" id="1">
@@ -79,6 +150,83 @@
 				<v8:item>
 					<v8:lang>en</v8:lang>
 					<v8:content>Log path</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="ScreenshotPID" id="5">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>PID</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:decimal</v8:Type>
+				<v8:NumberQualifiers>
+					<v8:Digits>10</v8:Digits>
+					<v8:FractionDigits>0</v8:FractionDigits>
+					<v8:AllowedSign>Nonnegative</v8:AllowedSign>
+				</v8:NumberQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="ScreenshotFormat" id="6">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Format</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>10</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="ScreenshotQuality" id="7">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Quality</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:decimal</v8:Type>
+				<v8:NumberQualifiers>
+					<v8:Digits>3</v8:Digits>
+					<v8:FractionDigits>0</v8:FractionDigits>
+					<v8:AllowedSign>Nonnegative</v8:AllowedSign>
+				</v8:NumberQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="ScreenshotInfo" id="8">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Window info</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="ScreenshotPicture" id="9">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Screenshot</v8:content>
 				</v8:item>
 			</Title>
 			<Type>
@@ -135,6 +283,39 @@
 				</v8:item>
 			</ToolTip>
 			<Action>GetStatus</Action>
+		</Command>
+		<Command name="TakeScreenshot" id="4">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Take screenshot</v8:content>
+				</v8:item>
+			</Title>
+			<ToolTip>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Capture screenshots of 1C windows</v8:content>
+				</v8:item>
+			</ToolTip>
+			<Action>TakeScreenshot</Action>
+		</Command>
+		<Command name="PrevScreenshot" id="5">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>&lt;</v8:content>
+				</v8:item>
+			</Title>
+			<Action>PrevScreenshot</Action>
+		</Command>
+		<Command name="NextScreenshot" id="6">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>&gt;</v8:content>
+				</v8:item>
+			</Title>
+			<Action>NextScreenshot</Action>
 		</Command>
 	</Commands>
 </Form>
