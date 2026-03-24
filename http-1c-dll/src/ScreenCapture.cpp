@@ -243,6 +243,10 @@ struct WindowInfo {
     RECT   rect;
     bool   isMainWindow;
     bool   isModal;
+    bool   isEnabled;    // IsWindowEnabled(hwnd)
+    bool   isMinimized;  // IsIconic(hwnd)
+    bool   isMaximized;  // IsZoomed(hwnd)
+    int    zOrder;       // index in EnumWindows z-order (0 = topmost for this PID)
 };
 
 struct EnumContext {
@@ -307,6 +311,10 @@ BOOL CALLBACK EnumWindowsCallback(HWND hwnd, LPARAM lParam) {
     if (info.ownerHwnd != nullptr) {
         info.isModal = !IsWindowEnabled(info.ownerHwnd);
     }
+    info.isEnabled   = (IsWindowEnabled(hwnd) != FALSE);
+    info.isMinimized = (IsIconic(hwnd)         != FALSE);
+    info.isMaximized = (IsZoomed(hwnd)         != FALSE);
+    info.zOrder      = static_cast<int>(ctx->windows.size());
 
     ctx->windows.push_back(info);
     return TRUE;
@@ -398,10 +406,36 @@ std::string CaptureWindowsByPid(unsigned long pid,
         wj["height"]       = static_cast<int>(win.rect.bottom - win.rect.top);
         wj["isMainWindow"] = win.isMainWindow;
         wj["isModal"]      = win.isModal;
+        wj["isEnabled"]    = win.isEnabled;
+        wj["isMinimized"]  = win.isMinimized;
+        wj["isMaximized"]  = win.isMaximized;
+        wj["zOrder"]       = win.zOrder;
 
+        // Always include ownerHwnd (0 means no owner / top-level window).
+        wj["ownerHwnd"] = reinterpret_cast<uintptr_t>(win.ownerHwnd);
+
+        // ownerIndex: index of the owner window in the windows array, -1 if none.
+        int ownerIdx = -1;
         if (win.ownerHwnd) {
-            wj["ownerHwnd"] = reinterpret_cast<uintptr_t>(win.ownerHwnd);
+            for (int k = 0; k < static_cast<int>(ctx.windows.size()); k++) {
+                if (ctx.windows[k].hwnd == win.ownerHwnd) { ownerIdx = k; break; }
+            }
         }
+        wj["ownerIndex"] = ownerIdx;
+
+        // level: depth in the owner chain within captured windows (0 = root).
+        int winLevel = 0;
+        {
+            HWND cur = win.ownerHwnd;
+            while (cur != nullptr && winLevel < 32) {
+                bool found = false;
+                for (auto& w2 : ctx.windows) {
+                    if (w2.hwnd == cur) { cur = w2.ownerHwnd; winLevel++; found = true; break; }
+                }
+                if (!found) break;
+            }
+        }
+        wj["level"] = winLevel;
 
         // Capture the window contents.
         auto imgData = CaptureWindowToImage(win.hwnd, encoderClsid, paramsPtr, grayscale);

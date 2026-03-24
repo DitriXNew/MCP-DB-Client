@@ -172,7 +172,7 @@ Procedure TakeScreenshot(Command)
 	Try
 		Component.BeginCallingTakeScreenshot(
 			New NotifyDescription("TakeScreenshotFormEnd", ThisObject),
-				PID, Format, Quality, False);
+				PID, Format, Quality, ScreenshotGrayscale);
 	Except
 		ShowMessageBox(, "Screenshot error: " + ErrorDescription());
 	EndTry;
@@ -222,6 +222,12 @@ Procedure TakeScreenshotFormEnd(ResultJson, ParametersCall, AdditionalParameters
 		IsMainWin = False;
 		WinWidth = 0;
 		WinHeight = 0;
+		WinOwnerIndex = -1;
+		WinLevel = 0;
+		WinIsEnabled = True;
+		WinIsMinimized = False;
+		WinIsMaximized = False;
+		WinZOrder = 0;
 		
 		If TypeOf(Win) = Type("Map") Then
 			Title = Win["title"];
@@ -230,6 +236,12 @@ Procedure TakeScreenshotFormEnd(ResultJson, ParametersCall, AdditionalParameters
 			IsMainWin = Win["isMainWindow"];
 			WinWidth = Win["width"];
 			WinHeight = Win["height"];
+			WinOwnerIndex = Win["ownerIndex"];
+			WinLevel = Win["level"];
+			WinIsEnabled = Win["isEnabled"];
+			WinIsMinimized = Win["isMinimized"];
+			WinIsMaximized = Win["isMaximized"];
+			WinZOrder = Win["zOrder"];
 		ElsIf TypeOf(Win) = Type("Structure") Then
 			Win.Property("title", Title);
 			Win.Property("image", ImageData);
@@ -237,19 +249,43 @@ Procedure TakeScreenshotFormEnd(ResultJson, ParametersCall, AdditionalParameters
 			Win.Property("isMainWindow", IsMainWin);
 			Win.Property("width", WinWidth);
 			Win.Property("height", WinHeight);
+			Win.Property("ownerIndex", WinOwnerIndex);
+			Win.Property("level", WinLevel);
+			Win.Property("isEnabled", WinIsEnabled);
+			Win.Property("isMinimized", WinIsMinimized);
+			Win.Property("isMaximized", WinIsMaximized);
+			Win.Property("zOrder", WinZOrder);
 		EndIf;
 		
 		If Not ValueIsFilled(Title) Then
 			Title = "(no title)";
 		EndIf;
 		
-		Info = Title + " (" + String(WinWidth) + "x" + String(WinHeight) + ")";
-		If IsModal = True Then
-			Info = Info + " [MODAL]";
-		EndIf;
+		// Build indented info string showing window hierarchy
+		Indent = "";
+		LvlIdx = 0;
+		While LvlIdx < WinLevel Do
+			Indent = Indent + "  ";
+			LvlIdx = LvlIdx + 1;
+		EndDo;
+		
+		Info = Indent + Title + " (" + String(WinWidth) + "x" + String(WinHeight) + ")";
 		If IsMainWin = True Then
 			Info = Info + " [MAIN]";
 		EndIf;
+		If IsModal = True Then
+			Info = Info + " [MODAL]";
+		EndIf;
+		If WinIsMinimized = True Then
+			Info = Info + " [MIN]";
+		EndIf;
+		If WinIsMaximized = True Then
+			Info = Info + " [MAX]";
+		EndIf;
+		If WinIsEnabled <> True Then
+			Info = Info + " [DISABLED]";
+		EndIf;
+		Info = Info + " [z=" + String(WinZOrder) + "]";
 		
 		PicAddress = "";
 		If ValueIsFilled(ImageData) Then
@@ -257,7 +293,8 @@ Procedure TakeScreenshotFormEnd(ResultJson, ParametersCall, AdditionalParameters
 			PicAddress = PutToTempStorage(BinData, ThisObject.UUID);
 		EndIf;
 		
-		Item = New Structure("Title,PictureAddress", Info, PicAddress);
+		Item = New Structure("Title,PictureAddress,Level,OwnerIndex",
+			Info, PicAddress, WinLevel, WinOwnerIndex);
 		ScreenshotDataArray.Add(Item);
 	EndDo;
 	
@@ -1208,6 +1245,12 @@ Procedure HandleTakeScreenshotEnd(ResultJson, ParametersCall, AdditionalParamete
 		ImageData = "";
 		MimeType = "image/jpeg";
 		WinError = "";
+		WinLevel = 0;
+		WinOwnerIndex = -1;
+		WinZOrder = 0;
+		WinIsEnabled = True;
+		WinIsMinimized = False;
+		WinIsMaximized = False;
 		
 		If TypeOf(Win) = Type("Map") Then
 			WinWidth = Win["width"];
@@ -1217,6 +1260,12 @@ Procedure HandleTakeScreenshotEnd(ResultJson, ParametersCall, AdditionalParamete
 			ImageData = Win["image"];
 			MimeType = Win["mimeType"];
 			WinError = Win["error"];
+			WinLevel = Win["level"];
+			WinOwnerIndex = Win["ownerIndex"];
+			WinZOrder = Win["zOrder"];
+			WinIsEnabled = Win["isEnabled"];
+			WinIsMinimized = Win["isMinimized"];
+			WinIsMaximized = Win["isMaximized"];
 		ElsIf TypeOf(Win) = Type("Structure") Then
 			Win.Property("width", WinWidth);
 			Win.Property("height", WinHeight);
@@ -1225,14 +1274,40 @@ Procedure HandleTakeScreenshotEnd(ResultJson, ParametersCall, AdditionalParamete
 			Win.Property("image", ImageData);
 			Win.Property("mimeType", MimeType);
 			Win.Property("error", WinError);
+			Win.Property("level", WinLevel);
+			Win.Property("ownerIndex", WinOwnerIndex);
+			Win.Property("zOrder", WinZOrder);
+			Win.Property("isEnabled", WinIsEnabled);
+			Win.Property("isMinimized", WinIsMinimized);
+			Win.Property("isMaximized", WinIsMaximized);
 		EndIf;
 		
-		Info = Title + " (" + String(WinWidth) + "x" + String(WinHeight) + ")";
+		// Build indented info string for AI (shows hierarchy via level)
+		AIIndent = "";
+		AILvlIdx = 0;
+		While AILvlIdx < WinLevel Do
+			AIIndent = AIIndent + "  ";
+			AILvlIdx = AILvlIdx + 1;
+		EndDo;
+		Info = AIIndent + Title + " (" + String(WinWidth) + "x" + String(WinHeight) + ")";
+		If IsMainWin = True Then
+			Info = Info + " [MAIN]";
+		EndIf;
 		If IsModal = True Then
 			Info = Info + " [MODAL]";
 		EndIf;
-		If IsMainWin = True Then
-			Info = Info + " [MAIN]";
+		If WinIsMinimized = True Then
+			Info = Info + " [MIN]";
+		EndIf;
+		If WinIsMaximized = True Then
+			Info = Info + " [MAX]";
+		EndIf;
+		If WinIsEnabled <> True Then
+			Info = Info + " [DISABLED]";
+		EndIf;
+		Info = Info + " [z=" + String(WinZOrder) + "]";
+		If WinOwnerIndex >= 0 Then
+			Info = Info + " [owner=#" + String(WinOwnerIndex) + "]";
 		EndIf;
 		
 		TextItem = New Structure("type,text", "text", Info);

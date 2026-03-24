@@ -407,14 +407,17 @@ curl -s -w "\nHTTP:%{http_code}" -X DELETE http://localhost:8888/mcp \
 **Expected result:** A multi-part MCP content response:
 - A text item: `"Captured N window(s) for PID ..."` where N ≥ 1
 - For each window:
-  - A text item with window title, dimensions, and flags (`[MAIN]` or `[MODAL]`)
-  - An image item with `type: "image"`, `data` (base64-encoded PNG), `mimeType: "image/png"`
+  - A text item with indented title, dimensions, and flags.
+    Top-level windows: `"MainWindow (1200x800) [MAIN] [z=0]"`
+    Owned windows are indented by 2 spaces per level and tagged with `[MODAL]`/`[MIN]`/`[MAX]`/`[DISABLED]` as applicable.
+    All windows include `[z=N]` (Z-order) and `[owner=#N]` (owner array index) when applicable.
+  - An image item with `type: "image"`, `data` (base64-encoded JPEG), `mimeType: "image/jpeg"`
 
 **Verify:**
 - At least one window is captured (the 1C main window)
-- The main window is tagged with `[MAIN]`
+- The main window text contains `[MAIN]` and `[z=0]`
 - Image data is present and non-empty
-- The base64 data starts with the PNG signature when decoded (`iVBOR...`)
+- The base64 data decodes to a valid JPEG (`/9j/` prefix)
 
 ---
 
@@ -426,15 +429,16 @@ curl -s -w "\nHTTP:%{http_code}" -X DELETE http://localhost:8888/mcp \
    (Note: this will block — use a timeout-aware approach or call `openForm` to trigger a modal)
 2. From another client or tool, call `takeScreenshot` with the 1C process PID.
 
-**Expected result:** Multiple windows captured:
-- The main 1C window tagged with `[MAIN]`
-- The modal dialog tagged with `[MODAL]`
+**Expected result:** Multiple windows captured with hierarchy info:
+- The main 1C window: text line `"MainTitle (WxH) [MAIN] [z=0]"`
+- The modal dialog: text line `"  DialogTitle (WxH) [MODAL] [z=1] [owner=#0]"` (indented 2 spaces = level 1)
 - Each has its own separate screenshot image
 
 **Verify:**
 - `windowCount` ≥ 2
-- At least one window has `[MODAL]` in its description
-- At least one window has `[MAIN]` in its description
+- At least one window text contains `[MODAL]` and is indented
+- At least one window text contains `[MAIN]`
+- The modal window text contains `[owner=#0]` referencing the main window at index 0
 - Both windows have valid image data
 
 ---
@@ -473,6 +477,7 @@ curl -s -w "\nHTTP:%{http_code}" -X DELETE http://localhost:8888/mcp \
 **Verify:**
 - `takeScreenshot` is present with description mentioning screenshots and modal dialogs
 - It has optional parameters `pid` (number), `format` (string), `quality` (number), and `grayscale` (boolean)
+- Each window entry in the response includes `level`, `ownerIndex`, `zOrder`, `isEnabled`, `isMinimized`, `isMaximized`
 
 ---
 
@@ -506,7 +511,8 @@ After completing all tests, verify:
 - [ ] `openForm` successfully opens an existing form
 - [ ] `runLongTask` completes with progress and returns the expected step count
 - [ ] `takeScreenshot` captures the current process main window with base64 JPEG
-- [ ] `takeScreenshot` captures modal dialogs separately with `[MODAL]` tag
+- [ ] `takeScreenshot` captures modal dialogs separately with `[MODAL]` tag and indented hierarchy
+- [ ] `takeScreenshot` window text includes `[z=N]`, `[owner=#N]`, `[DISABLED]`/`[MIN]`/`[MAX]` when applicable
 - [ ] `takeScreenshot` supports PNG format when `format` is `"png"`
 - [ ] `takeScreenshot` supports grayscale mode when `grayscale` is `true`
 - [ ] `takeScreenshot` handles invalid PID gracefully

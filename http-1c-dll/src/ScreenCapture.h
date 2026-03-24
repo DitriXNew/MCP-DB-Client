@@ -22,12 +22,19 @@
 //   "grayscale": false,
 //   "windows": [
 //     {
-//       "hwnd": 65538,
+//       "hwnd": 65538,            — window handle (decimal)
+//       "ownerHwnd": 0,           — owner window handle (0 = top-level / no owner)
+//       "ownerIndex": -1,         — index of owner in windows array (-1 = root)
+//       "level": 0,               — depth in owner chain (0 = root, 1 = owned by root, …)
+//       "zOrder": 0,              — Z-order index in EnumWindows (0 = topmost for this PID)
 //       "title": "1С:Предприятие - ...",
 //       "className": "V8NewLocalFrameBaseWnd",
 //       "x": 100, "y": 100, "width": 1200, "height": 800,
-//       "isMainWindow": true,
-//       "isModal": false,
+//       "isMainWindow": true,     — true when ownerHwnd == 0
+//       "isModal": false,         — true when owner exists and is disabled
+//       "isEnabled": true,        — IsWindowEnabled(hwnd)
+//       "isMinimized": false,     — IsIconic(hwnd)
+//       "isMaximized": false,     — IsZoomed(hwnd)
 //       "image": "base64...",
 //       "mimeType": "image/jpeg",
 //       "imageSize": 123456
