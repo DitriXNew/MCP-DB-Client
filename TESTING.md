@@ -472,7 +472,24 @@ curl -s -w "\nHTTP:%{http_code}" -X DELETE http://localhost:8888/mcp \
 
 **Verify:**
 - `takeScreenshot` is present with description mentioning screenshots and modal dialogs
-- It has optional parameters `pid` (number), `format` (string), and `quality` (number)
+- It has optional parameters `pid` (number), `format` (string), `quality` (number), and `grayscale` (boolean)
+
+---
+
+## Test 29: takeScreenshot — Grayscale Mode
+
+**Action:** Call `takeScreenshot` with `grayscale`: `true` (and optionally `format`: `"jpeg"`).
+
+**Expected result:** The response contains the same windows as a color capture but the images are grayscale:
+- Each window image has `mimeType: "image/jpeg"` (or `"image/png"` if format was `"png"`)
+- The top-level JSON contains `"grayscale": true`
+- Image file size should be noticeably smaller than the equivalent color JPEG
+
+**Verify:**
+- `windowCount` ≥ 1
+- `grayscale` field in the result is `true`
+- Image data is present and base64-encoded
+- The decoded image visually contains no color (can verify by inspecting pixel channels are equal)
 
 ---
 
@@ -491,6 +508,7 @@ After completing all tests, verify:
 - [ ] `takeScreenshot` captures the current process main window with base64 JPEG
 - [ ] `takeScreenshot` captures modal dialogs separately with `[MODAL]` tag
 - [ ] `takeScreenshot` supports PNG format when `format` is `"png"`
+- [ ] `takeScreenshot` supports grayscale mode when `grayscale` is `true`
 - [ ] `takeScreenshot` handles invalid PID gracefully
 - [ ] Both resources are listed
 - [ ] Catalog metadata resource returns valid data

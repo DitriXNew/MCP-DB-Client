@@ -172,11 +172,10 @@ Procedure TakeScreenshot(Command)
 	Try
 		Component.BeginCallingTakeScreenshot(
 			New NotifyDescription("TakeScreenshotFormEnd", ThisObject),
-			PID, Format, Quality);
+				PID, Format, Quality, False);
 	Except
 		ShowMessageBox(, "Screenshot error: " + ErrorDescription());
 	EndTry;
-	
 EndProcedure
 
 &AtClient
@@ -665,13 +664,15 @@ EndFunction
 Function ToolTakeScreenshot()
 	
 	Tool = NewTool("takeScreenshot",
-		"Capture screenshots of all visible windows of the 1C:Enterprise process, including modal dialogs. Returns base64-encoded JPEG images by default (smaller size, optimal for AI). Supports PNG for lossless quality.");
+		"Capture screenshots of all visible windows of the 1C:Enterprise process, including modal dialogs. Returns base64-encoded JPEG images by default (smaller size, optimal for AI). Supports PNG for lossless quality. Use grayscale=true to reduce image size when color is not needed.");
 	AddToolParam(Tool, "pid", "number",
 		"Process ID of the target 1C:Enterprise instance. Use 0 or omit to capture the current process.", False);
 	AddToolParam(Tool, "format", "string",
 		"Image format: 'jpeg' (default, smaller size) or 'png' (lossless).", False);
 	AddToolParam(Tool, "quality", "number",
 		"JPEG compression quality 1-100 (default 80). Lower values = smaller files. Ignored for PNG.", False);
+	AddToolParam(Tool, "grayscale", "boolean",
+		"Convert to grayscale (default false). Reduces file size; useful when color is not needed by the AI.", False);
 	AddToolAnnotations(Tool, True);  // read-only, safe
 	
 	Return Tool;
@@ -689,6 +690,8 @@ Function ToolTestScreenshot()
 		"Image format: 'jpeg' or 'png'.");
 	AddToolParam(Tool, "quality", "number",
 		"Compression quality 1-100 (for JPEG). Ignored for PNG.");
+	AddToolParam(Tool, "grayscale", "boolean",
+		"Convert to grayscale. Reduces file size when color is not needed.");
 	AddToolAnnotations(Tool, True);  // read-only, safe
 	
 	Return Tool;
@@ -1114,6 +1117,12 @@ Procedure HandleTakeScreenshot(RequestID, Arguments)
 	
 	Quality = NumberOrDefault(GetArg(Arguments, "quality"), 80);
 	
+	Grayscale = False;
+	ArgGrayscale = GetArg(Arguments, "grayscale");
+	If ArgGrayscale = True Then
+		Grayscale = True;
+	EndIf;
+	
 	MarkRuntimeStart(RequestID, "takeScreenshot", 1);
 	SendToolProgress(RequestID, 0, 1, "Capturing screenshots...");
 	
@@ -1121,7 +1130,7 @@ Procedure HandleTakeScreenshot(RequestID, Arguments)
 		Context = New Structure("RequestID", RequestID);
 		Component.BeginCallingTakeScreenshot(
 			New NotifyDescription("HandleTakeScreenshotEnd", ThisObject, Context),
-			PID, Format, Quality);
+			PID, Format, Quality, Grayscale);
 	Except
 		MarkRuntimeFailure("Screenshot capture failed: " + ErrorDescription());
 		SendToolError(RequestID, RuntimeStatus.LastError);
@@ -1265,6 +1274,12 @@ Procedure HandleTestScreenshot(RequestID, Arguments)
 	
 	Quality = NumberOrDefault(GetArg(Arguments, "quality"), 80);
 	
+	Grayscale = False;
+	ArgGrayscale = GetArg(Arguments, "grayscale");
+	If ArgGrayscale = True Then
+		Grayscale = True;
+	EndIf;
+	
 	MarkRuntimeStart(RequestID, "testScreenshot", 1);
 	SendToolProgress(RequestID, 0, 1, "Test: capturing screenshots...");
 	
@@ -1272,7 +1287,7 @@ Procedure HandleTestScreenshot(RequestID, Arguments)
 		Context = New Structure("RequestID", RequestID);
 		Component.BeginCallingTakeScreenshot(
 			New NotifyDescription("HandleTestScreenshotEnd", ThisObject, Context),
-			PID, Format, Quality);
+			PID, Format, Quality, Grayscale);
 	Except
 		MarkRuntimeFailure("Test screenshot failed: " + ErrorDescription());
 		SendToolError(RequestID, RuntimeStatus.LastError);

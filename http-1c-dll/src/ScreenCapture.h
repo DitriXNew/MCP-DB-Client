@@ -7,9 +7,11 @@
 // CaptureWindowsByPid — capture all visible windows belonging to a process.
 //
 // Parameters:
-//   pid      — target process ID (0 = current process)
-//   format   — "jpeg" (default, smaller size, better for AI) or "png" (lossless)
-//   quality  — JPEG quality 1-100 (default 80). Ignored for PNG.
+//   pid       — target process ID (0 = current process)
+//   format    — "jpeg" (default, smaller size, better for AI) or "png" (lossless)
+//   quality   — JPEG quality 1-100 (default 80). Ignored for PNG.
+//   grayscale — false (default, full color) or true (convert to grayscale;
+//               reduces file size, useful when color is not needed by the AI).
 //
 // Returns a JSON string with base64-encoded image data:
 // {
@@ -17,6 +19,7 @@
 //   "windowCount": 2,
 //   "format": "jpeg",
 //   "quality": 80,
+//   "grayscale": false,
 //   "windows": [
 //     {
 //       "hwnd": 65538,
@@ -38,12 +41,14 @@
 #ifdef _WINDOWS
 std::string CaptureWindowsByPid(unsigned long pid,
                                 const std::string& format = "jpeg",
-                                int quality = 80);
+                                int quality = 80,
+                                bool grayscale = false);
 #else
 inline std::string CaptureWindowsByPid(unsigned long pid,
                                        const std::string& format = "jpeg",
-                                       int quality = 80) {
-    (void)format; (void)quality;
+                                       int quality = 80,
+                                       bool grayscale = false) {
+    (void)format; (void)quality; (void)grayscale;
     return R"({"error":"Screenshot capture is only supported on Windows","pid":)" + std::to_string(pid) + "}";
 }
 #endif

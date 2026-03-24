@@ -413,17 +413,19 @@ HttpServerComponent::HttpServerComponent()
     // pid=0 means current process. Returns base64-encoded images.
     // format: "jpeg" (default, smaller for AI) or "png" (lossless).
     // quality: 1-100 JPEG quality (default 80). Ignored for PNG.
+    // grayscale: false=color (default), true=convert to grayscale (smaller size).
     AddFunction(u"TakeScreenshot", u"СделатьСкриншот",
-        [&](VH pid, VH format, VH quality) {
+        [&](VH pid, VH format, VH quality, VH grayscale) {
             unsigned long targetPid = static_cast<unsigned long>((int64_t)pid);
             std::u16string fmtU16 = (std::u16string)format;
             std::string fmtUtf8 = WCHAR2MB(std::basic_string_view<WCHAR_T>(
                 reinterpret_cast<const WCHAR_T*>(fmtU16.data()), fmtU16.size()));
             int q = static_cast<int>((int64_t)quality);
-            std::string jsonResult = CaptureWindowsByPid(targetPid, fmtUtf8, q);
+            bool gs = (bool)grayscale;
+            std::string jsonResult = CaptureWindowsByPid(targetPid, fmtUtf8, q, gs);
             this->result = MB2WCHAR(jsonResult);
         },
-        {{1, std::u16string(u"jpeg")}, {2, (int64_t)80}});
+        {{1, std::u16string(u"jpeg")}, {2, (int64_t)80}, {3, false}});
 
     // Return the process ID of the current 1C:Enterprise process.
     AddFunction(u"GetProcessId", u"ПолучитьИдентификаторПроцесса",

@@ -88,7 +88,8 @@ bool GetEncoderClsid(const wchar_t* mimeType, CLSID* clsid) {
 // =========================================================================
 
 std::vector<BYTE> CaptureWindowToImage(HWND hwnd, const CLSID& encoderClsid,
-                                       Gdiplus::EncoderParameters* encoderParams) {
+                                       Gdiplus::EncoderParameters* encoderParams,
+                                       bool grayscale) {
     std::vector<BYTE> result;
 
     RECT rc;
@@ -123,12 +124,40 @@ std::vector<BYTE> CaptureWindowToImage(HWND hwnd, const CLSID& encoderClsid,
     HBITMAP hBmp  = CreateCompatibleBitmap(hdcScreen, w, h);
     HGDIOBJ oldBmp = SelectObject(hdcMem, hBmp);
 
-    // PW_RENDERFULLCONTENT = 0x02 (Windows 8.1+).
-    // Provides correct capture of layered / DWM-composed windows.
+    // Attempt 1: PrintWindow with PW_RENDERFULLCONTENT (0x02).
+    // Works for regular GDI windows and, on Windows 11 / 10 21H2+, also for
+    // DWM-composed GDI windows regardless of occlusion.
     BOOL captured = PrintWindow(hwnd, hdcMem, 0x00000002);
+
     if (!captured) {
-        // Fallback for older Windows versions.
+        // Attempt 2: basic PrintWindow (older GDI / Windows 7 compatibility).
         captured = PrintWindow(hwnd, hdcMem, 0);
+    }
+
+    if (!captured) {
+        // Attempt 3: for DirectComposition windows (1C:Enterprise 8.5+ new UI,
+        // WS_EX_NOREDIRECTIONBITMAP) PrintWindow cannot render into a GDI DC at all.
+        // Workaround: temporarily make the window topmost WITHOUT stealing keyboard
+        // focus (SWP_NOACTIVATE), wait for DWM to compose exactly one frame
+        // (DwmFlush), then BitBlt from the screen DC.  After capture, restore the
+        // original z-order flag.  The window pops to the front for one frame only —
+        // imperceptible to the user in normal usage.
+        bool madeTopmost = false;
+        LONG_PTR exNow = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if (!(exNow & WS_EX_TOPMOST)) {
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            madeTopmost = true;
+        }
+        // Wait for the compositor to present the new z-order.
+        DwmFlush();
+
+        captured = BitBlt(hdcMem, 0, 0, w, h, hdcScreen, rc.left, rc.top, SRCCOPY);
+
+        if (madeTopmost) {
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
     }
 
     SelectObject(hdcMem, oldBmp);
@@ -142,6 +171,38 @@ std::vector<BYTE> CaptureWindowToImage(HWND hwnd, const CLSID& encoderClsid,
             PixelFormatDontCare);
 
         Gdiplus::Bitmap* bmpToSave = croppedBmp ? croppedBmp : &fullBmp;
+
+        // Optional grayscale conversion using a GDI+ ColorMatrix.
+        // Luminance formula: L = 0.299*R + 0.587*G + 0.114*B.
+        Gdiplus::Bitmap* gsBmp = nullptr;
+        if (grayscale) {
+            Gdiplus::ColorMatrix gsMatrix = {{
+                { 0.299f, 0.299f, 0.299f, 0, 0 },
+                { 0.587f, 0.587f, 0.587f, 0, 0 },
+                { 0.114f, 0.114f, 0.114f, 0, 0 },
+                { 0,      0,      0,      1, 0 },
+                { 0,      0,      0,      0, 1 }
+            }};
+            Gdiplus::ImageAttributes attrs;
+            attrs.SetColorMatrix(&gsMatrix,
+                Gdiplus::ColorMatrixFlagsDefault,
+                Gdiplus::ColorAdjustTypeBitmap);
+            int gw = static_cast<int>(bmpToSave->GetWidth());
+            int gh = static_cast<int>(bmpToSave->GetHeight());
+            gsBmp = new Gdiplus::Bitmap(gw, gh, PixelFormat24bppRGB);
+            Gdiplus::Graphics* g = Gdiplus::Graphics::FromImage(gsBmp);
+            if (g) {
+                Gdiplus::Rect dest(0, 0, gw, gh);
+                g->DrawImage(bmpToSave, dest, 0, 0, gw, gh,
+                             Gdiplus::UnitPixel, &attrs);
+                delete g;
+                bmpToSave = gsBmp;  // only switch if draw succeeded
+            } else {
+                // Graphics creation failed; discard gsBmp and keep color bitmap.
+                delete gsBmp;
+                gsBmp = nullptr;
+            }
+        }
 
         IStream* stream = nullptr;
         if (CreateStreamOnHGlobal(nullptr, TRUE, &stream) == S_OK) {
@@ -159,6 +220,7 @@ std::vector<BYTE> CaptureWindowToImage(HWND hwnd, const CLSID& encoderClsid,
             stream->Release();
         }
 
+        delete gsBmp;
         delete croppedBmp;
     }
 
@@ -206,8 +268,9 @@ BOOL CALLBACK EnumWindowsCallback(HWND hwnd, LPARAM lParam) {
     LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     if ((exStyle & WS_EX_LAYERED) && (exStyle & WS_EX_TRANSPARENT)) return TRUE;
 
-    // Filter windows without a redirection bitmap (UWP frame hosts, etc.).
-    if (exStyle & WS_EX_NOREDIRECTIONBITMAP) return TRUE;
+    // NOTE: WS_EX_NOREDIRECTIONBITMAP is set by 1C:Enterprise 8.5+ (DirectComposition
+    // rendering) and by UWP frame hosts. We no longer skip these — they are real
+    // application windows. Capture falls back to BitBlt from screen for them.
 
     RECT rc;
     if (!GetWindowRect(hwnd, &rc)) return TRUE;
@@ -270,7 +333,8 @@ std::string WideToUtf8(const std::wstring& wstr) {
 // =========================================================================
 
 std::string CaptureWindowsByPid(unsigned long pid,
-                                const std::string& format, int quality) {
+                                const std::string& format, int quality,
+                                bool grayscale) {
     if (pid == 0) {
         pid = GetCurrentProcessId();
     }
@@ -315,6 +379,7 @@ std::string CaptureWindowsByPid(unsigned long pid,
     result["windowCount"] = ctx.windows.size();
     result["format"]      = useJpeg ? "jpeg" : "png";
     result["quality"]     = quality;
+    result["grayscale"]   = grayscale;
     result["windows"]     = json::array();
 
     if (ctx.windows.empty()) {
@@ -339,7 +404,7 @@ std::string CaptureWindowsByPid(unsigned long pid,
         }
 
         // Capture the window contents.
-        auto imgData = CaptureWindowToImage(win.hwnd, encoderClsid, paramsPtr);
+        auto imgData = CaptureWindowToImage(win.hwnd, encoderClsid, paramsPtr, grayscale);
 
         if (!imgData.empty()) {
             wj["image"]     = Base64Encode(imgData.data(), imgData.size());
