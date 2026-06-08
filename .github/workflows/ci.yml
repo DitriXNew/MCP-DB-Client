@@ -18,6 +18,24 @@ jobs:
         with:
           arch: x64
 
+      # The DLL build invokes `cargo build` (via CMake) to produce rust-core's
+      # staticlib, so the Rust toolchain must be present. windows-latest ships
+      # Rust preinstalled, but pin it explicitly for a deterministic build and
+      # to guarantee the x86_64-pc-windows-msvc target.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-core
+
+      - name: Test Rust core
+        shell: bash
+        run: cargo test --manifest-path rust-core/Cargo.toml
+
       - name: Build DLL (Release)
         shell: bash
         run: |
