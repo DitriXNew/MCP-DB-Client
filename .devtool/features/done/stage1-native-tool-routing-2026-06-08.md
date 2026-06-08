@@ -1,12 +1,12 @@
 ---
 id: "stage1-native-tool-routing-2026-06-08"
-status: "backlog"
+status: "done"
 priority: "high"
 assignee: null
 dueDate: null
 created: "2026-06-08T18:03:21.000Z"
-modified: "2026-06-08T18:03:21.000Z"
-completedAt: null
+modified: "2026-06-08T20:21:55.000Z"
+completedAt: "2026-06-08T20:21:55.000Z"
 labels: ["stage-1", "cpp-glue"]
 order: "aC"
 ---
