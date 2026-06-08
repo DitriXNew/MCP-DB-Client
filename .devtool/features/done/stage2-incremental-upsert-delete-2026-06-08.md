@@ -1,12 +1,12 @@
 ---
 id: "stage2-incremental-upsert-delete-2026-06-08"
-status: "backlog"
+status: "done"
 priority: "medium"
 assignee: null
 dueDate: null
 created: "2026-06-08T18:03:21.000Z"
-modified: "2026-06-08T18:03:21.000Z"
-completedAt: null
+modified: "2026-06-08T21:31:30.000Z"
+completedAt: "2026-06-08T21:31:30.000Z"
 labels: ["stage-2", "rust-core"]
 order: "aK"
 ---

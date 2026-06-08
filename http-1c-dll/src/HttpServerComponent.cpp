@@ -831,6 +831,14 @@ void HttpServerComponent::doStopListen()
         serverThread.join();
     }
 
+    // The listener is fully stopped, so no worker thread can still be inside the
+    // native search path (rcore_dispatch). Now it is safe to cancel + join the
+    // Rust core's background worker so it isn't running when the DLL unloads.
+    // Best-effort and idempotent by contract; hooked here (server stop / form
+    // close), NOT in ~HttpServerComponent — the Rust singleton is process-global
+    // and outlives any single component instance.
+    rcore_shutdown();
+
     delete server;
     server = nullptr;
     running = false;
