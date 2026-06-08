@@ -30,6 +30,10 @@
 
 mod core;
 mod embed;
+// The real fastembed-backed embedder is compiled only under the `fastembed`
+// feature so the default (mock-only) build never pulls in ort/tokenizers.
+#[cfg(feature = "fastembed")]
+mod fastembed_embedder;
 mod filter;
 mod grep;
 mod protocol;
@@ -193,6 +197,7 @@ fn dispatch(method: &str, payload_json: &str) -> String {
                     "configured": true,
                     "dim": res.dim,
                     "reset": res.reset_due_to_dim_change,
+                    "model": core.config.model,
                     "model_path": core.config.model_path,
                     "normalize": core.config.normalize,
                     "max_seq_len": core.config.max_seq_len,
@@ -428,8 +433,14 @@ fn meta_or_empty(v: &Value, key: &str) -> Value {
 }
 
 /// Parse a `configure` payload. All fields optional; a null payload is fine.
+///
+/// `model` selects a built-in real model (e.g. `"multilingual-e5-small"`) and
+/// `model_path` points at offline ONNX + tokenizer files; either one (when the
+/// `fastembed` feature is compiled in) selects the real embedder, otherwise the
+/// mock is used — see `core::configure`.
 fn parse_config(payload: &Value) -> Result<Config, String> {
     Ok(Config {
+        model: opt_str(payload, "model"),
         model_path: opt_str(payload, "model_path"),
         normalize: bool_or(payload, "normalize", true),
         max_seq_len: opt_u64(payload, "max_seq_len"),
@@ -1580,5 +1591,96 @@ mod tests {
         let v = call("delete_document", r#"{}"#);
         assert_eq!(v["ok"], json!(false));
         assert_eq!(v["error"]["code"], json!(codes::BAD_PAYLOAD));
+    }
+
+    // -- Real fastembed integration test (gated) -----------------------------
+    //
+    // Compiled and run ONLY under `--features fastembed`. It mirrors the probe:
+    // configure the real multilingual-e5-small model, index ru/en/uk docs (two
+    // about a contract, one unrelated — a cat), wait for the background worker
+    // to embed, then dense-search a contract query and assert the contract docs
+    // outrank the unrelated one and that the index dim is 384.
+    //
+    // This downloads the model from HuggingFace on a cold cache (slow) and loads
+    // onnxruntime, so it lives behind the feature flag and is not part of the
+    // fast default suite.
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn fastembed_real_model_ranks_contracts_above_cat() {
+        let _g = e2e_guard();
+
+        // Select the real model. With the feature on, this loads e5-small (dim
+        // 384). The mock test suite never passes `model`, so it stays at dim 64.
+        let v = call("configure", r#"{"model":"multilingual-e5-small"}"#);
+        assert_eq!(v["ok"], json!(true), "configure failed: {v}");
+        assert_eq!(
+            v["result"]["dim"].as_u64().unwrap(),
+            384,
+            "real e5-small must report dim 384 (got {}). If this is 64 the real \
+             model failed to load and we fell back to the mock — inspect the \
+             onnxruntime/model-download path.",
+            v["result"]["dim"]
+        );
+
+        // Index two contract docs (ru + en) and one unrelated doc (uk: a cat on
+        // a windowsill). These mirror the probe's verified passages.
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"ru","name":"ru-contract",
+                "segments":[{"text":"Договор поставки товара №123 от 5 июня"}]}"#,
+        );
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"en","name":"en-contract",
+                "segments":[{"text":"Contract for the supply of goods"}]}"#,
+        );
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"cat","name":"uk-cat",
+                "segments":[{"text":"Кіт сидить на вікні"}]}"#,
+        );
+
+        // Real embedding is much slower than the mock; give the worker time.
+        assert!(
+            store::wait_until_ready("c", std::time::Duration::from_secs(120)),
+            "collection did not reach Ready (worker may have failed to embed)"
+        );
+
+        // Dense search for a contract query (e5 query prefix is applied inside
+        // the embedder). Both contract docs must outrank the cat.
+        let v = call(
+            "search",
+            r#"{"query":"договор на поставку товаров","collection":"c","mode":"dense","k":10,"include_text":true}"#,
+        );
+        assert_eq!(v["ok"], json!(true), "search failed: {v}");
+        assert_eq!(v["result"]["partial"], json!(false));
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert!(hits.len() >= 3, "expected all three docs scored, got {}", hits.len());
+
+        // Map doc_id -> score and assert both contracts beat the cat.
+        let mut score_of = std::collections::HashMap::new();
+        for h in hits {
+            score_of.insert(
+                h["doc_id"].as_str().unwrap().to_string(),
+                h["score"].as_f64().unwrap(),
+            );
+        }
+        let ru = score_of["ru"];
+        let en = score_of["en"];
+        let cat = score_of["cat"];
+        // Surfaced with --nocapture so the verified cosine ranking is visible.
+        eprintln!("e5-small cosine scores: ru={ru:.4} en={en:.4} cat={cat:.4}");
+        assert!(
+            ru > cat && en > cat,
+            "contract docs must outrank the cat: ru={ru:.4} en={en:.4} cat={cat:.4}"
+        );
+
+        // The top hit is one of the two contracts (not the cat).
+        let top = hits[0]["doc_id"].as_str().unwrap();
+        assert!(top == "ru" || top == "en", "top hit must be a contract, got '{top}'");
+
+        // dim is surfaced as 384 in stats too.
+        let s = call("stats", "");
+        assert_eq!(s["result"]["dim"].as_u64().unwrap(), 384);
     }
 }

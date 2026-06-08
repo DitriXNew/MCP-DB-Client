@@ -25,6 +25,23 @@ once_cell = "=1.21.3"
 # catastrophic backtracking (ReDoS). Used by the `grep` dispatch method.
 regex = "=1.12.3"
 
+# --- Real embedder (feature-gated) -------------------------------------------
+# fastembed pulls in onnxruntime (ort) + tokenizers — a heavy native stack we do
+# NOT want compiled for the fast, mock-only `cargo test`. It is therefore an
+# OPTIONAL dependency behind the `fastembed` feature (NOT default): the existing
+# 83 unit tests compile/run without ort, and only `cargo test --features
+# fastembed` (or a `--features fastembed` release build) compiles the real path.
+# Pinned exactly to the versions verified working on this machine.
+fastembed = { version = "=5.16.0", optional = true }
+# fastembed's `embed` returns `anyhow::Result`; only needed on the real path.
+anyhow = { version = "=1.0.99", optional = true }
+
+[features]
+# Off by default. Enabling it compiles the real FastEmbedder (ort + tokenizers)
+# and wires `configure` to select it when the caller asks for a real model.
+default = []
+fastembed = ["dep:fastembed", "dep:anyhow"]
+
 [profile.release]
 # A search core is hot-path code; favour optimized release builds.
 opt-level = 3

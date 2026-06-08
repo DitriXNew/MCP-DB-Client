@@ -151,10 +151,20 @@ impl Collection {
 // Configuration echoed back by `configure` / `stats`
 // ===========================================================================
 
-/// Echo of the knobs passed to `configure`. In mock mode `model_path` is
-/// accepted but a [`MockEmbedder`] is instantiated regardless.
+/// Echo of the knobs passed to `configure`.
+///
+/// Embedder selection (see [`configure`]): a real fastembed model is built only
+/// when the `fastembed` feature is compiled in AND the caller asked for it —
+/// either by naming a built-in `model` (e.g. `"multilingual-e5-small"`) or by
+/// supplying a non-empty `model_path` (offline files). Otherwise a
+/// [`MockEmbedder`] is used (the default for the test suite and any build
+/// without the feature).
 #[derive(Clone, Default)]
 pub struct Config {
+    /// Built-in model name (e.g. `"multilingual-e5-small"`). Selects the real
+    /// embedder when the `fastembed` feature is enabled.
+    pub model: Option<String>,
+    /// Path to local ONNX + tokenizer files for the offline real embedder.
     pub model_path: Option<String>,
     pub normalize: bool,
     pub max_seq_len: Option<u64>,
@@ -288,18 +298,89 @@ pub struct ConfigureResult {
     pub reset_due_to_dim_change: bool,
 }
 
+/// Does this config ask for the *real* (fastembed) embedder? True when the
+/// caller named a built-in `model` or supplied a non-empty `model_path`. When
+/// false (the default, including the whole mock test suite) we build a
+/// [`MockEmbedder`].
+fn wants_real_embedder(config: &Config) -> bool {
+    let named_model = config
+        .model
+        .as_deref()
+        .map(|m| !m.trim().is_empty())
+        .unwrap_or(false);
+    let has_path = config
+        .model_path
+        .as_deref()
+        .map(|p| !p.trim().is_empty())
+        .unwrap_or(false);
+    named_model || has_path
+}
+
+/// Build the embedder this config selects, returning it as `Arc<dyn Embedder>`.
+///
+/// Selection:
+///   * default (no `model` / `model_path`, or feature off) → [`MockEmbedder`]
+///     (dim 64) — keeps the test suite and any no-feature build mock-only;
+///   * `fastembed` feature on AND a real model requested → [`FastEmbedder`]:
+///     a non-empty `model_path` loads local files (offline); otherwise the
+///     built-in `model` name loads/caches from HuggingFace (only
+///     `"multilingual-e5-small"` is wired today; an unknown name falls back to
+///     that built-in model rather than erroring).
+///
+/// If the real model fails to load (e.g. offline with a cold cache, or
+/// onnxruntime cannot be loaded) we **fall back to the mock** rather than
+/// leaving the core unconfigured — this keeps the FFI boundary well-defined and
+/// non-fatal. Returns `(embedder, real_in_effect)` so the caller can echo
+/// whether the real path is actually active.
+fn build_embedder(config: &Config) -> (Arc<dyn Embedder>, bool) {
+    if !wants_real_embedder(config) {
+        return (Arc::new(MockEmbedder::new()), false);
+    }
+
+    #[cfg(feature = "fastembed")]
+    {
+        use crate::fastembed_embedder::FastEmbedder;
+        // Prefer local files when a path is given (offline); else the built-in.
+        let built = match config.model_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            Some(path) => FastEmbedder::new_local(path),
+            None => FastEmbedder::new_builtin(),
+        };
+        match built {
+            Ok(fe) => return (Arc::new(fe), true),
+            Err(_e) => {
+                // Real model unavailable → degrade to mock (non-fatal). The
+                // dim then reverts to the mock's, which `stats` reports.
+                return (Arc::new(MockEmbedder::new()), false);
+            }
+        }
+    }
+
+    // Feature not compiled in: a real request falls back to the mock. (The C++
+    // build that needs the real model compiles with `--features fastembed`.)
+    #[cfg(not(feature = "fastembed"))]
+    {
+        (Arc::new(MockEmbedder::new()), false)
+    }
+}
+
 /// Apply a `configure` request. Idempotent. If a different-dim embedder is
 /// chosen while data is already indexed, the index is reset (old vectors live in
-/// a different space and are invalid).
+/// a different space and are invalid) — this is what handles the 64↔384 switch
+/// between the mock and the real e5 model.
 ///
-/// In this slice we always instantiate a [`MockEmbedder`]; `model_path` is
-/// accepted and echoed but does not load anything.
+/// The embedder is chosen by [`build_embedder`]: a [`MockEmbedder`] by default
+/// (and for any build without the `fastembed` feature), or a real
+/// [`FastEmbedder`] when the feature is on and the caller asked for a real model
+/// via `model` / `model_path`.
 pub fn configure(core: &mut Core, config: Config) -> ConfigureResult {
-    let new_embedder = MockEmbedder::new();
+    let (new_embedder, _real) = build_embedder(&config);
     let new_dim = new_embedder.dim();
 
     // If we already had an embedder of a different dim AND there is indexed
     // data, the existing vectors are invalid in the new space → full reset.
+    // This covers the mock↔real (64↔384) transition: switching to the real
+    // model after indexing under the mock (or vice versa) clears the stale
+    // vectors so search never mixes incompatible vector spaces.
     let old_dim = core.embedder.as_ref().map(|e| e.dim());
     let had_data = !core.collections.is_empty();
     let dim_changed = matches!(old_dim, Some(d) if d != new_dim);
@@ -312,7 +393,7 @@ pub fn configure(core: &mut Core, config: Config) -> ConfigureResult {
         core.next_segment_id = 1;
     }
 
-    core.embedder = Some(Arc::new(new_embedder));
+    core.embedder = Some(new_embedder);
     core.config = config;
     core.configured = true;
     core.progress.1.notify_all();

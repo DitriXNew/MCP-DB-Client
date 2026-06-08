@@ -1,2 +1,7 @@
 # Rust build artifacts
 /target/
+
+# fastembed's downloaded/cached ONNX + tokenizer model files (created on the
+# first real-embedder run / `cargo test --features fastembed`). Large binaries,
+# never source — keep them out of git.
+/.fastembed_cache/
