@@ -1047,10 +1047,56 @@ fn normalize_newlines(s: &str) -> String {
 // search (dense)
 // ===========================================================================
 
+/// Which retrieval channel(s) `search` uses. The wire field is `mode`; an
+/// absent or unrecognized value defaults to [`SearchMode::Dense`] (unchanged
+/// Stage 1 behavior).
+///
+/// ## `min_score` semantics differ per mode (read before changing)
+/// The three modes produce scores on **incomparable scales**, so `min_score`
+/// cannot mean the same thing across them — applying one cosine threshold to an
+/// RRF score would be a category error. We therefore define it per mode:
+///   * **Dense** — `score` is cosine similarity over L2-normalized vectors, an
+///     absolute, meaningful number in `[-1, 1]`. `min_score` is an absolute
+///     cosine floor (the Stage 1 behavior, unchanged).
+///   * **Keyword** — `score` is the lexical match score (see [`keyword_score`]):
+///     a small positive number combining distinct-term coverage and total
+///     occurrences. `min_score` is a floor on *that* score (e.g. `min_score: 1.0`
+///     keeps only segments matching at least one whole query term). It is NOT a
+///     cosine.
+///   * **Hybrid** — `score` is the Reciprocal-Rank-Fusion score, `Σ 1/(k+rank)`
+///     over the dense and keyword rank lists (`k = 60`). Its magnitude is
+///     relative (roughly `0 .. 2/61 ≈ 0.033`) and carries no absolute meaning,
+///     so comparing it to a cosine threshold is meaningless. `min_score`, when
+///     given, is applied as a floor on the *fused RRF score* — useful only to
+///     drop the long tail, never as a similarity cutoff.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SearchMode {
+    /// Top-k by dot product over normalized vectors (needs embedded vectors).
+    Dense,
+    /// Full lexical scan over stored segment text (needs no vectors; works
+    /// while `vector_status == Building`).
+    Keyword,
+    /// Dense + keyword fused with Reciprocal Rank Fusion.
+    Hybrid,
+}
+
+impl SearchMode {
+    /// Parse the wire `mode` string. Unknown / absent ⇒ `Dense` (back-compat).
+    pub fn parse(s: Option<&str>) -> SearchMode {
+        match s.map(|x| x.trim().to_ascii_lowercase()).as_deref() {
+            Some("keyword") => SearchMode::Keyword,
+            Some("hybrid") => SearchMode::Hybrid,
+            _ => SearchMode::Dense,
+        }
+    }
+}
+
 /// Parsed `search` request.
 pub struct SearchRequest {
     pub query: String,
     pub collection: Option<String>,
+    /// Retrieval channel(s). Defaults to `Dense`.
+    pub mode: SearchMode,
     pub k: usize,
     pub min_score: Option<f32>,
     pub max_per_doc: Option<usize>,
@@ -1079,32 +1125,119 @@ pub struct SearchResult {
     pub partial: bool,
 }
 
-/// Dense search: embed the query, score every vectorized segment by dot product
-/// (== cosine, normalized), top-k with `min_score` and `max_per_doc` applied.
+/// Standard Reciprocal-Rank-Fusion constant. The canonical value from the RRF
+/// paper (Cormack et al. 2009): a larger `k` flattens the contribution of rank
+/// position so a high rank in either channel still meaningfully lifts a hit.
+const RRF_K: f32 = 60.0;
+
+/// Tokenize a query for keyword matching: lowercase, then split on any
+/// non-alphanumeric character (Unicode-aware), dropping empties. This keeps
+/// alphanumeric runs together so exact identifiers survive intact —
+/// `"ABC-123"` → `["abc", "123"]`, `"ИНН7701234567"` stays one token — which is
+/// exactly the SKU/ИНН case keyword mode exists to serve. The same tokenizer is
+/// applied to both the query and the segment text so they match symmetrically.
+fn keyword_tokens(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Lexical match score of one segment against the (already tokenized) distinct
+/// query terms. Returns `0.0` when nothing matches (the segment is then not a
+/// keyword hit).
 ///
-/// `collection` scopes the search; when omitted, all collections are searched.
-pub fn search(core: &Core, req: SearchRequest) -> SearchResult {
+/// Scoring scheme (simple and documented, BM25-lite-ish but deliberately not
+/// length-normalized so short exact-identifier segments are not penalized):
+///
+/// ```text
+///   score = (# distinct query terms present in the segment)
+///         + 0.1 * (total occurrences of any query term in the segment)
+/// ```
+///
+/// The integer part is **distinct-term coverage** — the dominant signal, so a
+/// segment containing more of the query's *distinct* terms always outranks one
+/// that merely repeats a single term. The fractional `0.1 * occurrences` part is
+/// a small tie-breaker that rewards density without ever letting raw repetition
+/// overtake an extra distinct term (since 10 repeats of one term add only 1.0,
+/// the same as covering one more distinct term — and coverage is counted first).
+/// Tokens are compared for *equality* (whole-token match), so `"db"` does not
+/// match inside `"database"`; this is the precise-identifier behavior we want
+/// (use `grep` for substring/regex search).
+fn keyword_score(seg_text: &str, query_terms: &[String]) -> f32 {
+    if query_terms.is_empty() {
+        return 0.0;
+    }
+    let seg_tokens = keyword_tokens(seg_text);
+    if seg_tokens.is_empty() {
+        return 0.0;
+    }
+    let mut distinct_present = 0u32;
+    let mut total_occurrences = 0u32;
+    for term in query_terms {
+        let occ = seg_tokens.iter().filter(|t| *t == term).count() as u32;
+        if occ > 0 {
+            distinct_present += 1;
+            total_occurrences += occ;
+        }
+    }
+    distinct_present as f32 + 0.1 * total_occurrences as f32
+}
+
+/// Build a fresh [`Hit`] for a segment with a given score. Centralizes the
+/// (verbose) field copy so the dense / keyword scanners stay terse.
+fn make_hit(doc: &Document, seg: &Segment, collection: &str, score: f32) -> Hit {
+    Hit {
+        doc_id: doc.doc_id.clone(),
+        name: doc.name.clone(),
+        collection: collection.to_string(),
+        meta: doc.meta.clone(),
+        segment_id: seg.segment_id,
+        line_start: seg.line_start,
+        line_end: seg.line_end,
+        score,
+        text: seg.text.clone(),
+    }
+}
+
+/// Does this collection fall within the request's `collection` scope?
+fn in_scope(want: &Option<String>, cname: &str) -> bool {
+    match want {
+        Some(w) => w == cname,
+        None => true,
+    }
+}
+
+/// Stable descending sort by score (NaN treated as lowest; segment ordering is
+/// otherwise preserved by `sort_by`, which is stable).
+fn sort_desc(scored: &mut [Hit]) {
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+/// Dense channel: embed the query and score every *vectorized* segment in scope
+/// by dot product (== cosine over normalized vectors). Applies the meta filter.
+/// `min_score`, when given, is an absolute cosine floor. Returns the ranked
+/// (descending) list and whether any in-scope collection is still `Building`.
+///
+/// Segments without a vector (not embedded yet, or skipped) are ignored — dense
+/// is the only channel that needs vectors.
+fn dense_channel(core: &Core, req: &SearchRequest, apply_min: bool) -> (Vec<Hit>, bool) {
     let embedder = match core.embedder.as_ref() {
         Some(e) => e,
-        // Not configured and nothing indexed → empty, non-partial result.
-        None => {
-            return SearchResult {
-                hits: Vec::new(),
-                partial: false,
-            }
-        }
+        None => return (Vec::new(), false),
     };
     let qvec = embedder.embed_query(&req.query);
 
-    // Which collections are in scope, and is any of them still Building?
     let mut partial = false;
     let mut scored: Vec<Hit> = Vec::new();
-
     for (cname, coll) in core.collections.iter() {
-        if let Some(want) = req.collection.as_ref() {
-            if want != cname {
-                continue;
-            }
+        if !in_scope(&req.collection, cname) {
+            continue;
         }
         if coll.vector_status == VectorStatus::Building {
             partial = true;
@@ -1115,43 +1248,121 @@ pub fn search(core: &Core, req: SearchRequest) -> SearchResult {
                     Some(v) => v,
                     None => continue, // not embedded (or skipped) → ignore
                 };
-                // Meta filter over the hit's effective meta (doc ∪ segment,
-                // segment wins). Cheap no-op when no filter was supplied.
                 if !req.filter.matches_doc_seg(&doc.meta, &seg.meta) {
                     continue;
                 }
                 let score = dot(&qvec, v);
-                if let Some(min) = req.min_score {
-                    if score < min {
-                        continue;
+                // Absolute cosine floor — only applied when this is the active
+                // mode (dense). For hybrid we want the *full* rank list as input
+                // to fusion, so the caller passes apply_min = false.
+                if apply_min {
+                    if let Some(min) = req.min_score {
+                        if score < min {
+                            continue;
+                        }
                     }
                 }
-                scored.push(Hit {
-                    doc_id: doc.doc_id.clone(),
-                    name: doc.name.clone(),
-                    collection: cname.clone(),
-                    meta: doc.meta.clone(),
-                    segment_id: seg.segment_id,
-                    line_start: seg.line_start,
-                    line_end: seg.line_end,
-                    score,
-                    text: seg.text.clone(),
-                });
+                scored.push(make_hit(doc, seg, cname, score));
             }
         }
     }
+    sort_desc(&mut scored);
+    (scored, partial)
+}
 
-    // Rank by descending score (stable on ties by keeping insertion order via
-    // a total comparator that treats NaN as lowest — vectors are finite so this
-    // is just defensive).
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+/// Keyword channel: full lexical scan over stored segment **text** — no vectors
+/// needed, so it works the instant a doc is accepted (even while `Building`).
+/// Scores by [`keyword_score`], drops zero-score (non-matching) segments, and
+/// applies the meta filter. `min_score`, when given and `apply_min`, is a floor
+/// on the *match score* (not a cosine). Returns the ranked (descending) list.
+///
+/// Note `partial` is irrelevant to keyword (it never reads vectors), so this
+/// returns only the list; the caller decides the result-level `partial` flag.
+fn keyword_channel(core: &Core, req: &SearchRequest, apply_min: bool) -> Vec<Hit> {
+    let query_terms = distinct(keyword_tokens(&req.query));
+    if query_terms.is_empty() {
+        return Vec::new(); // no terms ⇒ nothing can match
+    }
+    let mut scored: Vec<Hit> = Vec::new();
+    for (cname, coll) in core.collections.iter() {
+        if !in_scope(&req.collection, cname) {
+            continue;
+        }
+        for doc in coll.docs.values() {
+            for seg in &doc.segments {
+                if !req.filter.matches_doc_seg(&doc.meta, &seg.meta) {
+                    continue;
+                }
+                let score = keyword_score(&seg.text, &query_terms);
+                if score <= 0.0 {
+                    continue; // no query term present → not a hit
+                }
+                if apply_min {
+                    if let Some(min) = req.min_score {
+                        if score < min {
+                            continue;
+                        }
+                    }
+                }
+                scored.push(make_hit(doc, seg, cname, score));
+            }
+        }
+    }
+    sort_desc(&mut scored);
+    scored
+}
 
-    // Apply max_per_doc, then truncate to k.
-    let hits = if let Some(max_per_doc) = req.max_per_doc {
+/// De-duplicate a token list, preserving first-seen order.
+fn distinct(tokens: Vec<String>) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(tokens.len());
+    for t in tokens {
+        if seen.insert(t.clone()) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Fuse two ranked lists with Reciprocal Rank Fusion. Each segment (identified
+/// by its stable `segment_id`) accrues `1/(RRF_K + rank)` for every channel it
+/// appears in (`rank` is 0-based here, matching the common RRF formulation).
+/// A segment strong in *only one* channel still surfaces — that is the whole
+/// point: an exact-identifier match that dense misses, or a semantic match the
+/// keyword scan misses, both get fused in. The fused `score` replaces the raw
+/// per-channel score; its magnitude is relative (see [`SearchMode`] docs).
+fn rrf_fuse(dense: Vec<Hit>, keyword: Vec<Hit>) -> Vec<Hit> {
+    // Accumulate fused scores keyed by segment_id, keeping one representative
+    // Hit per segment (the first we encounter carries the displayable fields).
+    let mut fused: HashMap<u64, f32> = HashMap::new();
+    let mut rep: HashMap<u64, Hit> = HashMap::new();
+
+    for (rank, hit) in dense.into_iter().enumerate() {
+        *fused.entry(hit.segment_id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32);
+        rep.entry(hit.segment_id).or_insert(hit);
+    }
+    for (rank, hit) in keyword.into_iter().enumerate() {
+        *fused.entry(hit.segment_id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32);
+        rep.entry(hit.segment_id).or_insert(hit);
+    }
+
+    // Materialize the fused hits, overwriting each representative's score with
+    // its fused RRF score, then rank descending.
+    let mut out: Vec<Hit> = rep
+        .into_iter()
+        .map(|(sid, mut hit)| {
+            hit.score = fused.get(&sid).copied().unwrap_or(0.0);
+            hit
+        })
+        .collect();
+    sort_desc(&mut out);
+    out
+}
+
+/// Apply `max_per_doc` (cap hits per (collection, doc_id)) then truncate to `k`.
+/// Shared final stage for every mode so the limit semantics are identical.
+fn limit_hits(scored: Vec<Hit>, k: usize, max_per_doc: Option<usize>) -> Vec<Hit> {
+    if let Some(max_per_doc) = max_per_doc {
         let mut per_doc: HashMap<(String, String), usize> = HashMap::new();
         let mut kept: Vec<Hit> = Vec::new();
         for hit in scored {
@@ -1161,16 +1372,185 @@ pub fn search(core: &Core, req: SearchRequest) -> SearchResult {
                 *count += 1;
                 kept.push(hit);
             }
-            if kept.len() >= req.k {
+            if kept.len() >= k {
                 break;
             }
         }
         kept
     } else {
-        scored.into_iter().take(req.k).collect()
+        scored.into_iter().take(k).collect()
+    }
+}
+
+/// Mode-aware search over the store. Honors `mode` (`dense` | `keyword` |
+/// `hybrid`, default `dense`); all modes respect `collection`, `k`,
+/// `max_per_doc`, `include_text`, and the meta filter.
+///
+/// `min_score` is applied per the active mode — an absolute cosine floor in
+/// dense, a match-score floor in keyword, and a fused-RRF-score floor in hybrid
+/// (see [`SearchMode`] for why these are necessarily different scales).
+///
+/// `partial` (vectors still filling in) is meaningful only where vectors are
+/// read: it is reported for `dense` and `hybrid` when an in-scope collection is
+/// still `Building`. For `keyword` it is always `false` — keyword reads only
+/// text, which is present the instant a doc is accepted.
+pub fn search(core: &Core, req: SearchRequest) -> SearchResult {
+    let (scored, partial) = match req.mode {
+        SearchMode::Dense => dense_channel(core, &req, true),
+        SearchMode::Keyword => {
+            // Keyword reads only text → never partial, works while Building.
+            (keyword_channel(core, &req, true), false)
+        }
+        SearchMode::Hybrid => {
+            // Run both channels WITHOUT each one's own min_score (we want the
+            // full rank lists as fusion input), fuse with RRF, then apply
+            // min_score as a floor on the fused score below.
+            let (dense, partial) = dense_channel(core, &req, false);
+            let keyword = keyword_channel(core, &req, false);
+            let mut fused = rrf_fuse(dense, keyword);
+            if let Some(min) = req.min_score {
+                fused.retain(|h| h.score >= min);
+            }
+            (fused, partial)
+        }
     };
 
+    let hits = limit_hits(scored, req.k, req.max_per_doc);
     SearchResult { hits, partial }
+}
+
+// ===========================================================================
+// delete_document / delete_collection — incremental, atomic removal
+// ===========================================================================
+
+/// Outcome of [`delete_document`].
+///
+/// `deleted` is the structural answer (chosen over an error so a delete of an
+/// already-absent doc — a common, benign idempotent retry — is a normal `false`
+/// result, not a failure the caller must special-case). When `true`, the doc and
+/// all its segments are gone; `removed_segments` reports how many segments went
+/// away, and `collection_dropped` says whether the doc's collection became empty
+/// and was therefore removed (see the empty-collection policy below).
+pub struct DeleteDocResult {
+    pub deleted: bool,
+    pub collection: Option<String>,
+    pub removed_segments: usize,
+    pub collection_dropped: bool,
+}
+
+/// Remove a document (and ALL its segments) by `doc_id`, atomically.
+///
+/// Atomicity: the whole removal happens under the single short write lock the
+/// dispatcher already holds for this call — readers never observe a torn doc
+/// (half its segments gone). Because a `doc_id` is unique across collections
+/// (it is the addressing key, as `get_segment` relies on), we scan collections
+/// for the first one that owns it and remove it there.
+///
+/// In-flight embeds: if the background worker is mid-embedding this doc when the
+/// delete lands, its later `apply_job` simply finds the doc absent and drops the
+/// result on the floor (the same stale-id path that makes re-ingest atomic) — so
+/// a deleted doc never reappears with late-arriving vectors.
+///
+/// Empty-collection policy: when removing the doc empties its collection, we
+/// **drop the now-empty collection** entirely (rather than keep a ghost entry in
+/// `stats`). This keeps `stats` honest — a collection with zero docs and zero
+/// segments carries no state worth surfacing — and matches what a caller deleting
+/// the last document of a collection intuitively expects. (`delete_collection`
+/// exists for the explicit whole-collection case.)
+///
+/// Unknown `doc_id` → `deleted: false` (a no-op, not an error). Counters are not
+/// touched on a miss; on a hit, the per-collection progress counters are left as
+/// historical totals (they describe embedding *attempts*, not current contents),
+/// while the surfaced `n_docs` / `n_segments` derive from the live maps and so
+/// drop immediately.
+pub fn delete_document(core: &mut Core, doc_id: &str) -> DeleteDocResult {
+    // Find the collection that owns this doc (first match wins; ids are unique).
+    let owner = core
+        .collections
+        .iter()
+        .find(|(_, coll)| coll.docs.contains_key(doc_id))
+        .map(|(name, _)| name.clone());
+
+    let cname = match owner {
+        Some(c) => c,
+        None => {
+            // Unknown doc → structural no-op result.
+            return DeleteDocResult {
+                deleted: false,
+                collection: None,
+                removed_segments: 0,
+                collection_dropped: false,
+            };
+        }
+    };
+
+    // Remove the doc; count its segments for the result/stats.
+    let coll = core
+        .collections
+        .get_mut(&cname)
+        .expect("owner collection just located");
+    let removed = coll
+        .docs
+        .remove(doc_id)
+        .map(|d| d.segments.len())
+        .unwrap_or(0);
+
+    // Drop the collection if it is now empty (empty-collection policy above).
+    let collection_dropped = coll.docs.is_empty();
+    if collection_dropped {
+        core.collections.remove(&cname);
+    }
+
+    // Wake any `wait_until_ready` waiter so a pending wait on a now-dropped
+    // collection returns promptly instead of hanging to its timeout.
+    core.progress.1.notify_all();
+
+    DeleteDocResult {
+        deleted: true,
+        collection: Some(cname),
+        removed_segments: removed,
+        collection_dropped,
+    }
+}
+
+/// Outcome of [`delete_collection`].
+///
+/// `deleted` is the structural answer (an unknown collection → `false`, a benign
+/// no-op rather than an error). When `true`, `removed_docs` / `removed_segments`
+/// report what was cleared.
+pub struct DeleteCollectionResult {
+    pub deleted: bool,
+    pub removed_docs: usize,
+    pub removed_segments: usize,
+}
+
+/// Remove an entire collection — all its documents and segments — atomically
+/// under the dispatcher's single write lock.
+///
+/// In-flight embeds for the collection become harmless no-ops: their
+/// `apply_job` finds the collection absent and returns early (the existing
+/// reset/dim-change guard). Unknown collection → `deleted: false` (a no-op, not
+/// an error), consistent with [`delete_document`].
+pub fn delete_collection(core: &mut Core, collection: &str) -> DeleteCollectionResult {
+    match core.collections.remove(collection) {
+        Some(coll) => {
+            let removed_segments = coll.n_segments();
+            let removed_docs = coll.docs.len();
+            // Wake waiters so a pending `wait_until_ready` on this collection
+            // returns promptly (it is gone → never going to be Ready).
+            core.progress.1.notify_all();
+            DeleteCollectionResult {
+                deleted: true,
+                removed_docs,
+                removed_segments,
+            }
+        }
+        None => DeleteCollectionResult {
+            deleted: false,
+            removed_docs: 0,
+            removed_segments: 0,
+        },
+    }
 }
 
 // ===========================================================================
@@ -1444,6 +1824,7 @@ mod tests {
             SearchRequest {
                 query: "database connection".to_string(),
                 collection: Some("docs".to_string()),
+                mode: SearchMode::Dense,
                 k: 10,
                 min_score: None,
                 max_per_doc: None,
@@ -1474,6 +1855,7 @@ mod tests {
             SearchRequest {
                 query: "alpha beta gamma".to_string(),
                 collection: None,
+                mode: SearchMode::Dense,
                 k: 2,
                 min_score: None,
                 max_per_doc: None,
@@ -1489,6 +1871,7 @@ mod tests {
             SearchRequest {
                 query: "alpha beta gamma".to_string(),
                 collection: None,
+                mode: SearchMode::Dense,
                 k: 10,
                 min_score: None,
                 max_per_doc: Some(1),
@@ -1508,6 +1891,7 @@ mod tests {
             SearchRequest {
                 query: "alpha beta gamma".to_string(),
                 collection: None,
+                mode: SearchMode::Dense,
                 k: 10,
                 min_score: Some(0.99),
                 max_per_doc: None,
@@ -1540,6 +1924,7 @@ mod tests {
             SearchRequest {
                 query: "anything".to_string(),
                 collection: Some("docs".to_string()),
+                mode: SearchMode::Dense,
                 k: 5,
                 min_score: None,
                 max_per_doc: None,
@@ -1877,5 +2262,186 @@ mod tests {
         // Full text + offset table are retained on the raw doc.
         assert!(doc.full_text.is_some());
         assert!(doc.line_offsets.is_some());
+    }
+
+    // ===================================================================
+    // Stage 2: keyword tokenizer + score (pure-function unit tests)
+    // ===================================================================
+
+    #[test]
+    fn keyword_tokenizer_splits_on_non_alphanumeric_and_keeps_ids_intact() {
+        // Lowercased; split on every non-alphanumeric char; empties dropped.
+        assert_eq!(keyword_tokens("Hello, World!"), vec!["hello", "world"]);
+        // A hyphenated SKU splits into its alphanumeric runs.
+        assert_eq!(keyword_tokens("ABC-123"), vec!["abc", "123"]);
+        // A glued identifier stays one token (the exact-id case keyword serves).
+        assert_eq!(keyword_tokens("ИНН7701234567"), vec!["инн7701234567"]);
+        assert!(keyword_tokens("   ,.;  ").is_empty());
+    }
+
+    #[test]
+    fn keyword_score_ranks_by_distinct_coverage_then_density() {
+        let q = distinct(keyword_tokens("alpha beta"));
+        // Both distinct terms present → coverage 2 (+ density).
+        let both = keyword_score("alpha beta gamma", &q);
+        // One distinct term, repeated → coverage 1 (+ a little density).
+        let one_rep = keyword_score("alpha alpha alpha", &q);
+        // No query term → not a hit.
+        let none = keyword_score("gamma delta", &q);
+        assert!(both > one_rep, "more distinct terms must outrank repetition");
+        assert!(one_rep > 0.0, "a present term is a hit");
+        assert_eq!(none, 0.0, "no shared term → zero (non-hit)");
+        // Whole-token match only: "alph" must not match inside "alpha".
+        let q2 = distinct(keyword_tokens("alph"));
+        assert_eq!(keyword_score("alpha beta", &q2), 0.0, "no substring matching");
+    }
+
+    /// Build a `SearchRequest` with the given mode/min_score, scoped to a
+    /// collection, k large, no per-doc cap, no meta filter.
+    fn sreq(query: &str, collection: Option<&str>, mode: SearchMode, min_score: Option<f32>) -> SearchRequest {
+        SearchRequest {
+            query: query.to_string(),
+            collection: collection.map(String::from),
+            mode,
+            k: 50,
+            min_score,
+            max_per_doc: None,
+            include_text: true,
+            filter: MetaFilter::default(),
+        }
+    }
+
+    #[test]
+    fn keyword_search_works_while_building_without_vectors() {
+        // Hold the WRITE lock so the worker can't run: text is installed at
+        // accept, but vectors stay None and the collection stays Building.
+        let _g = test_lock();
+        let res = {
+            let mut c = CORE.write().unwrap();
+            accept_index(
+                &mut c,
+                IndexRequest {
+                    collection: "docs".to_string(),
+                    doc_id: "k1".to_string(),
+                    name: "n".to_string(),
+                    meta: json!({}),
+                    segments: vec![seg("the exact sku ABC-123 lives here"), seg("unrelated prose")],
+                },
+            );
+            let coll = c.collections.get("docs").unwrap();
+            assert_eq!(coll.vector_status, VectorStatus::Building);
+            assert!(coll.docs.get("k1").unwrap().segments.iter().all(|s| s.vector.is_none()));
+            // Keyword search reads only text → must find the sku segment now.
+            search(&c, sreq("ABC-123", Some("docs"), SearchMode::Keyword, None))
+        };
+        assert!(!res.partial, "keyword never reports partial (reads no vectors)");
+        assert!(!res.hits.is_empty(), "keyword must work while Building");
+        assert_eq!(res.hits[0].doc_id, "k1");
+        assert!(res.hits[0].text.contains("ABC-123"));
+    }
+
+    #[test]
+    fn hybrid_rrf_surfaces_both_keyword_only_and_dense_only_strong_docs() {
+        let _g = test_lock();
+        // dwin: shares semantic tokens with the query (dense-strong) but NOT the
+        //       exact id token.
+        // kwin: contains the exact identifier token (keyword-strong) but little
+        //       semantic overlap with the rest of the query.
+        index("docs", "dwin", &["database connection pooling and tuning guide"]);
+        index("docs", "kwin", &["sku7701234567 inventory record"]);
+        index("docs", "noise", &["completely irrelevant banana smoothie"]);
+        assert!(wait_until_ready("docs", Duration::from_secs(5)));
+        let c = CORE.read().unwrap();
+        // Query blends a semantic phrase (favors dwin in dense) with the exact id
+        // (favors kwin in keyword). RRF must surface BOTH above the noise doc.
+        let res = search(
+            &c,
+            sreq("database connection sku7701234567", Some("docs"), SearchMode::Hybrid, None),
+        );
+        let ids: Vec<&str> = res.hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert!(ids.contains(&"dwin"), "dense-strong doc must surface via RRF");
+        assert!(ids.contains(&"kwin"), "keyword-strong doc must surface via RRF");
+        // The keyword-only-strong doc (kwin) must rank ABOVE the noise doc, which
+        // pure dense might otherwise have ordered ahead of it.
+        let pos = |id: &str| ids.iter().position(|x| *x == id);
+        if let (Some(k), Some(n)) = (pos("kwin"), pos("noise")) {
+            assert!(k < n, "exact-id doc must outrank noise under fusion");
+        }
+    }
+
+    // ===================================================================
+    // Stage 2: delete_document / delete_collection (store-level)
+    // ===================================================================
+
+    #[test]
+    fn delete_document_removes_doc_and_drops_empty_collection() {
+        let _g = test_lock();
+        index("docs", "d1", &["first segment", "second segment"]);
+        index("docs", "d2", &["other doc"]);
+        assert!(wait_until_ready("docs", Duration::from_secs(5)));
+
+        // Delete d1: removed, 2 segments gone, collection survives (d2 remains).
+        let res = {
+            let mut c = CORE.write().unwrap();
+            delete_document(&mut c, "d1")
+        };
+        assert!(res.deleted);
+        assert_eq!(res.collection.as_deref(), Some("docs"));
+        assert_eq!(res.removed_segments, 2);
+        assert!(!res.collection_dropped, "collection still has d2");
+        {
+            let c = CORE.read().unwrap();
+            let coll = c.collections.get("docs").unwrap();
+            assert!(!coll.docs.contains_key("d1"));
+            assert!(coll.docs.contains_key("d2"));
+        }
+
+        // Delete the last doc → collection becomes empty and is dropped.
+        let res = {
+            let mut c = CORE.write().unwrap();
+            delete_document(&mut c, "d2")
+        };
+        assert!(res.deleted);
+        assert!(res.collection_dropped, "empty collection must be dropped");
+        let c = CORE.read().unwrap();
+        assert!(!c.collections.contains_key("docs"), "empty collection gone");
+    }
+
+    #[test]
+    fn delete_unknown_document_is_structural_false() {
+        let _g = test_lock();
+        let mut c = CORE.write().unwrap();
+        let res = delete_document(&mut c, "ghost");
+        assert!(!res.deleted, "unknown doc → deleted:false, not an error");
+        assert!(res.collection.is_none());
+        assert_eq!(res.removed_segments, 0);
+        assert!(!res.collection_dropped);
+    }
+
+    #[test]
+    fn delete_collection_clears_all_docs_and_unknown_is_false() {
+        let _g = test_lock();
+        index("docs", "d1", &["a", "b"]);
+        index("docs", "d2", &["c"]);
+        assert!(wait_until_ready("docs", Duration::from_secs(5)));
+
+        let res = {
+            let mut c = CORE.write().unwrap();
+            delete_collection(&mut c, "docs")
+        };
+        assert!(res.deleted);
+        assert_eq!(res.removed_docs, 2);
+        assert_eq!(res.removed_segments, 3);
+        {
+            let c = CORE.read().unwrap();
+            assert!(!c.collections.contains_key("docs"));
+        }
+
+        // Unknown collection → structural false (no-op).
+        let mut c = CORE.write().unwrap();
+        let res = delete_collection(&mut c, "missing");
+        assert!(!res.deleted);
+        assert_eq!(res.removed_docs, 0);
+        assert_eq!(res.removed_segments, 0);
     }
 }

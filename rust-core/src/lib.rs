@@ -41,8 +41,8 @@ use std::panic::{self, AssertUnwindSafe};
 use serde_json::{json, Value};
 
 use crate::core::{
-    self as store, Config, GetSegmentRequest, IndexRequest, RawIndexRequest, SearchRequest,
-    SegmentInput, CORE,
+    self as store, Config, GetSegmentRequest, IndexRequest, RawIndexRequest, SearchMode,
+    SearchRequest, SegmentInput, CORE,
 };
 use crate::filter::MetaFilter;
 use crate::grep::GrepRequest;
@@ -340,6 +340,55 @@ fn dispatch(method: &str, payload_json: &str) -> String {
             Err(e) => Envelope::err(codes::BAD_PAYLOAD, e),
         },
 
+        // Incremental delete of a single document (and all its segments) by
+        // `doc_id`, atomically under one short write lock. An unknown doc_id is
+        // a structural no-op (`deleted:false`), never an error — a benign
+        // idempotent retry. Echoes which collection it lived in, how many
+        // segments went away, and whether the (now-empty) collection was dropped.
+        "delete_document" => match parse_delete_document_request(&payload) {
+            Ok(doc_id) => {
+                let mut core = match CORE.write() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return Envelope::err(codes::INTERNAL, "core lock poisoned")
+                            .to_json_string()
+                    }
+                };
+                let res = store::delete_document(&mut core, &doc_id);
+                Envelope::ok(json!({
+                    "deleted": res.deleted,
+                    "doc_id": doc_id,
+                    "collection": res.collection,
+                    "removed_segments": res.removed_segments,
+                    "collection_dropped": res.collection_dropped,
+                }))
+            }
+            Err(e) => Envelope::err(codes::BAD_PAYLOAD, e),
+        },
+
+        // Incremental delete of an entire collection (all docs + segments),
+        // atomically. An unknown collection is a structural no-op
+        // (`deleted:false`), consistent with `delete_document`.
+        "delete_collection" => match parse_delete_collection_request(&payload) {
+            Ok(collection) => {
+                let mut core = match CORE.write() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return Envelope::err(codes::INTERNAL, "core lock poisoned")
+                            .to_json_string()
+                    }
+                };
+                let res = store::delete_collection(&mut core, &collection);
+                Envelope::ok(json!({
+                    "deleted": res.deleted,
+                    "collection": collection,
+                    "removed_docs": res.removed_docs,
+                    "removed_segments": res.removed_segments,
+                }))
+            }
+            Err(e) => Envelope::err(codes::BAD_PAYLOAD, e),
+        },
+
         other => Envelope::err(
             codes::UNKNOWN_METHOD,
             format!("no such method: '{other}'"),
@@ -488,7 +537,22 @@ fn parse_get_segment_request(payload: &Value) -> Result<GetSegmentRequest, Strin
     })
 }
 
-/// Parse a `search` payload. `query` required; `k` defaults to 10.
+/// Parse a `delete_document` payload. `doc_id` is required and non-empty.
+fn parse_delete_document_request(payload: &Value) -> Result<String, String> {
+    opt_str(payload, "doc_id")
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "missing or empty 'doc_id'".to_string())
+}
+
+/// Parse a `delete_collection` payload. `collection` is required and non-empty.
+fn parse_delete_collection_request(payload: &Value) -> Result<String, String> {
+    opt_str(payload, "collection")
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "missing or empty 'collection'".to_string())
+}
+
+/// Parse a `search` payload. `query` required; `k` defaults to 10; `mode`
+/// defaults to `dense` (an unknown mode also falls back to `dense`).
 fn parse_search_request(payload: &Value) -> Result<SearchRequest, String> {
     let query = opt_str(payload, "query")
         .ok_or_else(|| "missing 'query'".to_string())?;
@@ -498,9 +562,12 @@ fn parse_search_request(payload: &Value) -> Result<SearchRequest, String> {
         .and_then(|x| x.as_f64())
         .map(|x| x as f32);
     let max_per_doc = opt_u64(payload, "max_per_doc").map(|v| v as usize);
+    // `mode`: dense | keyword | hybrid. Absent/unknown → dense (back-compat).
+    let mode = SearchMode::parse(payload.get("mode").and_then(|x| x.as_str()));
     Ok(SearchRequest {
         query,
         collection: opt_str(payload, "collection"),
+        mode,
         k,
         min_score,
         max_per_doc,
@@ -1226,5 +1293,292 @@ mod tests {
 
         // It still embeds (truncated) in the background and reaches Ready.
         assert!(store::wait_until_ready("raw", std::time::Duration::from_secs(5)));
+    }
+
+    // -- Stage 2: hybrid search (mode: dense | keyword | hybrid) -------------
+
+    /// Seed three docs whose contents separate the two retrieval channels:
+    ///   * `dwin` — semantically close to "database connection" (dense-strong)
+    ///     but has none of the exact-id token, so keyword wouldn't surface it.
+    ///   * `kwin` — carries the exact identifier `sku7701234567` (keyword-strong)
+    ///     but little semantic overlap, so dense alone may bury it under noise.
+    ///   * `noise` — unrelated, to give RRF something to outrank.
+    fn seed_hybrid_docs() {
+        call("configure", "{}");
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"dwin","name":"db",
+                "segments":[{"text":"database connection pooling and tuning guide"}]}"#,
+        );
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"kwin","name":"sku",
+                "segments":[{"text":"sku7701234567 inventory record"}]}"#,
+        );
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"noise","name":"x",
+                "segments":[{"text":"completely irrelevant banana smoothie"}]}"#,
+        );
+        assert!(store::wait_until_ready("c", std::time::Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn keyword_mode_ranks_by_term_match() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // doc m has two distinct query terms; doc o has one; doc z has none.
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"m","name":"m",
+                "segments":[{"text":"alpha beta gamma"}]}"#,
+        );
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"o","name":"o",
+                "segments":[{"text":"alpha delta epsilon"}]}"#,
+        );
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"z","name":"z",
+                "segments":[{"text":"nothing relevant here"}]}"#,
+        );
+        assert!(store::wait_until_ready("c", std::time::Duration::from_secs(5)));
+
+        let v = call(
+            "search",
+            r#"{"query":"alpha beta","collection":"c","mode":"keyword","k":10}"#,
+        );
+        assert_eq!(v["ok"], json!(true));
+        // keyword reads only text → never partial.
+        assert_eq!(v["result"]["partial"], json!(false));
+        let hits = v["result"]["hits"].as_array().unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h["doc_id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), 2, "only docs containing a query term match");
+        assert_eq!(ids[0], "m", "two-term doc outranks one-term doc");
+        assert_eq!(ids[1], "o");
+        assert!(!ids.contains(&"z"), "non-matching doc is excluded");
+    }
+
+    #[test]
+    fn keyword_mode_works_while_building() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // Index but do NOT wait for vectors — keyword must work immediately.
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"b1","name":"b",
+                "segments":[{"text":"exact token magicword present"}]}"#,
+        );
+        let v = call(
+            "search",
+            r#"{"query":"magicword","collection":"c","mode":"keyword","k":5}"#,
+        );
+        assert_eq!(v["ok"], json!(true));
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "keyword works before vectors are ready");
+        assert_eq!(hits[0]["doc_id"], json!("b1"));
+    }
+
+    #[test]
+    fn hybrid_mode_rrf_surfaces_both_channels() {
+        let _g = e2e_guard();
+        seed_hybrid_docs();
+        // A query blending a semantic phrase (favors dwin via dense) with the
+        // exact id token (favors kwin via keyword). RRF must surface BOTH.
+        let v = call(
+            "search",
+            r#"{"query":"database connection sku7701234567","collection":"c","mode":"hybrid","k":10}"#,
+        );
+        assert_eq!(v["ok"], json!(true));
+        let hits = v["result"]["hits"].as_array().unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h["doc_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"dwin"), "dense-strong doc must surface");
+        assert!(ids.contains(&"kwin"), "keyword-only-strong doc must surface");
+    }
+
+    #[test]
+    fn keyword_and_hybrid_honor_filter_k_and_max_per_doc() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // Two docs share the query term; meta distinguishes them. Each doc has
+        // two matching segments so max_per_doc is observable.
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"en1","name":"en","meta":{"lang":"en"},
+                "segments":[{"text":"shared keyword one"},{"text":"shared keyword two"}]}"#,
+        );
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"ru1","name":"ru","meta":{"lang":"ru"},
+                "segments":[{"text":"shared keyword three"},{"text":"shared keyword four"}]}"#,
+        );
+        assert!(store::wait_until_ready("c", std::time::Duration::from_secs(5)));
+
+        // keyword + meta filter (lang==en) → only en1's segments.
+        let v = call(
+            "search",
+            r#"{"query":"shared keyword","collection":"c","mode":"keyword","k":10,
+                "filter":{"all":{"lang":"en"}}}"#,
+        );
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter().all(|h| h["doc_id"] == json!("en1")),
+            "keyword must respect the meta filter"
+        );
+
+        // keyword + k caps total hits.
+        let v = call(
+            "search",
+            r#"{"query":"shared keyword","collection":"c","mode":"keyword","k":1}"#,
+        );
+        assert_eq!(v["result"]["hits"].as_array().unwrap().len(), 1, "k caps keyword");
+
+        // hybrid + max_per_doc:1 → at most one hit per doc.
+        let v = call(
+            "search",
+            r#"{"query":"shared keyword","collection":"c","mode":"hybrid","k":10,"max_per_doc":1}"#,
+        );
+        let hits = v["result"]["hits"].as_array().unwrap();
+        let mut per_doc = std::collections::HashMap::new();
+        for h in hits {
+            *per_doc.entry(h["doc_id"].as_str().unwrap()).or_insert(0) += 1;
+        }
+        assert!(per_doc.values().all(|&n| n <= 1), "hybrid must respect max_per_doc");
+    }
+
+    // -- Stage 2: incremental delete ----------------------------------------
+
+    #[test]
+    fn delete_document_removes_from_search_grep_and_get_segment() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // A raw doc → searchable + greppable + get_segment-able.
+        call(
+            "index_raw",
+            r#"{"collection":"c","doc_id":"d1","name":"guide",
+                "text":"database connection tuning\nsecond informative line"}"#,
+        );
+        // A second doc so the collection survives the first delete.
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"d2","name":"keep","segments":[{"text":"keep me around"}]}"#,
+        );
+        assert!(store::wait_until_ready("c", std::time::Duration::from_secs(5)));
+
+        // Present in all three surfaces before the delete.
+        assert!(!call("grep", r#"{"pattern":"database","collection":"c"}"#)["result"]["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(!call("search", r#"{"query":"database connection","collection":"c","mode":"keyword","k":10}"#)["result"]["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            call("get_segment", r#"{"doc_id":"d1","line_start":1,"line_end":1}"#)["ok"],
+            json!(true)
+        );
+
+        // Delete d1.
+        let v = call("delete_document", r#"{"doc_id":"d1"}"#);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["result"]["deleted"], json!(true));
+        assert_eq!(v["result"]["collection"], json!("c"));
+        assert!(v["result"]["removed_segments"].as_u64().unwrap() >= 1);
+        assert_eq!(v["result"]["collection_dropped"], json!(false), "d2 keeps it alive");
+
+        // Gone from grep, keyword search, and get_segment (now not_found).
+        assert!(call("grep", r#"{"pattern":"database","collection":"c"}"#)["result"]["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty(), "grep no longer finds the deleted doc");
+        assert!(call("search", r#"{"query":"database connection","collection":"c","mode":"keyword","k":10}"#)["result"]["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty(), "keyword search no longer finds the deleted doc");
+        let g = call("get_segment", r#"{"doc_id":"d1","line_start":1,"line_end":1}"#);
+        assert_eq!(g["ok"], json!(false));
+        assert_eq!(g["error"]["code"], json!(codes::NOT_FOUND));
+
+        // d2 is untouched.
+        assert!(!call("grep", r#"{"pattern":"keep","collection":"c"}"#)["result"]["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn delete_document_drops_empty_collection() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        call(
+            "index_segments",
+            r#"{"collection":"solo","doc_id":"only","name":"n","segments":[{"text":"lonely doc"}]}"#,
+        );
+        assert!(store::wait_until_ready("solo", std::time::Duration::from_secs(5)));
+
+        let v = call("delete_document", r#"{"doc_id":"only"}"#);
+        assert_eq!(v["result"]["deleted"], json!(true));
+        assert_eq!(v["result"]["collection_dropped"], json!(true), "last doc → drop collection");
+
+        // The empty collection is no longer reported by stats.
+        let s = call("stats", "");
+        assert!(s["result"]["collections"].get("solo").is_none(), "empty collection gone from stats");
+    }
+
+    #[test]
+    fn delete_unknown_document_is_structural_false() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        let v = call("delete_document", r#"{"doc_id":"ghost"}"#);
+        // A no-op result, not an error envelope.
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["result"]["deleted"], json!(false));
+        assert_eq!(v["result"]["removed_segments"], json!(0));
+    }
+
+    #[test]
+    fn delete_collection_clears_it_and_unknown_is_false() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"d1","name":"a","segments":[{"text":"one"},{"text":"two"}]}"#,
+        );
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"d2","name":"b","segments":[{"text":"three"}]}"#,
+        );
+        assert!(store::wait_until_ready("c", std::time::Duration::from_secs(5)));
+
+        let v = call("delete_collection", r#"{"collection":"c"}"#);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["result"]["deleted"], json!(true));
+        assert_eq!(v["result"]["removed_docs"], json!(2));
+        assert_eq!(v["result"]["removed_segments"], json!(3));
+
+        // The collection is gone: search and grep find nothing in it.
+        assert!(call("search", r#"{"query":"one two three","collection":"c","mode":"keyword","k":10}"#)["result"]["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let s = call("stats", "");
+        assert!(s["result"]["collections"].get("c").is_none());
+
+        // Unknown collection → structural false (no-op), not an error.
+        let v = call("delete_collection", r#"{"collection":"nope"}"#);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["result"]["deleted"], json!(false));
+        assert_eq!(v["result"]["removed_docs"], json!(0));
+    }
+
+    #[test]
+    fn delete_document_requires_doc_id() {
+        let _g = e2e_guard();
+        let v = call("delete_document", r#"{}"#);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["error"]["code"], json!(codes::BAD_PAYLOAD));
     }
 }
