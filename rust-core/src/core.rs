@@ -64,6 +64,11 @@ pub struct Segment {
 }
 
 /// One document: a `doc_id`-keyed bundle of segments with doc-level metadata.
+///
+/// For `index_raw` documents we additionally retain the **full normalized text**
+/// plus a **line offset table** so `get_segment` can do an O(1) line-range slice.
+/// Atomic `index_segments` records leave both `None` — they have no document-wide
+/// text/line model, so `get_segment` returns a structural `no_line_index` error.
 #[derive(Clone)]
 pub struct Document {
     /// Required stable id (a 1C reference / GUID). Everything that is later
@@ -73,6 +78,12 @@ pub struct Document {
     /// Doc-level metadata (JSON object), echoed back in hits.
     pub meta: serde_json::Value,
     pub segments: Vec<Segment>,
+    /// Full CRLF→LF-normalized document text. `Some` only for `index_raw` docs.
+    pub full_text: Option<String>,
+    /// Byte offset of the start of each line in `full_text` (1-based line N is at
+    /// `line_offsets[N-1]`). Parallel to `full_text`; `Some` only for raw docs.
+    /// Has exactly `line_count` entries (the number of `\n`-delimited lines).
+    pub line_offsets: Option<Vec<usize>>,
 }
 
 /// Two-axis vector state. `text_ready` is a separate boolean on the collection.
@@ -377,6 +388,10 @@ pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
         name: req.name,
         meta: req.meta,
         segments: Vec::with_capacity(req.segments.len()),
+        // Atomic `index_segments` records carry no document-wide text/offset
+        // table; `get_segment` is intentionally unsupported for them.
+        full_text: None,
+        line_offsets: None,
     };
     let mut segment_ids: Vec<u64> = Vec::with_capacity(req.segments.len());
     let mut embed_texts: Vec<String> = Vec::with_capacity(req.segments.len());
@@ -592,6 +607,440 @@ fn apply_job(job: EmbedJob, vectors: Option<Vec<Vec<f32>>>) {
     if coll.pending_jobs == 0 {
         coll.vector_status = VectorStatus::Ready;
     }
+}
+
+// ===========================================================================
+// index_raw — normalize + offset table + chunker + async accept
+// ===========================================================================
+
+/// Default token target per chunk when the request omits `chunk_cfg`. The
+/// chunker aims for chunks around this many estimated tokens, snapping to whole
+/// lines, so a chunk is usually slightly under or over this figure.
+pub const DEFAULT_CHUNK_TARGET_TOKENS: usize = 300;
+
+/// Default number of overlapping lines carried into the next chunk so a match
+/// straddling a chunk boundary is still wholly present in at least one chunk.
+const DEFAULT_OVERLAP_LINES: usize = 2;
+
+/// Estimate the token count of a piece of text.
+///
+/// IMPORTANT — heuristic placeholder. There is no real tokenizer in this slice
+/// (the [`MockEmbedder`] is a bag-of-hashed-tokens model with no vocabulary). We
+/// approximate a transformer subword count with `max(whitespace_words, chars/4)`:
+/// whitespace words give a sane floor for normal prose, while `chars/4` (the
+/// common "~4 chars per token" rule of thumb) dominates for long/CJK/no-space
+/// runs so we never wildly under-count. This is the SINGLE place that defines
+/// "token count"; when the real embedder + tokenizer land, swap this body for a
+/// call into the tokenizer and everything downstream (budget, hard cap, oversized
+/// detection) keeps working unchanged.
+pub fn estimate_tokens(text: &str) -> usize {
+    let words = text.split_whitespace().count();
+    let chars = text.chars().count();
+    words.max(chars / 4)
+}
+
+/// Knobs controlling how [`chunk_text`] splits a document. All optional on the
+/// wire (`chunk_cfg`); sensible defaults are filled in by [`ChunkConfig::resolve`].
+#[derive(Clone, Copy)]
+pub struct ChunkConfig {
+    /// Soft per-chunk token budget the chunker aims for (snapped to line ends).
+    pub target_tokens: usize,
+    /// Hard cap on tokens per chunk; defaults to the configured `max_seq_len`.
+    /// A single line over this cap becomes one *oversized* chunk on its own.
+    pub max_tokens: usize,
+    /// Number of trailing lines of one chunk repeated at the start of the next.
+    pub overlap_lines: usize,
+}
+
+impl ChunkConfig {
+    /// Resolve a (possibly partial) request config against the store's
+    /// `max_seq_len`, clamping to keep invariants: target ≥ 1, max ≥ target,
+    /// overlap < target so chunking always makes forward progress.
+    pub fn resolve(
+        target_tokens: Option<usize>,
+        max_tokens: Option<usize>,
+        overlap_lines: Option<usize>,
+        config_max_seq_len: Option<u64>,
+    ) -> ChunkConfig {
+        let target = target_tokens.unwrap_or(DEFAULT_CHUNK_TARGET_TOKENS).max(1);
+        // Hard cap = explicit value, else configured max_seq_len, else fall back
+        // to the target itself. Never below the target (that would make every
+        // chunk oversized).
+        let cap = max_tokens
+            .or_else(|| config_max_seq_len.map(|v| v as usize))
+            .unwrap_or(target)
+            .max(target);
+        // Overlap must stay strictly below the target line count so successive
+        // chunks always advance; we cap it defensively here too.
+        let overlap = overlap_lines.unwrap_or(DEFAULT_OVERLAP_LINES);
+        ChunkConfig {
+            target_tokens: target,
+            max_tokens: cap,
+            overlap_lines: overlap,
+        }
+    }
+}
+
+/// One chunk produced by [`chunk_text`]: its 1-based inclusive line range, the
+/// exact text of those lines, and whether it is an *oversized* single line.
+pub struct Chunk {
+    /// 1-based inclusive first line of the chunk.
+    pub line_start: u64,
+    /// 1-based inclusive last line of the chunk.
+    pub line_end: u64,
+    /// The chunk's text (the joined lines, LF-separated, no trailing newline).
+    pub text: String,
+    /// True when this chunk is a single line that alone exceeds `max_tokens`.
+    /// Such a chunk is truncated for *embedding* but returned whole by
+    /// `get_segment`; we surface the flag so the caller (accept) can truncate
+    /// only the embed text and keep the stored segment text intact.
+    pub oversized: bool,
+}
+
+/// Build the line offset table for `text`: the byte offset at which each
+/// `\n`-delimited line begins. `text` MUST already be CRLF→LF normalized.
+///
+/// The table has exactly one entry per line, where "line count" follows the same
+/// model grep uses: `split('\n')` yields `(number of '\n') + 1` pieces. So a
+/// trailing `\n` produces a final empty line with its own offset (== text.len()).
+/// This lets `get_segment` map a 1-based line number to a byte range in O(1).
+pub fn build_line_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = vec![0usize]; // line 1 always starts at byte 0
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            // The next line starts right after this '\n'.
+            offsets.push(i + 1);
+        }
+    }
+    offsets
+}
+
+/// Split a normalized document into line-snapped chunks by token budget.
+///
+/// Algorithm (greedy, line-granular, with overlap):
+///   * Walk the document's lines. Accumulate lines into the current chunk while
+///     the running token estimate stays under `target_tokens`.
+///   * When adding a line would exceed the target, the current chunk is emitted
+///     (snapped to whole line boundaries — we never split mid-line), and the next
+///     chunk *backs up* `overlap_lines` lines so consecutive chunks overlap.
+///   * Edge case — a single line that alone exceeds `max_tokens` is emitted as
+///     its own **oversized** chunk (it cannot be combined or split further at the
+///     line granularity). The caller truncates only its *embed* text to the cap;
+///     `get_segment` still returns it whole from the stored full text.
+///
+/// Returns chunks with 1-based inclusive line ranges. An empty document yields a
+/// single empty chunk covering line 1 so the doc is always representable.
+pub fn chunk_text(text: &str, cfg: &ChunkConfig) -> Vec<Chunk> {
+    // Line model matches `build_line_offsets` / grep: split on '\n'. This keeps
+    // line numbers consistent across chunking, the offset table, and get_segment.
+    let lines: Vec<&str> = text.split('\n').collect();
+    let n = lines.len();
+
+    let mut chunks: Vec<Chunk> = Vec::new();
+    if n == 0 {
+        return chunks; // unreachable (split always yields ≥1), but be safe.
+    }
+
+    let mut start = 0usize; // 0-based index of the current chunk's first line
+    while start < n {
+        let mut end = start; // 0-based inclusive index of last line included
+        let mut tokens = estimate_tokens(lines[start]);
+
+        // A single first line already over the hard cap → oversized chunk of
+        // exactly that line. Don't try to grow it.
+        let oversized = tokens > cfg.max_tokens;
+        if !oversized {
+            // Grow the chunk one line at a time while we stay within the target
+            // budget. We always keep at least the starting line (end == start).
+            while end + 1 < n {
+                let next_tokens = estimate_tokens(lines[end + 1]);
+                if tokens + next_tokens > cfg.target_tokens {
+                    break;
+                }
+                tokens += next_tokens;
+                end += 1;
+            }
+        }
+
+        // Materialize the chunk text from the joined lines (LF-separated).
+        let text = lines[start..=end].join("\n");
+        chunks.push(Chunk {
+            line_start: (start + 1) as u64, // 1-based inclusive
+            line_end: (end + 1) as u64,
+            text,
+            oversized,
+        });
+
+        // Advance. Normally we step to `end + 1`, but back up `overlap_lines` so
+        // consecutive chunks share context. Never let overlap stall progress:
+        // the next start must be strictly greater than the current start.
+        let next_start = (end + 1).saturating_sub(cfg.overlap_lines);
+        start = next_start.max(start + 1);
+    }
+
+    chunks
+}
+
+/// A parsed `index_raw` request (the raw-document ingest path).
+pub struct RawIndexRequest {
+    pub collection: String,
+    /// Caller-supplied id; `None` ⇒ auto-assign a stable id and return it.
+    pub doc_id: Option<String>,
+    pub name: String,
+    pub meta: serde_json::Value,
+    /// The raw document text (any newline convention; normalized on accept).
+    pub text: String,
+    /// Optional chunker overrides (`target_tokens` / `max_tokens` / `overlap_lines`).
+    pub target_tokens: Option<usize>,
+    pub max_tokens: Option<usize>,
+    pub overlap_lines: Option<usize>,
+}
+
+/// Outcome of the synchronous `index_raw` accept. `doc_id` is always populated
+/// (auto-assigned when the request omitted it) so the caller can upsert/delete.
+pub struct RawAcceptResult {
+    pub collection: String,
+    pub doc_id: String,
+    pub segment_count: usize,
+}
+
+/// Auto-assign a stable, collision-resistant `doc_id` for a fire-and-forget
+/// `index_raw` with no caller id. Reuses the monotonic segment-id source so the
+/// value is unique within the process run. The `raw:` prefix makes auto-ids
+/// distinguishable from caller GUIDs in logs/debugging.
+fn auto_doc_id(core: &mut Core) -> String {
+    format!("raw:{}", core.alloc_segment_id())
+}
+
+/// Synchronous accept for `index_raw`. Under the short write lock it:
+///   1. normalizes the text CRLF→LF;
+///   2. builds the line offset table for the full document;
+///   3. stores the full normalized text + offset table on the doc (so
+///      `get_segment` works the instant this returns — before any embedding);
+///   4. chunks the text (line-snapped, by token budget, with overlap) and
+///      installs each chunk as a text segment with `vector: None`;
+///   5. marks the collection `text_ready` / `Building` and enqueues ONE embed
+///      job for the worker (which later fills only the vectors).
+///
+/// Returns immediately; embedding happens off-thread, exactly like
+/// `index_segments`. The doc is greppable and `get_segment`-able right away.
+pub fn accept_index_raw(core: &mut Core, req: RawIndexRequest) -> RawAcceptResult {
+    let _embedder = ensure_embedder(core);
+
+    // (1) Normalize newlines once, up front. Everything downstream — offsets,
+    // chunk line numbers, stored text — is in terms of this LF-only text.
+    let full_text = normalize_newlines(&req.text);
+
+    // (2) Offset table over the full normalized document.
+    let line_offsets = build_line_offsets(&full_text);
+
+    // Resolve chunk config against the configured max_seq_len (the hard cap).
+    let cfg = ChunkConfig::resolve(
+        req.target_tokens,
+        req.max_tokens,
+        req.overlap_lines,
+        core.config.max_seq_len,
+    );
+
+    // (4) Chunk the normalized text into line-snapped segments.
+    let chunks = chunk_text(&full_text, &cfg);
+
+    // doc_id: caller-supplied or auto-assigned (returned in the ack).
+    let doc_id = match req.doc_id {
+        Some(id) => id,
+        None => auto_doc_id(core),
+    };
+
+    // Build the doc's segments + the parallel (segment_id, embed_text) lists.
+    let mut segments: Vec<Segment> = Vec::with_capacity(chunks.len());
+    let mut segment_ids: Vec<u64> = Vec::with_capacity(chunks.len());
+    let mut embed_texts: Vec<String> = Vec::with_capacity(chunks.len());
+    let mut skipped_now: u64 = 0;
+
+    for chunk in chunks {
+        let segment_id = core.alloc_segment_id();
+        // Oversized single line → truncate ONLY the embed text to the hard cap.
+        // The stored segment text stays whole (get_segment returns it intact).
+        let embed_full = if chunk.oversized {
+            truncate_to_tokens(&chunk.text, cfg.max_tokens)
+        } else {
+            chunk.text.clone()
+        };
+        let is_blank = embed_full.trim().is_empty();
+        if is_blank {
+            skipped_now += 1;
+        }
+        segment_ids.push(segment_id);
+        embed_texts.push(if is_blank { String::new() } else { embed_full });
+        segments.push(Segment {
+            segment_id,
+            text: chunk.text,
+            embed_text: None,
+            line_start: Some(chunk.line_start),
+            line_end: Some(chunk.line_end),
+            meta: serde_json::json!({}),
+            vector: None,
+        });
+    }
+
+    let segment_count = segments.len();
+
+    // (3) Build the doc carrying the full text + offset table.
+    let doc = Document {
+        doc_id: doc_id.clone(),
+        name: req.name,
+        meta: req.meta,
+        segments,
+        full_text: Some(full_text),
+        line_offsets: Some(line_offsets),
+    };
+
+    // (5) Short write-locked accept: install text+offsets, mark Building, upsert.
+    let coll = core
+        .collections
+        .entry(req.collection.clone())
+        .or_insert_with(Collection::new);
+    coll.text_ready = true;
+    coll.vector_status = VectorStatus::Building;
+    coll.error = None;
+    coll.pending_jobs = coll.pending_jobs.saturating_add(1);
+    coll.skipped = coll.skipped.saturating_add(skipped_now);
+    // Atomic upsert by doc_id (same semantics as index_segments).
+    coll.docs.insert(doc_id.clone(), doc);
+
+    // Enqueue the embed job for the worker (fills vectors off-thread).
+    enqueue_job(
+        core,
+        EmbedJob {
+            collection: req.collection.clone(),
+            doc_id: doc_id.clone(),
+            segment_ids,
+            embed_texts,
+        },
+    );
+
+    RawAcceptResult {
+        collection: req.collection,
+        doc_id,
+        segment_count,
+    }
+}
+
+/// Truncate `text` to roughly `max_tokens` for *embedding only*. Uses the same
+/// "~4 chars per token" rule of thumb as [`estimate_tokens`]; cut on a char
+/// boundary so we never split a UTF-8 sequence. The original line is preserved
+/// elsewhere (stored segment text) — this only bounds what we hand the embedder.
+fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
+    let max_chars = max_tokens.saturating_mul(4);
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    text.chars().take(max_chars).collect()
+}
+
+// ===========================================================================
+// get_segment — O(1) line-range slice over the offset table
+// ===========================================================================
+
+/// A parsed `get_segment` request.
+pub struct GetSegmentRequest {
+    pub doc_id: String,
+    pub line_start: u64,
+    pub line_end: u64,
+    /// Optional hard cap on how many lines are returned (after clamping).
+    pub max_lines: Option<usize>,
+}
+
+/// Why `get_segment` could not produce a slice. Surfaced as a structural error.
+pub enum GetSegmentError {
+    /// No document with that `doc_id` exists in any collection.
+    NotFound,
+    /// The document exists but has no full-text/offset table (an atomic
+    /// `index_segments` record). Line slicing is not supported for it.
+    NoLineIndex,
+}
+
+/// Successful `get_segment` result: the sliced text plus the *actual* (clamped)
+/// 1-based inclusive line range that was returned.
+pub struct GetSegmentResult {
+    pub doc_id: String,
+    pub line_start: u64,
+    pub line_end: u64,
+    pub text: String,
+    /// Total number of lines in the document (so the caller can page).
+    pub line_count: u64,
+}
+
+/// Return the text of lines `[line_start, line_end]` (1-based inclusive) from a
+/// document's stored full text via its offset table — O(1) per boundary, then a
+/// single substring copy.
+///
+/// Clamping: an out-of-range request is clamped to `[1, line_count]` and the
+/// *actual* range used is returned. `max_lines`, when set, further caps the
+/// returned line count (trimming from the end). A reversed request
+/// (`line_start > line_end`) is normalized to a single line at the start.
+///
+/// Errors: an unknown `doc_id` → [`GetSegmentError::NotFound`]; a document with
+/// no offset table (atomic `index_segments` record) → [`GetSegmentError::NoLineIndex`].
+pub fn get_segment(core: &Core, req: &GetSegmentRequest) -> Result<GetSegmentResult, GetSegmentError> {
+    // Find the doc across all collections (doc_id is unique per ingest path; the
+    // first match wins). We scan collections because doc_id is the addressing
+    // key and the caller doesn't pass a collection here.
+    let doc = core
+        .collections
+        .values()
+        .find_map(|coll| coll.docs.get(&req.doc_id))
+        .ok_or(GetSegmentError::NotFound)?;
+
+    // Must be a raw doc with a full-text/offset table.
+    let (full_text, offsets) = match (&doc.full_text, &doc.line_offsets) {
+        (Some(t), Some(o)) => (t, o),
+        _ => return Err(GetSegmentError::NoLineIndex),
+    };
+
+    let line_count = offsets.len() as u64; // ≥ 1 (offsets always has line 1)
+
+    // Clamp the requested range to [1, line_count]. A 0 or reversed request is
+    // normalized: start is clamped to ≥1, end to ≥start, both to ≤ line_count.
+    let mut start = req.line_start.clamp(1, line_count);
+    let mut end = req.line_end.clamp(start, line_count);
+
+    // Respect max_lines (cap the returned line count, trimming from the end).
+    if let Some(max) = req.max_lines {
+        let max = max.max(1) as u64;
+        if end - start + 1 > max {
+            end = start + max - 1;
+        }
+    }
+    let _ = &mut start; // start is final; kept mutable above for clarity.
+
+    // O(1) byte range: line N starts at offsets[N-1]; the slice runs from the
+    // start of `start` to the end of `end`. The end of line `end` is the start
+    // of line `end+1` minus its '\n' (i.e. offsets[end] - 1), or text.len() for
+    // the last line.
+    let byte_start = offsets[(start - 1) as usize];
+    let byte_end = if (end as usize) < offsets.len() {
+        // Start of the next line minus the separating '\n'.
+        offsets[end as usize] - 1
+    } else {
+        full_text.len()
+    };
+    let text = full_text[byte_start..byte_end].to_string();
+
+    Ok(GetSegmentResult {
+        doc_id: req.doc_id.clone(),
+        line_start: start,
+        line_end: end,
+        text,
+        line_count,
+    })
+}
+
+/// Normalize line endings to `\n` (CRLF and bare CR → LF). Mirrors the grep
+/// module's normalization so the line model is identical everywhere: chunking,
+/// the offset table, grep, and get_segment all agree on what a "line" is.
+fn normalize_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 // ===========================================================================
@@ -836,9 +1285,19 @@ mod tests {
 
     /// Acquire the global test mutex so the shared `CORE` singleton isn't raced
     /// by tests running in parallel. Each test resets state at the start.
+    ///
+    /// Crucially we also **drain the background worker** (`shutdown` joins it)
+    /// BEFORE resetting: the worker is a process-global thread shared by every
+    /// test, so a job enqueued by a *previous* test could otherwise apply to a
+    /// later test's same-named collection and flip it `Ready` prematurely (a
+    /// latent cross-test race). Draining first guarantees no stale job survives
+    /// into the next test; the worker respawns lazily on the next ingest. This is
+    /// test-harness hygiene only — production behaviour is unchanged.
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         let g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // Fresh state for every test.
+        // Join any in-flight worker so no stale job bleeds into this test, then
+        // reset to a clean slate.
+        shutdown();
         if let Ok(mut c) = CORE.write() {
             c.reset();
         }
@@ -893,6 +1352,8 @@ mod tests {
                     name: "n".to_string(),
                     meta: json!({}),
                     segments: vec![],
+                    full_text: None,
+                    line_offsets: None,
                 },
             );
         }
@@ -1167,5 +1628,254 @@ mod tests {
             wait_until_ready("docs", Duration::from_secs(5)),
             "ingest after shutdown should respawn worker and complete"
         );
+    }
+
+    // ===================================================================
+    // index_raw: chunker + offset table (pure-function unit tests)
+    // ===================================================================
+
+    /// Build a config with a known small target/cap/overlap for deterministic
+    /// chunking tests independent of the default 300-token budget.
+    fn cfg(target: usize, cap: usize, overlap: usize) -> ChunkConfig {
+        ChunkConfig::resolve(Some(target), Some(cap), Some(overlap), None)
+    }
+
+    #[test]
+    fn estimate_tokens_uses_max_of_words_and_chars_over_4() {
+        // Five short words → 5 words; chars/4 is smaller, so words wins.
+        assert_eq!(estimate_tokens("a b c d e"), 5);
+        // One long no-space run: words=1 but chars/4 dominates so we don't
+        // wildly under-count a single huge token.
+        let long = "x".repeat(40);
+        assert_eq!(estimate_tokens(&long), 10); // 40 chars / 4
+        assert_eq!(estimate_tokens(""), 0);
+    }
+
+    #[test]
+    fn offset_table_maps_lines_to_byte_starts() {
+        // 3 lines, no trailing newline.
+        let text = "ab\ncde\nf";
+        let off = build_line_offsets(text);
+        assert_eq!(off, vec![0, 3, 7]); // "ab\n"=0..3, "cde\n"=3..7, "f"=7
+        // A trailing newline yields a final empty line with its own offset.
+        let text2 = "ab\ncd\n";
+        let off2 = build_line_offsets(text2);
+        assert_eq!(off2, vec![0, 3, 6]); // last (empty) line starts at len()
+    }
+
+    #[test]
+    fn chunker_snaps_to_lines_and_overlaps() {
+        // Six single-word lines; target 3 tokens means ~3 lines per chunk.
+        // overlap=1 → the last line of a chunk repeats as the first of the next.
+        let text = "l1\nl2\nl3\nl4\nl5\nl6";
+        let chunks = chunk_text(text, &cfg(3, 100, 1));
+        // Each chunk is at most 3 lines (the target), snapped to whole lines.
+        assert!(chunks.len() >= 2, "must split into multiple chunks");
+        for ch in &chunks {
+            assert!(ch.line_end >= ch.line_start, "range well-formed");
+            assert!(!ch.oversized);
+            // The chunk text is exactly the joined source lines.
+            let all_lines: Vec<&str> = text.split('\n').collect();
+            let joined =
+                all_lines[(ch.line_start - 1) as usize..=(ch.line_end - 1) as usize].join("\n");
+            assert_eq!(ch.text, joined);
+        }
+        // Overlap: consecutive chunks must share at least `overlap` line(s) — the
+        // next chunk starts no later than the previous chunk's last line.
+        for w in chunks.windows(2) {
+            assert!(
+                w[1].line_start <= w[0].line_end,
+                "consecutive chunks must overlap (got {} then start {})",
+                w[0].line_end,
+                w[1].line_start
+            );
+        }
+        // Coverage: line 1 is in the first chunk, the last line in the last.
+        assert_eq!(chunks.first().unwrap().line_start, 1);
+        assert_eq!(chunks.last().unwrap().line_end, 6);
+    }
+
+    #[test]
+    fn chunker_oversized_single_line_is_one_chunk() {
+        // A single line whose token estimate exceeds the hard cap (cap=3) must
+        // become exactly one oversized chunk covering just that line.
+        let huge = "tok ".repeat(50); // ~50 whitespace tokens, one line
+        let text = format!("short before\n{}\nshort after", huge.trim());
+        let chunks = chunk_text(&text, &cfg(3, 5, 1));
+        // Find the oversized chunk: it must be exactly one line, whole.
+        let oversized: Vec<&Chunk> = chunks.iter().filter(|c| c.oversized).collect();
+        assert_eq!(oversized.len(), 1, "exactly one oversized chunk");
+        let o = oversized[0];
+        assert_eq!(o.line_start, o.line_end, "oversized chunk is a single line");
+        assert!(o.text.starts_with("tok"), "oversized chunk holds the whole line");
+        assert_eq!(o.text, huge.trim(), "stored oversized text is the full line");
+    }
+
+    #[test]
+    fn truncate_to_tokens_bounds_embed_text_on_char_boundary() {
+        let s = "a".repeat(100);
+        let t = truncate_to_tokens(&s, 5); // 5 tokens * 4 = 20 chars
+        assert_eq!(t.chars().count(), 20);
+        // Short text is returned unchanged.
+        assert_eq!(truncate_to_tokens("hi", 5), "hi");
+    }
+
+    // ===================================================================
+    // get_segment: O(1) slice, clamping, structural errors
+    // ===================================================================
+
+    /// Accept a raw doc synchronously under the write lock and return its doc_id.
+    fn index_raw_doc(collection: &str, doc_id: Option<&str>, text: &str) -> String {
+        let mut c = CORE.write().unwrap();
+        let res = accept_index_raw(
+            &mut c,
+            RawIndexRequest {
+                collection: collection.to_string(),
+                doc_id: doc_id.map(String::from),
+                name: "raw doc".to_string(),
+                meta: json!({}),
+                text: text.to_string(),
+                target_tokens: Some(3),
+                max_tokens: Some(8),
+                overlap_lines: Some(1),
+            },
+        );
+        res.doc_id
+    }
+
+    #[test]
+    fn get_segment_basic_slice_and_immediate_after_accept() {
+        let _g = test_lock();
+        // CRLF on the wire → normalized to LF; get_segment works immediately,
+        // before any vectors are computed (we never wait_until_ready here).
+        let id = index_raw_doc("docs", Some("r1"), "line one\r\nline two\r\nline three");
+        assert_eq!(id, "r1");
+        let c = CORE.read().unwrap();
+        let res = get_segment(
+            &c,
+            &GetSegmentRequest {
+                doc_id: "r1".to_string(),
+                line_start: 2,
+                line_end: 3,
+                max_lines: None,
+            },
+        )
+        .unwrap_or_else(|_| panic!("slice must succeed"));
+        // CRLF was normalized away; the slice is exactly lines 2..=3.
+        assert_eq!(res.text, "line two\nline three");
+        assert_eq!(res.line_start, 2);
+        assert_eq!(res.line_end, 3);
+        assert_eq!(res.line_count, 3);
+    }
+
+    #[test]
+    fn get_segment_out_of_range_clamps_and_returns_actual() {
+        let _g = test_lock();
+        index_raw_doc("docs", Some("r2"), "a\nb\nc");
+        let c = CORE.read().unwrap();
+        // Request lines 0..=99 → clamp to 1..=3 and report the actual range.
+        let res = get_segment(
+            &c,
+            &GetSegmentRequest {
+                doc_id: "r2".to_string(),
+                line_start: 0,
+                line_end: 99,
+                max_lines: None,
+            },
+        )
+        .unwrap_or_else(|_| panic!("clamped slice must succeed"));
+        assert_eq!(res.line_start, 1);
+        assert_eq!(res.line_end, 3);
+        assert_eq!(res.text, "a\nb\nc");
+    }
+
+    #[test]
+    fn get_segment_respects_max_lines() {
+        let _g = test_lock();
+        index_raw_doc("docs", Some("r3"), "a\nb\nc\nd\ne");
+        let c = CORE.read().unwrap();
+        let res = get_segment(
+            &c,
+            &GetSegmentRequest {
+                doc_id: "r3".to_string(),
+                line_start: 2,
+                line_end: 5,
+                max_lines: Some(2),
+            },
+        )
+        .unwrap_or_else(|_| panic!("max_lines slice must succeed"));
+        assert_eq!(res.line_start, 2);
+        assert_eq!(res.line_end, 3, "max_lines caps the returned range");
+        assert_eq!(res.text, "b\nc");
+    }
+
+    #[test]
+    fn get_segment_on_atomic_record_is_no_line_index() {
+        let _g = test_lock();
+        // An index_segments doc has no full text / offset table.
+        index("docs", "atomic1", &["just a segment, no document text"]);
+        let c = CORE.read().unwrap();
+        let err = get_segment(
+            &c,
+            &GetSegmentRequest {
+                doc_id: "atomic1".to_string(),
+                line_start: 1,
+                line_end: 1,
+                max_lines: None,
+            },
+        );
+        assert!(matches!(err, Err(GetSegmentError::NoLineIndex)));
+    }
+
+    #[test]
+    fn get_segment_unknown_doc_is_not_found() {
+        let _g = test_lock();
+        let c = CORE.read().unwrap();
+        let err = get_segment(
+            &c,
+            &GetSegmentRequest {
+                doc_id: "nope".to_string(),
+                line_start: 1,
+                line_end: 1,
+                max_lines: None,
+            },
+        );
+        assert!(matches!(err, Err(GetSegmentError::NotFound)));
+    }
+
+    #[test]
+    fn index_raw_auto_assigns_doc_id() {
+        let _g = test_lock();
+        // No doc_id supplied → a stable id is auto-assigned and returned.
+        let id = index_raw_doc("docs", None, "auto id document body");
+        assert!(!id.is_empty(), "auto doc_id must be returned");
+        let c = CORE.read().unwrap();
+        assert!(
+            c.collections
+                .get("docs")
+                .unwrap()
+                .docs
+                .contains_key(&id),
+            "auto-assigned doc is addressable by the returned id"
+        );
+    }
+
+    #[test]
+    fn index_raw_doc_embeds_in_background() {
+        // `test_lock()` already drains the shared worker, so no stale job can
+        // flip our collection Ready before our own embed job applies.
+        let _g = test_lock();
+        index_raw_doc("docs", Some("rb"), "alpha beta\ngamma delta\nepsilon zeta");
+        // The worker fills vectors off-thread; collection reaches Ready.
+        assert!(wait_until_ready("docs", Duration::from_secs(5)));
+        let c = CORE.read().unwrap();
+        let doc = c.collections.get("docs").unwrap().docs.get("rb").unwrap();
+        assert!(
+            doc.segments.iter().any(|s| s.vector.is_some()),
+            "raw-doc chunks must get vectors from the worker"
+        );
+        // Full text + offset table are retained on the raw doc.
+        assert!(doc.full_text.is_some());
+        assert!(doc.line_offsets.is_some());
     }
 }

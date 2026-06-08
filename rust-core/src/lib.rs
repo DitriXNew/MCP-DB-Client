@@ -41,7 +41,8 @@ use std::panic::{self, AssertUnwindSafe};
 use serde_json::{json, Value};
 
 use crate::core::{
-    self as store, Config, IndexRequest, SearchRequest, SegmentInput, CORE,
+    self as store, Config, GetSegmentRequest, IndexRequest, RawIndexRequest, SearchRequest,
+    SegmentInput, CORE,
 };
 use crate::filter::MetaFilter;
 use crate::grep::GrepRequest;
@@ -223,6 +224,68 @@ fn dispatch(method: &str, payload_json: &str) -> String {
             Err(e) => Envelope::err(codes::BAD_PAYLOAD, e),
         },
 
+        // Asynchronous raw-document ingest: under a short lock we normalize the
+        // text, build a line offset table, store the full text + table, chunk it
+        // (line-snapped, by token budget, with overlap) and install the chunks
+        // (vector=None); the worker embeds off-thread. Returns immediately, with
+        // the (possibly auto-assigned) doc_id so the caller can upsert/delete.
+        "index_raw" => match parse_raw_index_request(&payload) {
+            Ok(req) => {
+                let mut core = match CORE.write() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return Envelope::err(codes::INTERNAL, "core lock poisoned")
+                            .to_json_string()
+                    }
+                };
+                let res = store::accept_index_raw(&mut core, req);
+                Envelope::ok(json!({
+                    "accepted": true,
+                    "collection": res.collection,
+                    "doc_id": res.doc_id,
+                    "segment_count": res.segment_count,
+                }))
+            }
+            Err(e) => Envelope::err(codes::BAD_PAYLOAD, e),
+        },
+
+        // O(1) line-range slice of a raw document's stored full text via the
+        // offset table. Works the instant after accept (text+offsets are
+        // synchronous). Out-of-range clamps and returns the ACTUAL range used.
+        // An atomic index_segments record (no offset table) → no_line_index.
+        "get_segment" => match parse_get_segment_request(&payload) {
+            Ok(req) => {
+                let core = match CORE.read() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return Envelope::err(codes::INTERNAL, "core lock poisoned")
+                            .to_json_string()
+                    }
+                };
+                match store::get_segment(&core, &req) {
+                    Ok(res) => Envelope::ok(json!({
+                        "doc_id": res.doc_id,
+                        "line_start": res.line_start,
+                        "line_end": res.line_end,
+                        "line_count": res.line_count,
+                        "text": res.text,
+                    })),
+                    Err(store::GetSegmentError::NotFound) => Envelope::err(
+                        codes::NOT_FOUND,
+                        format!("no document with doc_id '{}'", req.doc_id),
+                    ),
+                    Err(store::GetSegmentError::NoLineIndex) => Envelope::err(
+                        codes::NO_LINE_INDEX,
+                        format!(
+                            "doc_id '{}' has no line index (not an index_raw document)",
+                            req.doc_id
+                        ),
+                    ),
+                }
+            }
+            Err(e) => Envelope::err(codes::BAD_PAYLOAD, e),
+        },
+
         // Dense top-k search over normalized vectors (dot product).
         "search" => match parse_search_request(&payload) {
             Ok(req) => {
@@ -361,6 +424,67 @@ fn parse_index_request(payload: &Value) -> Result<IndexRequest, String> {
         name,
         meta,
         segments,
+    })
+}
+
+/// Parse an `index_raw` payload. `collection`, `name`, and `text` are required;
+/// `doc_id` is optional (auto-assigned when absent). `chunk_cfg` is an optional
+/// object with `target_tokens` / `max_tokens` / `overlap_lines` overrides.
+fn parse_raw_index_request(payload: &Value) -> Result<RawIndexRequest, String> {
+    let collection = opt_str(payload, "collection")
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "missing or empty 'collection'".to_string())?;
+    // doc_id is optional; a present-but-blank value is treated as absent so the
+    // caller still gets an auto-assigned id rather than an unusable "" key.
+    let doc_id = opt_str(payload, "doc_id").filter(|s| !s.trim().is_empty());
+    let name = opt_str(payload, "name").unwrap_or_default();
+    let meta = meta_or_empty(payload, "meta");
+    // `text` is required (an empty string is allowed → a single empty chunk).
+    let text = payload
+        .get("text")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "missing 'text'".to_string())?;
+
+    // Optional chunker overrides under `chunk_cfg`.
+    let cfg = payload.get("chunk_cfg");
+    let target_tokens = cfg
+        .and_then(|c| opt_u64(c, "target_tokens"))
+        .map(|v| v as usize);
+    let max_tokens = cfg
+        .and_then(|c| opt_u64(c, "max_tokens"))
+        .map(|v| v as usize);
+    let overlap_lines = cfg
+        .and_then(|c| opt_u64(c, "overlap_lines"))
+        .map(|v| v as usize);
+
+    Ok(RawIndexRequest {
+        collection,
+        doc_id,
+        name,
+        meta,
+        text,
+        target_tokens,
+        max_tokens,
+        overlap_lines,
+    })
+}
+
+/// Parse a `get_segment` payload. `doc_id` is required and non-empty;
+/// `line_start` / `line_end` default to 1 (the store clamps out-of-range values).
+fn parse_get_segment_request(payload: &Value) -> Result<GetSegmentRequest, String> {
+    let doc_id = opt_str(payload, "doc_id")
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "missing or empty 'doc_id'".to_string())?;
+    // Missing line bounds default to 1; the store clamps to the actual range.
+    let line_start = opt_u64(payload, "line_start").unwrap_or(1);
+    let line_end = opt_u64(payload, "line_end").unwrap_or(line_start);
+    let max_lines = opt_u64(payload, "max_lines").map(|v| v as usize);
+    Ok(GetSegmentRequest {
+        doc_id,
+        line_start,
+        line_end,
+        max_lines,
     })
 }
 
@@ -641,6 +765,10 @@ mod tests {
         let g = crate::core::TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        // Drain the shared background worker first so a job enqueued by a prior
+        // test can't apply to this test's same-named collection and flip it
+        // `Ready` prematurely (the worker respawns lazily on the next ingest).
+        store::shutdown();
         let reset = CString::new("reset").unwrap();
         let out = unsafe { rcore_dispatch(reset.as_ptr(), std::ptr::null()) };
         let _ = unsafe { take_and_free(out) };
@@ -938,5 +1066,165 @@ mod tests {
         let hits = v["result"]["hits"].as_array().unwrap();
         assert_eq!(hits.len(), 1, "meta filter must scope grep");
         assert_eq!(hits[0]["doc_id"], json!("m1"));
+    }
+
+    // -- Stage 2: index_raw + get_segment (this card) ------------------------
+
+    #[test]
+    fn index_raw_returns_doc_id_and_segment_count() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // No doc_id → auto-assigned and returned in the ack so the caller can
+        // upsert/delete later.
+        let v = call(
+            "index_raw",
+            r#"{"collection":"raw","name":"manual","text":"line a\nline b\nline c"}"#,
+        );
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["result"]["accepted"], json!(true));
+        assert_eq!(v["result"]["collection"], json!("raw"));
+        let doc_id = v["result"]["doc_id"].as_str().unwrap();
+        assert!(!doc_id.is_empty(), "auto doc_id must be returned in the ack");
+        assert!(v["result"]["segment_count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn index_raw_get_segment_works_right_after_accept() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // CRLF on the wire is normalized to LF on accept; line numbers are
+        // 1-based inclusive. We do NOT wait for vectors — text+offsets are
+        // synchronous, so get_segment must work immediately.
+        let v = call(
+            "index_raw",
+            r#"{"collection":"raw","doc_id":"d1","name":"manual",
+                "text":"first line\r\nsecond line\r\nthird line\r\nfourth line"}"#,
+        );
+        assert_eq!(v["result"]["doc_id"], json!("d1"));
+
+        let v = call(
+            "get_segment",
+            r#"{"doc_id":"d1","line_start":2,"line_end":3}"#,
+        );
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["result"]["line_start"], json!(2));
+        assert_eq!(v["result"]["line_end"], json!(3));
+        assert_eq!(v["result"]["line_count"], json!(4));
+        // CRLF normalized away; exactly lines 2..=3 returned.
+        assert_eq!(v["result"]["text"], json!("second line\nthird line"));
+    }
+
+    #[test]
+    fn get_segment_clamps_out_of_range_and_returns_actual() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        call(
+            "index_raw",
+            r#"{"collection":"raw","doc_id":"d2","name":"n","text":"a\nb\nc"}"#,
+        );
+        // Request well beyond the end → clamp to [1,3] and report actual range.
+        let v = call(
+            "get_segment",
+            r#"{"doc_id":"d2","line_start":2,"line_end":900}"#,
+        );
+        assert_eq!(v["result"]["line_start"], json!(2));
+        assert_eq!(v["result"]["line_end"], json!(3));
+        assert_eq!(v["result"]["text"], json!("b\nc"));
+
+        // max_lines caps the returned line count.
+        let v = call(
+            "get_segment",
+            r#"{"doc_id":"d2","line_start":1,"line_end":3,"max_lines":1}"#,
+        );
+        assert_eq!(v["result"]["line_start"], json!(1));
+        assert_eq!(v["result"]["line_end"], json!(1));
+        assert_eq!(v["result"]["text"], json!("a"));
+    }
+
+    #[test]
+    fn get_segment_on_atomic_record_is_structural_error() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // An atomic index_segments doc has no document-wide text/offset table.
+        call(
+            "index_segments",
+            r#"{"collection":"docs","doc_id":"atomic","name":"a",
+                "segments":[{"text":"a segment with no document line index"}]}"#,
+        );
+        let v = call("get_segment", r#"{"doc_id":"atomic","line_start":1,"line_end":1}"#);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["error"]["code"], json!(codes::NO_LINE_INDEX));
+    }
+
+    #[test]
+    fn get_segment_unknown_doc_is_not_found() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        let v = call("get_segment", r#"{"doc_id":"ghost","line_start":1,"line_end":1}"#);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["error"]["code"], json!(codes::NOT_FOUND));
+    }
+
+    #[test]
+    fn index_raw_doc_is_greppable_immediately_and_searchable_when_ready() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // A multi-line raw doc; chunked synchronously on accept.
+        call(
+            "index_raw",
+            r#"{"collection":"raw","doc_id":"big","name":"guide",
+                "text":"intro paragraph\ndatabase connection pooling and tuning\nunrelated banana smoothie\nclosing notes"}"#,
+        );
+        // Greppable immediately (no vectors needed): the text is in the store.
+        let v = call("grep", r#"{"pattern":"database","collection":"raw"}"#);
+        assert_eq!(v["ok"], json!(true));
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "raw-doc text must be greppable right after accept");
+        assert_eq!(hits[0]["doc_id"], json!("big"));
+
+        // Dense-searchable once the worker finishes embedding the chunks.
+        assert!(store::wait_until_ready("raw", std::time::Duration::from_secs(5)));
+        let v = call(
+            "search",
+            r#"{"query":"database connection","collection":"raw","k":5}"#,
+        );
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["result"]["partial"], json!(false));
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "raw-doc chunks must be dense-searchable when ready");
+        assert_eq!(hits[0]["doc_id"], json!("big"));
+        // The hit carries the chunk's 1-based inclusive line range.
+        assert!(hits[0]["line_start"].as_u64().is_some());
+        assert!(hits[0]["line_end"].as_u64().is_some());
+    }
+
+    #[test]
+    fn index_raw_oversized_line_truncates_embed_but_get_segment_returns_whole() {
+        let _g = e2e_guard();
+        // Small max_seq_len so a long line is "oversized". The line stays whole
+        // in the store (get_segment), but its embed text is truncated to the cap.
+        call("configure", r#"{"max_seq_len":5}"#);
+        // Build a single very long line (many tokens) surrounded by short ones.
+        let long_line = "word ".repeat(60); // ~60 tokens, well over the cap of 5
+        let payload = serde_json::json!({
+            "collection": "raw",
+            "doc_id": "ov",
+            "name": "oversized",
+            "text": format!("short head\n{}\nshort tail", long_line.trim()),
+        });
+        let v = call("index_raw", &payload.to_string());
+        assert_eq!(v["ok"], json!(true));
+
+        // get_segment must return the oversized line WHOLE (line 2).
+        let v = call("get_segment", r#"{"doc_id":"ov","line_start":2,"line_end":2}"#);
+        let text = v["result"]["text"].as_str().unwrap();
+        assert_eq!(
+            text,
+            long_line.trim(),
+            "get_segment returns the oversized line in full, untruncated"
+        );
+
+        // It still embeds (truncated) in the background and reaches Ready.
+        assert!(store::wait_until_ready("raw", std::time::Duration::from_secs(5)));
     }
 }

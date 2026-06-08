@@ -20,6 +20,11 @@ pub mod codes {
     pub const INTERNAL: &str = "internal";
     /// A `grep` pattern failed to compile (invalid regex). Structural, not a panic.
     pub const BAD_PATTERN: &str = "bad_pattern";
+    /// `get_segment` could not find the requested `doc_id` in any collection.
+    pub const NOT_FOUND: &str = "not_found";
+    /// `get_segment` targeted a document that has no full-text/offset table
+    /// (an atomic `index_segments` record). Line slicing is unsupported there.
+    pub const NO_LINE_INDEX: &str = "no_line_index";
 }
 
 /// A structural error object: `{"code": ..., "message": ...}`.
