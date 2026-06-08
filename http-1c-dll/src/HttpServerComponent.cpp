@@ -179,10 +179,11 @@ json paginateJsonArray(const json& arr, const json& params) {
 }
 
 // =========================================================================
-// Native search tools — served by the linked Rust core (rcore_dispatch),
-// NOT forwarded to 1C. The component owns these tool names and their JSON
-// Schemas, so the search subsystem is self-contained regardless of whether
-// 1C declares them.
+// Native search tools — served by the Rust core (rcore.dll, loaded at runtime
+// via RustCore.h), NOT forwarded to 1C. The component owns these tool names and
+// their JSON Schemas, so the search subsystem is self-contained regardless of
+// whether 1C declares them. The tool SURFACE is uniform across lite/full: lite
+// advertises the same tools but returns "install RAG" when they are called.
 // =========================================================================
 
 // True if `toolName` is handled natively by the Rust core (search subsystem).
@@ -356,7 +357,17 @@ json nativeToolDefinitions() {
 // `error` object on failure — tool errors are STRUCTURAL results, never a
 // transport/session failure. Exception/panic-safe: any parse problem degrades
 // to a structured isError result rather than throwing.
+//
+// rcore.dll is loaded at RUNTIME (see RustCore.h). When it's absent — the "lite"
+// component — every native tool returns a structured `rag_not_installed` result
+// telling the caller to install the RAG (full) package.
 json dispatchNativeTool(const std::string& toolName, const json& arguments) {
+    if (!RCore::available()) {
+        return makeTextToolResult(
+            R"({"code":"rag_not_installed","message":"Semantic search backend (rcore.dll) is not installed — this is the lite component. Install the RAG package to enable search/grep/get_segment."})",
+            true);
+    }
+
     std::string argsJson;
     try {
         argsJson = arguments.is_null() ? std::string("{}") : arguments.dump();
@@ -364,7 +375,7 @@ json dispatchNativeTool(const std::string& toolName, const json& arguments) {
         argsJson = "{}";
     }
 
-    RustString raw = RustString::adopt(rcore_dispatch(toolName.c_str(), argsJson.c_str()));
+    RustString raw = RCore::dispatch(toolName, argsJson);
     std::string envelopeStr = raw.str();
 
     if (envelopeStr.empty()) {
@@ -832,12 +843,13 @@ void HttpServerComponent::doStopListen()
     }
 
     // The listener is fully stopped, so no worker thread can still be inside the
-    // native search path (rcore_dispatch). Now it is safe to cancel + join the
+    // native search path (RCore::dispatch). Now it is safe to cancel + join the
     // Rust core's background worker so it isn't running when the DLL unloads.
-    // Best-effort and idempotent by contract; hooked here (server stop / form
-    // close), NOT in ~HttpServerComponent — the Rust singleton is process-global
-    // and outlives any single component instance.
-    rcore_shutdown();
+    // Best-effort and idempotent by contract; a no-op if rcore.dll was never
+    // loaded (lite component). Hooked here (server stop / form close), NOT in
+    // ~HttpServerComponent — the Rust singleton is process-global and outlives
+    // any single component instance.
+    RCore::shutdown();
 
     delete server;
     server = nullptr;

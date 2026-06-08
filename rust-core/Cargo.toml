@@ -7,18 +7,18 @@ license = "MIT"
 publish = false
 
 [lib]
-# Two output shapes:
-#   * staticlib (rcore.lib)  — the MOCK build: linked directly into the MSVC C++
-#     DLL, which uses the static CRT (/MT); see .cargo/config.toml's +crt-static.
-#   * cdylib   (rcore.dll)   — the FASTEMBED build: ort/onnxruntime requires the
-#     dynamic CRT (/MD), but the 1C C++ component cannot compile under /MD
-#     (char16_t streams hit MSVC C2491). So the real embedder ships as a separate
-#     rcore.dll (built /MD, self-contained static onnxruntime) that the /MT
-#     component links via its import lib and loads across the DLL boundary. The
-#     FFI ownership convention (rcore_free_string frees Rust-side) makes that
-#     boundary safe. Which one the C++ build uses is gated by RCORE_FASTEMBED.
+# Single output shape: cdylib (rcore.dll).
+#   ort/onnxruntime requires the dynamic CRT (/MD), but the 1C C++ component
+#   cannot compile under /MD (char16_t streams hit MSVC C2491). So the real
+#   embedder ships as a separate rcore.dll (built /MD, self-contained static
+#   onnxruntime) that the /MT component does NOT link: it loads rcore.dll at
+#   runtime via LoadLibrary + GetProcAddress (see http-1c-dll/src/RustCore.h).
+#   One libhttp1cWin.dll therefore serves both packages — "lite" (no rcore.dll,
+#   search returns "install RAG") and "full" (with rcore.dll, real search). The
+#   FFI ownership convention (rcore_free_string frees Rust-side) keeps the
+#   cross-DLL string boundary safe. The full build is gated by RCORE_FASTEMBED.
 name = "rcore"
-crate-type = ["staticlib", "cdylib"]
+crate-type = ["cdylib"]
 
 [dependencies]
 # Keep the dependency surface minimal for Stage 0. Heavy ML deps

@@ -75,72 +75,60 @@ else(UNIX)
 endif(UNIX)
 
 # ===========================================================================
-# Rust search core (rust-core/, crate `rcore`) — Stage 0 FFI skeleton.
+# Rust search core (rust-core/, crate `rcore`) — runtime-loaded rcore.dll.
 #
-# The core is built by cargo into a staticlib (.lib) and linked into this DLL.
-# It uses the static CRT (+crt-static, see rust-core/.cargo/config.toml) so it
-# matches the C++ side's /MT (Release) / /MTd (Debug) above. Only MSVC/Windows
-# is wired here; the FFI core is a Windows deliverable for Stage 0/1.
+# The component does NOT link the Rust core. It loads rcore.dll at RUNTIME via
+# LoadLibrary + GetProcAddress (see src/RustCore.h), so the lite component is
+# PURE C++ (/MT) with ZERO cargo/Rust dependency: building libhttp1cWin.dll
+# never invokes cargo. RustCore.h only needs to be on the include path.
 #
-# NOTE: building requires the Rust toolchain (rustup + the
-# x86_64-pc-windows-msvc target) on PATH. The custom target below invokes
-# `cargo build` at DLL-build time; if cargo is missing the build fails loudly.
-# ===========================================================================
-if (NOT UNIX)
+# The header is in src/, so make it resolvable regardless of package flavour.
+target_include_directories(${TARGET} PRIVATE src)
+
+# ---------------------------------------------------------------------------
+# Optional "full" package: also build rcore.dll (the real fastembed search core)
+# and drop it next to the component. ort/onnxruntime requires the DYNAMIC CRT
+# (/MD), so the cdylib is built with -crt-static REMOVED (overriding the
+# +crt-static default in rust-core/.cargo/config.toml) — this is independent of
+# the component's /MT and they never link together. DirectML.dll bundling is a
+# separate, later step.
+#
+# OFF by default → the default build is the Rust-free lite component.
+# ---------------------------------------------------------------------------
+option(RCORE_FASTEMBED "Also build rcore.dll (real fastembed search core) for the full package" OFF)
+
+if (RCORE_FASTEMBED AND NOT UNIX)
 	set(RCORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rust-core")
 	set(RCORE_TARGET_TRIPLE "x86_64-pc-windows-msvc")
 
-	# cargo's output profile dir differs between Debug and Release, and the
-	# extra --release flag is only passed for non-Debug builds.
-	if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-		set(RCORE_CARGO_PROFILE_FLAG "")
-		set(RCORE_PROFILE_DIR "debug")
-	else()
-		set(RCORE_CARGO_PROFILE_FLAG "--release")
-		set(RCORE_PROFILE_DIR "release")
-	endif()
+	# cargo always emits a cdylib under the release profile dir for this target.
+	set(RCORE_DLL_SRC
+		"${RCORE_DIR}/target/${RCORE_TARGET_TRIPLE}/release/rcore.dll")
+	set(RCORE_DLL_OUT "${HTTP1C_OUTPUT_DIR}/rcore.dll")
 
-	# The produced static library. cargo names a `staticlib` crate `<name>.lib`
-	# on MSVC (matching the crate name `rcore` in Cargo.toml).
-	set(RCORE_LIB
-		"${RCORE_DIR}/target/${RCORE_TARGET_TRIPLE}/${RCORE_PROFILE_DIR}/rcore.lib")
-
-	# Rust sources that should trigger a relink. CONFIGURE_DEPENDS re-globs at
-	# build time so editing a .rs file rebuilds the staticlib (cargo itself is
+	# Rust sources that should trigger a rebuild. CONFIGURE_DEPENDS re-globs at
+	# build time so editing a .rs file rebuilds the cdylib (cargo itself is
 	# incremental, but CMake needs the dependency to know it must invoke cargo).
 	file(GLOB_RECURSE RCORE_SOURCES CONFIGURE_DEPENDS
 		"${RCORE_DIR}/src/*.rs")
 	list(APPEND RCORE_SOURCES "${RCORE_DIR}/Cargo.toml")
 
-	# Build the staticlib via cargo. The .lib is the OUTPUT (do NOT also list it
-	# as BYPRODUCTS — Ninja rejects a file defined as an output twice).
+	# Build the cdylib with the dynamic CRT (ort needs /MD), then copy rcore.dll
+	# into the component output dir (bin/). The copied DLL is the OUTPUT.
 	add_custom_command(
-		OUTPUT "${RCORE_LIB}"
-		COMMAND cargo build ${RCORE_CARGO_PROFILE_FLAG}
+		OUTPUT "${RCORE_DLL_OUT}"
+		COMMAND ${CMAKE_COMMAND} -E env "RUSTFLAGS=-C target-feature=-crt-static"
+				cargo build --release --features fastembed
 				--target ${RCORE_TARGET_TRIPLE}
 				--manifest-path "${RCORE_DIR}/Cargo.toml"
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"${RCORE_DLL_SRC}" "${RCORE_DLL_OUT}"
 		WORKING_DIRECTORY "${RCORE_DIR}"
 		DEPENDS ${RCORE_SOURCES}
-		COMMENT "Building Rust core (rcore) staticlib via cargo"
+		COMMENT "Building Rust core (rcore.dll, fastembed) via cargo and copying to bin/"
 		VERBATIM
 		USES_TERMINAL)
 
-	add_custom_target(rcore_staticlib DEPENDS "${RCORE_LIB}")
-	add_dependencies(${TARGET} rcore_staticlib)
-
-	# Make RustCore.h's extern "C" declarations resolvable from the C++ sources.
-	target_include_directories(${TARGET} PRIVATE src)
-
-	# Link the Rust staticlib plus the Win32 system import libraries that a
-	# minimal Rust MSVC staticlib (std runtime) pulls in:
-	#   ntdll    — low-level NT calls used by std (e.g. RtlGenRandom path)
-	#   userenv  — std::env / user profile lookups
-	#   bcrypt   — std's RNG / hashing backend on Windows
-	#   advapi32 — registry + security APIs used by std
-	#   ws2_32   — sockets (already linked above for the C++ side; harmless dup)
-	#   kernel32 — base Win32 (normally implicit, listed for clarity/robustness)
-	# Trim this list if a future, smaller std footprint stops requiring an entry.
-	target_link_libraries(${TARGET} PRIVATE
-		"${RCORE_LIB}"
-		ntdll userenv bcrypt advapi32 ws2_32 kernel32)
+	add_custom_target(rcore_dll DEPENDS "${RCORE_DLL_OUT}")
+	add_dependencies(${TARGET} rcore_dll)
 endif()
