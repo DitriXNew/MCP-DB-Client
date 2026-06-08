@@ -41,8 +41,8 @@
 use std::sync::Mutex;
 
 use fastembed::{
-    EmbeddingModel, InitOptions, InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles,
-    UserDefinedEmbeddingModel,
+    EmbeddingModel, ExecutionProviderDispatch, InitOptions, InitOptionsUserDefined, Pooling,
+    TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
 };
 
 use crate::embed::Embedder;
@@ -51,6 +51,39 @@ use crate::embed::Embedder;
 const QUERY_PREFIX: &str = "query: ";
 /// e5 passage prefix (prepended to every document before embedding).
 const PASSAGE_PREFIX: &str = "passage: ";
+
+/// Which onnxruntime execution provider to request for inference.
+///
+/// ort registers EPs **best-effort**: CPU is the always-present default, so
+/// requesting DirectML (`DirectML`/`Auto`) and finding no usable GPU/driver makes
+/// ort **log and silently fall back to CPU** — no manual fallback code is needed.
+/// `Auto` is the recommended default: try the GPU, transparently degrade to CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Device {
+    /// Force CPU: register no GPU EP (empty list ⇒ ort's default CPU EP).
+    Cpu,
+    /// Request DirectML explicitly (still auto-falls-back to CPU if unavailable).
+    DirectML,
+    /// Try DirectML, transparently fall back to CPU. Same EP list as `DirectML`;
+    /// distinct variant so callers/echoes can tell an explicit `dml` from `auto`.
+    Auto,
+}
+
+impl Device {
+    /// Build the ort execution-provider list this device selects.
+    ///
+    ///   * `Cpu`              → `vec![]` (empty ⇒ ort's default CPU EP only).
+    ///   * `DirectML`/`Auto`  → `vec![DirectML::default().build()]` — registered
+    ///     best-effort; ort falls back to CPU automatically if DirectML can't
+    ///     initialize (no GPU/driver). fastembed, seeing a DirectML EP, also sets
+    ///     the DML-required session opts (memory_pattern + parallel_execution off).
+    fn execution_providers(self) -> Vec<ExecutionProviderDispatch> {
+        match self {
+            Device::Cpu => vec![],
+            Device::DirectML | Device::Auto => vec![ort::ep::DirectML::default().build()],
+        }
+    }
+}
 
 /// Production embedder: two separately-loaded fastembed models behind their own
 /// mutexes (see the module docs for the two-instance rationale).
@@ -73,14 +106,18 @@ impl FastEmbedder {
     /// instance — see module docs); both share the same on-disk cache, so only
     /// the first incurs a download.
     ///
+    /// `device` selects the execution provider (CPU, or DirectML with automatic
+    /// CPU fallback — see [`Device`]).
+    ///
     /// Returns a descriptive error string (never panics) so the FFI boundary can
     /// surface a clean structural error if model load fails (e.g. offline with a
     /// cold cache, or onnxruntime not loadable).
-    pub fn new_builtin() -> Result<Self, String> {
+    pub fn new_builtin(device: Device) -> Result<Self, String> {
         // Two independent loads of the SAME model (see module docs: this is what
-        // decouples bulk-reindex latency from query latency).
-        let bulk = Self::load_builtin().map_err(|e| format!("load bulk model: {e}"))?;
-        let query = Self::load_builtin().map_err(|e| format!("load query model: {e}"))?;
+        // decouples bulk-reindex latency from query latency). Both get the same
+        // device/EP selection.
+        let bulk = Self::load_builtin(device).map_err(|e| format!("load bulk model: {e}"))?;
+        let query = Self::load_builtin(device).map_err(|e| format!("load query model: {e}"))?;
 
         let mut me = FastEmbedder {
             bulk: Mutex::new(bulk),
@@ -107,12 +144,15 @@ impl FastEmbedder {
     /// ```
     ///
     /// Pooling is set to `Mean` (what multilingual-e5 uses); change this if you
-    /// point it at a CLS-pooled model. NOTE: this path is implemented but, unlike
+    /// point it at a CLS-pooled model. `device` selects the execution provider
+    /// (see [`Device`]). NOTE: this path is implemented but, unlike
     /// `new_builtin`, is **not exercised by the integration test** (it needs a
     /// pre-staged model directory). It is here so production can run offline.
-    pub fn new_local(model_path: &str) -> Result<Self, String> {
-        let bulk = Self::load_local(model_path).map_err(|e| format!("load bulk model: {e}"))?;
-        let query = Self::load_local(model_path).map_err(|e| format!("load query model: {e}"))?;
+    pub fn new_local(model_path: &str, device: Device) -> Result<Self, String> {
+        let bulk =
+            Self::load_local(model_path, device).map_err(|e| format!("load bulk model: {e}"))?;
+        let query =
+            Self::load_local(model_path, device).map_err(|e| format!("load query model: {e}"))?;
 
         let mut me = FastEmbedder {
             bulk: Mutex::new(bulk),
@@ -123,17 +163,22 @@ impl FastEmbedder {
         Ok(me)
     }
 
-    /// Load one built-in MultilingualE5Small instance (download/cache via HF).
-    fn load_builtin() -> Result<TextEmbedding, String> {
+    /// Load one built-in MultilingualE5Small instance (download/cache via HF),
+    /// requesting `device`'s execution providers (empty ⇒ CPU; DirectML otherwise,
+    /// with ort's automatic CPU fallback).
+    fn load_builtin(device: Device) -> Result<TextEmbedding, String> {
         TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::MultilingualE5Small)
-                .with_show_download_progress(true),
+                .with_show_download_progress(true)
+                .with_execution_providers(device.execution_providers()),
         )
         .map_err(|e| e.to_string())
     }
 
-    /// Load one user-defined instance from on-disk ONNX + tokenizer files.
-    fn load_local(model_path: &str) -> Result<TextEmbedding, String> {
+    /// Load one user-defined instance from on-disk ONNX + tokenizer files,
+    /// requesting `device`'s execution providers (same CPU/DirectML semantics as
+    /// [`Self::load_builtin`]).
+    fn load_local(model_path: &str, device: Device) -> Result<TextEmbedding, String> {
         use std::path::Path;
         let dir = Path::new(model_path);
         let read = |rel: &str| -> Result<Vec<u8>, String> {
@@ -158,8 +203,12 @@ impl FastEmbedder {
             // multilingual-e5 is mean-pooled (matches the built-in path).
             .with_pooling(Pooling::Mean);
 
-        TextEmbedding::try_new_from_user_defined(model, InitOptionsUserDefined::new())
-            .map_err(|e| e.to_string())
+        TextEmbedding::try_new_from_user_defined(
+            model,
+            InitOptionsUserDefined::new()
+                .with_execution_providers(device.execution_providers()),
+        )
+        .map_err(|e| e.to_string())
     }
 
     /// Probe the model's output dimensionality by embedding a single short

@@ -1882,6 +1882,7 @@ dependencies = [
  "anyhow",
  "fastembed",
  "once_cell",
+ "ort",
  "regex",
  "serde",
  "serde_json",

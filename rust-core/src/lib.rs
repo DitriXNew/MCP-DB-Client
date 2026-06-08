@@ -438,13 +438,20 @@ fn meta_or_empty(v: &Value, key: &str) -> Value {
 /// `model_path` points at offline ONNX + tokenizer files; either one (when the
 /// `fastembed` feature is compiled in) selects the real embedder, otherwise the
 /// mock is used — see `core::configure`.
+///
+/// `device` is `"cpu" | "dml" | "auto"` (default `"auto"` = DirectML with
+/// automatic CPU fallback). It only affects the real embedder; the mock build
+/// parses and echoes it but otherwise ignores it.
 fn parse_config(payload: &Value) -> Result<Config, String> {
     Ok(Config {
         model: opt_str(payload, "model"),
         model_path: opt_str(payload, "model_path"),
         normalize: bool_or(payload, "normalize", true),
         max_seq_len: opt_u64(payload, "max_seq_len"),
-        device: opt_str(payload, "device").unwrap_or_else(|| "cpu".to_string()),
+        // Default `"auto"` = DirectML with ort's automatic CPU fallback (the
+        // GPU-acceleration default). Explicit `"cpu"`/`"dml"` force the EP. Only
+        // meaningful under the `fastembed` feature; ignored by the mock build.
+        device: opt_str(payload, "device").unwrap_or_else(|| "auto".to_string()),
         intra_threads: opt_u64(payload, "intra_threads"),
     })
 }
@@ -1609,10 +1616,16 @@ mod tests {
     fn fastembed_real_model_ranks_contracts_above_cat() {
         let _g = e2e_guard();
 
-        // Select the real model. With the feature on, this loads e5-small (dim
-        // 384). The mock test suite never passes `model`, so it stays at dim 64.
-        let v = call("configure", r#"{"model":"multilingual-e5-small"}"#);
+        // Select the real model with `device:"auto"` → ort registers the
+        // DirectML EP (best-effort). On a machine with no usable GPU/driver ort
+        // logs and falls back to CPU automatically, so this MUST NOT crash either
+        // way. With the feature on, e5-small loads at dim 384. The mock test
+        // suite never passes `model`, so it stays at dim 64.
+        let v = call("configure", r#"{"model":"multilingual-e5-small","device":"auto"}"#);
         assert_eq!(v["ok"], json!(true), "configure failed: {v}");
+        // The chosen device is echoed back verbatim (the EP selection — and any
+        // DirectML→CPU fallback — happens inside ort and is transparent here).
+        assert_eq!(v["result"]["device"], json!("auto"));
         assert_eq!(
             v["result"]["dim"].as_u64().unwrap(),
             384,

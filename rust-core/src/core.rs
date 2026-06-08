@@ -339,11 +339,20 @@ fn build_embedder(config: &Config) -> (Arc<dyn Embedder>, bool) {
 
     #[cfg(feature = "fastembed")]
     {
-        use crate::fastembed_embedder::FastEmbedder;
+        use crate::fastembed_embedder::{Device, FastEmbedder};
+        // Map the textual `device` knob to the execution-provider selection.
+        // Default (`auto`) = DirectML with ort's automatic CPU fallback, per the
+        // GPU-acceleration request; `cpu`/`dml` force the respective EP. Unknown
+        // strings fall back to `Auto` (safe: still works on a CPU-only machine).
+        let device = match config.device.trim().to_ascii_lowercase().as_str() {
+            "cpu" => Device::Cpu,
+            "dml" | "directml" => Device::DirectML,
+            _ => Device::Auto, // "auto" and any unrecognized value.
+        };
         // Prefer local files when a path is given (offline); else the built-in.
         let built = match config.model_path.as_deref().filter(|p| !p.trim().is_empty()) {
-            Some(path) => FastEmbedder::new_local(path),
-            None => FastEmbedder::new_builtin(),
+            Some(path) => FastEmbedder::new_local(path, device),
+            None => FastEmbedder::new_builtin(device),
         };
         match built {
             Ok(fe) => return (Arc::new(fe), true),
