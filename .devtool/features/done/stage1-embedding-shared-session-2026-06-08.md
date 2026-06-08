@@ -1,12 +1,12 @@
 ---
 id: "stage1-embedding-shared-session-2026-06-08"
-status: "backlog"
+status: "done"
 priority: "high"
 assignee: null
 dueDate: null
 created: "2026-06-08T18:03:21.000Z"
-modified: "2026-06-08T18:03:21.000Z"
-completedAt: null
+modified: "2026-06-08T22:11:45.000Z"
+completedAt: "2026-06-08T22:11:45.000Z"
 labels: ["stage-1", "rust-core"]
 order: "a9"
 ---

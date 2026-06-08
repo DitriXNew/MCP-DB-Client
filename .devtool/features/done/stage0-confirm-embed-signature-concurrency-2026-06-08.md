@@ -1,12 +1,12 @@
 ---
 id: "stage0-confirm-embed-signature-concurrency-2026-06-08"
-status: "todo"
+status: "done"
 priority: "high"
 assignee: null
 dueDate: null
 created: "2026-06-08T18:03:21.000Z"
-modified: "2026-06-08T18:13:44.000Z"
-completedAt: null
+modified: "2026-06-08T22:11:45.000Z"
+completedAt: "2026-06-08T22:11:45.000Z"
 labels: ["stage-0", "rust-core", "investigation"]
 order: "a4"
 ---
