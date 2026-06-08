@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "HttpServerComponent.h"
 #include "ScreenCapture.h"
+#include "RustCore.h"
 
 #include "../version.h"
 
@@ -175,6 +176,229 @@ json paginateJsonArray(const json& arr, const json& params) {
         result["nextCursor"] = std::to_string(end);
     }
     return result;
+}
+
+// =========================================================================
+// Native search tools — served by the linked Rust core (rcore_dispatch),
+// NOT forwarded to 1C. The component owns these tool names and their JSON
+// Schemas, so the search subsystem is self-contained regardless of whether
+// 1C declares them.
+// =========================================================================
+
+// True if `toolName` is handled natively by the Rust core (search subsystem).
+bool isNativeTool(const std::string& toolName) {
+    return toolName == "search" ||
+           toolName == "get_segment" ||
+           toolName == "grep";
+}
+
+// Shared `meta_filters` schema fragment (free key-value, OR via `any` /
+// AND via `all`; no domain-specific fields — the core stays generic).
+json metaFiltersSchema() {
+    return json{
+        {"type", "object"},
+        {"description", "Optional metadata filters over free key-value pairs. "
+                        "`any` matches if ANY pair matches (OR); `all` requires "
+                        "ALL pairs to match (AND). Combinable."},
+        {"properties", {
+            {"any", {
+                {"type", "object"},
+                {"description", "OR filter: keep results matching any of these key-value pairs."},
+                {"additionalProperties", true}
+            }},
+            {"all", {
+                {"type", "object"},
+                {"description", "AND filter: keep results matching all of these key-value pairs."},
+                {"additionalProperties", true}
+            }}
+        }},
+        {"additionalProperties", false}
+    };
+}
+
+// The 3 native tool definitions ({name, description, inputSchema}) merged into
+// tools/list. Schemas follow the Stage-1/Stage-2 contracts (§4.1, §5.3, §5.4).
+json nativeToolDefinitions() {
+    json searchTool = {
+        {"name", "search"},
+        {"description", "Semantic/keyword/hybrid search over indexed segments. "
+                        "Returns ranked hits with doc_id, name, score and segment "
+                        "line ranges."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"query", {
+                    {"type", "string"},
+                    {"description", "Search query text."}
+                }},
+                {"collection", {
+                    {"type", "string"},
+                    {"description", "Restrict the search to a single collection. "
+                                    "When omitted, all collections are searched."}
+                }},
+                {"k", {
+                    {"type", "integer"},
+                    {"minimum", 1},
+                    {"description", "Maximum number of hits to return (default 10)."}
+                }},
+                {"mode", {
+                    {"type", "string"},
+                    {"enum", json::array({"dense", "keyword", "hybrid"})},
+                    {"description", "Retrieval mode: dense (vectors), keyword "
+                                    "(lexical) or hybrid (RRF fusion)."}
+                }},
+                {"min_score", {
+                    {"type", "number"},
+                    {"description", "Drop hits scoring below this threshold."}
+                }},
+                {"max_per_doc", {
+                    {"type", "integer"},
+                    {"minimum", 1},
+                    {"description", "Cap the number of hits returned per document."}
+                }},
+                {"include_text", {
+                    {"type", "boolean"},
+                    {"description", "Include the full segment text in each hit "
+                                    "(default true). When false a short preview is returned."}
+                }},
+                {"meta_filters", metaFiltersSchema()}
+            }},
+            {"required", json::array({"query"})},
+            {"additionalProperties", false}
+        }}
+    };
+
+    json getSegmentTool = {
+        {"name", "get_segment"},
+        {"description", "Return a line range of an indexed document by O(1) offset "
+                        "lookup. Out-of-range requests are clamped and the actual "
+                        "range returned."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"doc_id", {
+                    {"type", "string"},
+                    {"description", "Identifier of the document to slice."}
+                }},
+                {"line_start", {
+                    {"type", "integer"},
+                    {"description", "First line of the range (1-based, inclusive)."}
+                }},
+                {"line_end", {
+                    {"type", "integer"},
+                    {"description", "Last line of the range (inclusive)."}
+                }},
+                {"max_lines", {
+                    {"type", "integer"},
+                    {"minimum", 1},
+                    {"description", "Optional hard cap on the number of lines returned."}
+                }}
+            }},
+            {"required", json::array({"doc_id", "line_start", "line_end"})},
+            {"additionalProperties", false}
+        }}
+    };
+
+    json grepTool = {
+        {"name", "grep"},
+        {"description", "Regex search (RE2 / linear time, no backreferences or "
+                        "lookaround) over indexed document text. Returns matching "
+                        "lines with optional context."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"pattern", {
+                    {"type", "string"},
+                    {"description", "RE2 regular expression to match against each line."}
+                }},
+                {"collection", {
+                    {"type", "string"},
+                    {"description", "Restrict the search to a single collection. "
+                                    "When omitted, all collections are searched."}
+                }},
+                {"ignore_case", {
+                    {"type", "boolean"},
+                    {"description", "Case-insensitive matching (default false)."}
+                }},
+                {"multiline", {
+                    {"type", "boolean"},
+                    {"description", "Multiline mode: ^ and $ match at line boundaries."}
+                }},
+                {"context_lines", {
+                    {"type", "integer"},
+                    {"minimum", 0},
+                    {"description", "Number of context lines to include before and "
+                                    "after each match."}
+                }},
+                {"max_matches", {
+                    {"type", "integer"},
+                    {"minimum", 1},
+                    {"description", "Stop after this many total matches; sets `truncated`."}
+                }},
+                {"max_per_doc", {
+                    {"type", "integer"},
+                    {"minimum", 1},
+                    {"description", "Cap the number of matches returned per document."}
+                }},
+                {"meta_filters", metaFiltersSchema()}
+            }},
+            {"required", json::array({"pattern"})},
+            {"additionalProperties", false}
+        }}
+    };
+
+    return json::array({searchTool, getSegmentTool, grepTool});
+}
+
+// Call the Rust core for a native tool and turn its envelope into an MCP
+// tools/call result: {"content":[{"type":"text","text":<payload>}],
+// "isError":<bool>}. The text carries the inner `result` on success, or the
+// `error` object on failure — tool errors are STRUCTURAL results, never a
+// transport/session failure. Exception/panic-safe: any parse problem degrades
+// to a structured isError result rather than throwing.
+json dispatchNativeTool(const std::string& toolName, const json& arguments) {
+    std::string argsJson;
+    try {
+        argsJson = arguments.is_null() ? std::string("{}") : arguments.dump();
+    } catch (...) {
+        argsJson = "{}";
+    }
+
+    RustString raw = RustString::adopt(rcore_dispatch(toolName.c_str(), argsJson.c_str()));
+    std::string envelopeStr = raw.str();
+
+    if (envelopeStr.empty()) {
+        return makeTextToolResult(
+            R"({"code":"internal","message":"rust core returned an empty response"})",
+            true);
+    }
+
+    json envelope = json::parse(envelopeStr, nullptr, false);
+    if (envelope.is_discarded() || !envelope.is_object()) {
+        // The core promises well-formed JSON; if that ever breaks, surface the
+        // raw body as a structured tool error instead of crashing.
+        return makeTextToolResult(envelopeStr, true);
+    }
+
+    bool ok = envelope.value("ok", false);
+    if (ok) {
+        std::string text;
+        if (envelope.contains("result")) {
+            text = envelope["result"].dump();
+        } else {
+            text = "null";
+        }
+        return makeTextToolResult(text, false);
+    }
+
+    // Failure envelope: emit the structured error object as the tool result text.
+    std::string errText;
+    if (envelope.contains("error")) {
+        errText = envelope["error"].dump();
+    } else {
+        errText = R"({"code":"internal","message":"rust core reported failure without an error body"})";
+    }
+    return makeTextToolResult(errText, true);
 }
 
 // =========================================================================
@@ -801,6 +1025,14 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
             tools = json::parse(cachedToolsJson, nullptr, false);
             if (tools.is_discarded()) tools = json::array();
         }
+        if (!tools.is_array()) tools = json::array();
+
+        // Merge the native search-tool schemas owned by this component. The
+        // search subsystem is self-contained: these are always present even if
+        // 1C never registers them. Pagination below applies to the union.
+        for (auto& def : nativeToolDefinitions()) {
+            tools.push_back(std::move(def));
+        }
 
         json page = paginateJsonArray(tools, params);
 
@@ -829,6 +1061,35 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
             res.set_content(
                 makeJsonRpcError(rpcId, -32602, "Missing tool name in params").dump(),
                 "application/json");
+            return;
+        }
+
+        // ---- Native search tools: served by the Rust core, synchronously ----
+        // search / get_segment / grep are handled here and NOT forwarded to 1C.
+        // Tool-level errors come back as a structural isError result, so a bad
+        // regex or missing doc_id never tears down the transport/session.
+        if (isNativeTool(toolName)) {
+            logToFile("MCP -> tools/call (native): " + toolName);
+
+            json toolResult;
+            try {
+                toolResult = dispatchNativeTool(toolName, toolArgs);
+            } catch (const std::exception& e) {
+                toolResult = makeTextToolResult(
+                    std::string(R"({"code":"internal","message":"native tool dispatch threw: )") +
+                        e.what() + R"("})",
+                    true);
+            } catch (...) {
+                toolResult = makeTextToolResult(
+                    R"({"code":"internal","message":"native tool dispatch threw an unknown exception"})",
+                    true);
+            }
+
+            json rpcResp;
+            rpcResp["jsonrpc"] = "2.0";
+            rpcResp["id"] = rpcId;
+            rpcResp["result"] = toolResult;
+            res.set_content(rpcResp.dump(), "application/json");
             return;
         }
 
