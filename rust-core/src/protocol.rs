@@ -18,6 +18,8 @@ pub mod codes {
     pub const UNKNOWN_METHOD: &str = "unknown_method";
     pub const BAD_PAYLOAD: &str = "bad_payload";
     pub const INTERNAL: &str = "internal";
+    /// A `grep` pattern failed to compile (invalid regex). Structural, not a panic.
+    pub const BAD_PATTERN: &str = "bad_pattern";
 }
 
 /// A structural error object: `{"code": ..., "message": ...}`.

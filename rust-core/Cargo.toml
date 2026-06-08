@@ -20,6 +20,10 @@ crate-type = ["staticlib"]
 serde = { version = "=1.0.219", features = ["derive"] }
 serde_json = "=1.0.140"
 once_cell = "=1.21.3"
+# RE2-style regex engine (finite automata): linear-time matching, no
+# backreferences/lookaround, so user-supplied `grep` patterns can't trigger
+# catastrophic backtracking (ReDoS). Used by the `grep` dispatch method.
+regex = "=1.12.3"
 
 [profile.release]
 # A search core is hot-path code; favour optimized release builds.

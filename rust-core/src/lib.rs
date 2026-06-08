@@ -30,6 +30,8 @@
 
 mod core;
 mod embed;
+mod filter;
+mod grep;
 mod protocol;
 
 use std::ffi::{CStr, CString};
@@ -41,6 +43,8 @@ use serde_json::{json, Value};
 use crate::core::{
     self as store, Config, IndexRequest, SearchRequest, SegmentInput, CORE,
 };
+use crate::filter::MetaFilter;
+use crate::grep::GrepRequest;
 use crate::protocol::{codes, Envelope};
 
 /// ABI revision of this boundary. Bump when the FFI surface changes shape so the
@@ -244,6 +248,35 @@ fn dispatch(method: &str, payload_json: &str) -> String {
             Err(e) => Envelope::err(codes::BAD_PAYLOAD, e),
         },
 
+        // Regex search over stored segment TEXT. Needs no vectors, so it works
+        // the instant a doc is accepted (even while vectors are still Building).
+        // A broken pattern is a structural `bad_pattern` error, never a panic.
+        "grep" => match parse_grep_request(&payload) {
+            Ok(req) => {
+                let core = match CORE.read() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return Envelope::err(codes::INTERNAL, "core lock poisoned")
+                            .to_json_string()
+                    }
+                };
+                match grep::grep(&core, &req) {
+                    Ok(res) => {
+                        let hits: Vec<Value> = res.hits.iter().map(grep::hit_to_json).collect();
+                        Envelope::ok(json!({
+                            "hits": hits,
+                            "truncated": res.truncated,
+                            "total_found": res.total_found,
+                        }))
+                    }
+                    Err(grep::GrepError::BadPattern(msg)) => {
+                        Envelope::err(codes::BAD_PATTERN, format!("invalid grep pattern: {msg}"))
+                    }
+                }
+            }
+            Err(e) => Envelope::err(codes::BAD_PAYLOAD, e),
+        },
+
         other => Envelope::err(
             codes::UNKNOWN_METHOD,
             format!("no such method: '{other}'"),
@@ -348,6 +381,32 @@ fn parse_search_request(payload: &Value) -> Result<SearchRequest, String> {
         min_score,
         max_per_doc,
         include_text: bool_or(payload, "include_text", true),
+        filter: MetaFilter::parse(payload),
+    })
+}
+
+/// Parse a `grep` payload. `pattern` is required and non-empty. `max_matches`
+/// defaults to 200 (and is clamped to at least 1); `multiline` defaults to true;
+/// `context_lines` defaults to 0.
+fn parse_grep_request(payload: &Value) -> Result<GrepRequest, String> {
+    let pattern = opt_str(payload, "pattern")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing or empty 'pattern'".to_string())?;
+    let max_matches = opt_u64(payload, "max_matches")
+        .map(|v| v as usize)
+        .unwrap_or(200)
+        .max(1);
+    let context_lines = opt_u64(payload, "context_lines").map(|v| v as usize).unwrap_or(0);
+    let max_per_doc = opt_u64(payload, "max_per_doc").map(|v| v as usize);
+    Ok(GrepRequest {
+        pattern,
+        collection: opt_str(payload, "collection"),
+        filter: MetaFilter::parse(payload),
+        ignore_case: bool_or(payload, "ignore_case", false),
+        multiline: bool_or(payload, "multiline", true),
+        context_lines,
+        max_matches,
+        max_per_doc,
     })
 }
 
@@ -689,5 +748,195 @@ mod tests {
         assert_eq!(coll["skipped"], json!(0));
         assert_eq!(coll["n_docs"], json!(1));
         assert_eq!(coll["n_segments"], json!(2));
+    }
+
+    // -- Stage 2: meta filters on `search` (Task 2) ---------------------------
+
+    /// Index two docs with distinguishing meta, wait for vectors, then return.
+    /// Both share the query tokens so ranking can't accidentally hide a doc; the
+    /// meta filter is what selects between them.
+    fn seed_meta_docs() {
+        call("configure", "{}");
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"en1","name":"english",
+                "meta":{"lang":"en","status":"draft"},
+                "segments":[{"text":"shared token alpha beta"}]}"#,
+        );
+        call(
+            "index_segments",
+            r#"{"collection":"c","doc_id":"ru1","name":"russian",
+                "meta":{"lang":"ru","status":"published"},
+                "segments":[{"text":"shared token alpha beta"}]}"#,
+        );
+        assert!(store::wait_until_ready("c", std::time::Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn search_meta_filter_all_is_and() {
+        let _g = e2e_guard();
+        seed_meta_docs();
+        // all: lang==en AND status==draft → only en1.
+        let v = call(
+            "search",
+            r#"{"query":"shared token","collection":"c","k":10,
+                "filter":{"all":{"lang":"en","status":"draft"}}}"#,
+        );
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "AND filter must select exactly one doc");
+        assert_eq!(hits[0]["doc_id"], json!("en1"));
+    }
+
+    #[test]
+    fn search_meta_filter_any_is_or() {
+        let _g = e2e_guard();
+        seed_meta_docs();
+        // any: lang==ru OR status==draft → both docs (en1 via status, ru1 via lang).
+        let v = call(
+            "search",
+            r#"{"query":"shared token","collection":"c","k":10,
+                "filter":{"any":{"lang":"ru","status":"draft"}}}"#,
+        );
+        let hits = v["result"]["hits"].as_array().unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h["doc_id"].as_str().unwrap()).collect();
+        assert_eq!(hits.len(), 2, "OR filter should match both");
+        assert!(ids.contains(&"en1") && ids.contains(&"ru1"));
+    }
+
+    #[test]
+    fn search_meta_filter_combined() {
+        let _g = e2e_guard();
+        seed_meta_docs();
+        // all (lang==en) AND any (status in [draft, review]) → only en1.
+        let v = call(
+            "search",
+            r#"{"query":"shared token","collection":"c","k":10,
+                "filter":{"all":{"lang":"en"},"any":{"status":["draft","review"]}}}"#,
+        );
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["doc_id"], json!("en1"));
+
+        // Same all-clause but an any-clause that excludes en1's status → empty.
+        let v = call(
+            "search",
+            r#"{"query":"shared token","collection":"c","k":10,
+                "filter":{"all":{"lang":"en"},"any":{"status":["review"]}}}"#,
+        );
+        assert!(v["result"]["hits"].as_array().unwrap().is_empty());
+    }
+
+    // -- Stage 2: grep (Task 3) ----------------------------------------------
+
+    /// Index a multi-line doc (text installed synchronously) and wait for ready.
+    /// The segment text uses JSON `\r\n` escapes (two-char sequences in the wire
+    /// JSON) so the stored text really contains CRLF, exercising normalization.
+    fn seed_grep_doc() {
+        call("configure", "{}");
+        // A 4-line segment with CRLF endings to exercise normalization. The
+        // raw-string keeps the backslash-r-backslash-n as JSON escapes, not
+        // literal control bytes (which would be invalid JSON).
+        call(
+            "index_segments",
+            r#"{"collection":"docs","doc_id":"g1","name":"log",
+                "meta":{"kind":"manual"},
+                "segments":[{"text":"first line ERROR here\r\nsecond plain line\r\nthird Error again\r\nfourth done"}]}"#,
+        );
+        assert!(store::wait_until_ready("docs", std::time::Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn grep_basic_match() {
+        let _g = e2e_guard();
+        seed_grep_doc();
+        let v = call("grep", r#"{"pattern":"ERROR","collection":"docs"}"#);
+        assert_eq!(v["ok"], json!(true));
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "only the exact-case ERROR line matches");
+        assert_eq!(hits[0]["doc_id"], json!("g1"));
+        assert_eq!(hits[0]["line_number"], json!(1));
+        assert_eq!(hits[0]["line_text"], json!("first line ERROR here"));
+        assert_eq!(v["result"]["truncated"], json!(false));
+        assert_eq!(v["result"]["total_found"], json!(1));
+    }
+
+    #[test]
+    fn grep_ignore_case() {
+        let _g = e2e_guard();
+        seed_grep_doc();
+        let v = call(
+            "grep",
+            r#"{"pattern":"error","collection":"docs","ignore_case":true}"#,
+        );
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2, "case-insensitive matches both ERROR and Error");
+        // Line numbers are 1-based after CRLF normalization.
+        assert_eq!(hits[0]["line_number"], json!(1));
+        assert_eq!(hits[1]["line_number"], json!(3));
+    }
+
+    #[test]
+    fn grep_context_lines() {
+        let _g = e2e_guard();
+        seed_grep_doc();
+        let v = call(
+            "grep",
+            r#"{"pattern":"third","collection":"docs","context_lines":1}"#,
+        );
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        let h = &hits[0];
+        assert_eq!(h["line_number"], json!(3));
+        assert_eq!(h["context_before"], json!(["second plain line"]));
+        assert_eq!(h["context_after"], json!(["fourth done"]));
+    }
+
+    #[test]
+    fn grep_max_matches_truncates() {
+        let _g = e2e_guard();
+        seed_grep_doc();
+        // "line" appears on lines 1 and 2; cap at 1 → truncated.
+        let v = call(
+            "grep",
+            r#"{"pattern":"line","collection":"docs","max_matches":1}"#,
+        );
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "max_matches caps hits");
+        assert_eq!(v["result"]["truncated"], json!(true));
+    }
+
+    #[test]
+    fn grep_broken_pattern_is_structural_error() {
+        let _g = e2e_guard();
+        seed_grep_doc();
+        // An unclosed group is an invalid regex → structural bad_pattern error.
+        let v = call("grep", r#"{"pattern":"(unclosed","collection":"docs"}"#);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["error"]["code"], json!(codes::BAD_PATTERN));
+    }
+
+    #[test]
+    fn grep_meta_filtered() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        call(
+            "index_segments",
+            r#"{"collection":"docs","doc_id":"m1","name":"a","meta":{"kind":"manual"},
+                "segments":[{"text":"keyword target one"}]}"#,
+        );
+        call(
+            "index_segments",
+            r#"{"collection":"docs","doc_id":"n1","name":"b","meta":{"kind":"note"},
+                "segments":[{"text":"keyword target two"}]}"#,
+        );
+        assert!(store::wait_until_ready("docs", std::time::Duration::from_secs(5)));
+        // Filter to kind==manual → only m1 should match the same pattern.
+        let v = call(
+            "grep",
+            r#"{"pattern":"keyword","collection":"docs","filter":{"all":{"kind":"manual"}}}"#,
+        );
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "meta filter must scope grep");
+        assert_eq!(hits[0]["doc_id"], json!("m1"));
     }
 }

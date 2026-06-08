@@ -32,6 +32,7 @@ use std::thread::JoinHandle;
 use once_cell::sync::Lazy;
 
 use crate::embed::{dot, Embedder, MockEmbedder};
+use crate::filter::MetaFilter;
 
 // ===========================================================================
 // Data model: collection → documents → segments
@@ -154,16 +155,23 @@ pub struct Config {
 // Background worker plumbing
 // ===========================================================================
 
-/// A unit of embedding work handed to the worker thread. It carries everything
-/// the worker needs to embed *outside* the lock and then apply *inside* a short
-/// lock: the collection name, the doc to install, and the texts to embed (one
-/// per segment, already chosen as embed_text-or-text).
+/// A unit of embedding work handed to the worker thread.
+///
+/// The doc's text segments are *already installed* in the store at accept time
+/// (synchronously, with `vector: None`). This job carries only what the worker
+/// needs to embed *outside* the lock and then, *inside* a short lock, fill the
+/// already-present segments' vectors in place — matched by `(doc_id, segment_id)`:
+///   * the collection + doc id to locate the segments;
+///   * the stable `segment_id` of each segment, parallel to `embed_texts`;
+///   * the text to embed for each segment (empty string marks a blank → skip).
 struct EmbedJob {
     collection: String,
-    /// The document whose segments still have `vector: None`. After embedding,
-    /// the worker fills vectors here and upserts it into the store.
-    doc: Document,
-    /// Per-segment text to embed, parallel to `doc.segments`. Empty strings mark
+    doc_id: String,
+    /// Stable segment ids to fill, parallel to `embed_texts`. A stale id (the
+    /// doc was re-ingested while this job was in flight) simply won't be found
+    /// and is skipped — this is what keeps re-ingest atomic.
+    segment_ids: Vec<u64>,
+    /// Per-segment text to embed, parallel to `segment_ids`. Empty strings mark
     /// blank segments to skip.
     embed_texts: Vec<String>,
 }
@@ -344,25 +352,33 @@ pub struct AcceptResult {
 }
 
 /// Synchronous accept for `index_segments`. Does the cheap work under a short
-/// write lock — allocate ids, store segments with `vector: None`, mark the
-/// collection `text_ready=true` / `vector_status=Building`, bump `pending_jobs`
-/// — then enqueues one [`EmbedJob`] for the background worker. Returns
-/// immediately; embedding happens off-thread.
+/// write lock — allocate ids, **install the doc's text segments into the store
+/// with `vector: None`** (atomic upsert by `doc_id`), mark the collection
+/// `text_ready=true` / `vector_status=Building`, bump `pending_jobs` — then
+/// enqueues one [`EmbedJob`] for the background worker. Returns immediately;
+/// embedding happens off-thread.
+///
+/// This is the carried-forward fix from Stage 1 (§4.4 / Правка-2): text-only
+/// operations (`grep` / `get_segment` / keyword) can see a doc's text the moment
+/// accept returns, because the segments are present in the store *before* the
+/// worker runs. The worker fills ONLY the vectors afterwards (matched by
+/// `segment_id`), so dense search is the only operation that waits for vectors.
 ///
 /// Blank-text segments are counted as `skipped` right here at accept time (they
-/// never get a job slot) so they don't keep the collection in Building forever.
+/// never get embedded) so they don't keep the collection in Building forever.
 pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
     let embedder = ensure_embedder(core);
     let dim = embedder.dim();
 
-    // Build the doc + the parallel list of texts to embed. A blank text is
-    // skipped immediately (counter bumped after we have the collection).
+    // Build the doc + the parallel list of (segment_id, text-to-embed). A blank
+    // text is skipped immediately (counter bumped after we have the collection).
     let mut doc = Document {
         doc_id: req.doc_id.clone(),
         name: req.name,
         meta: req.meta,
         segments: Vec::with_capacity(req.segments.len()),
     };
+    let mut segment_ids: Vec<u64> = Vec::with_capacity(req.segments.len());
     let mut embed_texts: Vec<String> = Vec::with_capacity(req.segments.len());
     let mut skipped_now: u64 = 0;
 
@@ -374,6 +390,7 @@ pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
         if is_blank {
             skipped_now += 1;
         }
+        segment_ids.push(segment_id);
         embed_texts.push(if is_blank { String::new() } else { chosen });
         doc.segments.push(Segment {
             segment_id,
@@ -388,7 +405,7 @@ pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
 
     let segment_count = doc.segments.len();
 
-    // --- short write-locked accept: ensure collection, mark Building ---
+    // --- short write-locked accept: install text, mark Building ---
     let coll = core
         .collections
         .entry(req.collection.clone())
@@ -399,20 +416,23 @@ pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
     coll.pending_jobs = coll.pending_jobs.saturating_add(1);
     coll.skipped = coll.skipped.saturating_add(skipped_now);
 
-    // Note: we do NOT install `doc` yet — it has no vectors. The worker installs
-    // it atomically after embedding (atomic upsert by doc_id). For text-ready
-    // visibility of *content*, search only returns vectorized segments anyway,
-    // so deferring the install keeps the upsert truly atomic. We still want the
-    // collection to exist so `stats`/`search` see it as Building.
+    // Atomic upsert by doc_id: install the doc's text segments NOW (vectors are
+    // `None`). Re-ingesting the same doc_id replaces all of its segments here, in
+    // one map insert — so text-readers never see a torn doc, and any embed job
+    // still in flight for the *previous* generation of this doc has stale
+    // `segment_id`s that simply won't match (see `apply_job`).
+    coll.docs.insert(req.doc_id.clone(), doc);
 
     let _ = dim; // dim is fixed by the embedder; kept for clarity/future use.
 
-    // Enqueue the embed job for the worker (spawns it lazily).
+    // Enqueue the embed job for the worker (spawns it lazily). It carries only
+    // the ids + texts needed to fill vectors in place after embedding.
     enqueue_job(
         core,
         EmbedJob {
             collection: req.collection.clone(),
-            doc,
+            doc_id: req.doc_id,
+            segment_ids,
             embed_texts,
         },
     );
@@ -494,60 +514,77 @@ fn notify(progress: &Arc<(Mutex<()>, Condvar)>) {
     progress.1.notify_all();
 }
 
-/// Apply one finished job under a short write lock: fill vectors, atomically
-/// upsert the doc by `doc_id`, update counters, and flip to `Ready` when this
-/// collection has no more pending jobs.
+/// Apply one finished job under a short write lock: fill the *already-installed*
+/// segments' vectors in place (matched by `segment_id`), update counters, and
+/// flip the collection to `Ready` when it has no more pending jobs.
 ///
-/// `vectors`, when `Some`, is parallel to `job.doc.segments` / `job.embed_texts`.
-/// A blank embed text (empty string) → skip; a non-finite vector → fail; else
-/// the vector is installed and `embedded` bumped.
+/// The doc's text was installed synchronously at accept time, so here we only
+/// fill vectors — we never insert/replace segments. `vectors`, when `Some`, is
+/// parallel to `job.segment_ids` / `job.embed_texts`:
+///   * a blank embed text (empty string) → skip (vector stays `None`);
+///   * a non-finite / all-zero vector → fail;
+///   * a missing segment id (the doc was re-ingested while this job ran, so the
+///     id is stale) → silently skipped, which is what makes re-ingest atomic;
+///   * otherwise the vector is installed and `embedded` bumped.
 fn apply_job(job: EmbedJob, vectors: Option<Vec<Vec<f32>>>) {
     let mut core = match CORE.write() {
         Ok(c) => c,
         Err(_) => return, // poisoned lock: nothing safe to do
     };
 
-    // If the collection was cleared (reset / dim-change) while this job was in
-    // flight, drop the result on the floor. The job is now meaningless.
-    if !core.collections.contains_key(&job.collection) {
-        return;
-    }
-
     let EmbedJob {
         collection,
-        mut doc,
+        doc_id,
+        segment_ids,
         embed_texts,
     } = job;
+
+    // If the collection was cleared (reset / dim-change) while this job was in
+    // flight, drop the result on the floor. The job is now meaningless.
+    let coll = match core.collections.get_mut(&collection) {
+        Some(c) => c,
+        None => return,
+    };
 
     let mut embedded = 0u64;
     let mut failed = 0u64;
 
     if let Some(vectors) = vectors {
-        for (i, seg) in doc.segments.iter_mut().enumerate() {
-            // Blank text was marked skip at accept; leave vector None.
-            if embed_texts.get(i).map(|t| t.is_empty()).unwrap_or(true) {
-                continue;
-            }
-            match vectors.get(i) {
-                Some(v) if v.iter().all(|x| x.is_finite()) && v.iter().any(|&x| x != 0.0) => {
-                    seg.vector = Some(v.clone());
-                    embedded += 1;
+        // Locate the (possibly re-ingested) doc once; if it's gone, every id is
+        // stale and we just fall through to the bookkeeping below.
+        if let Some(doc) = coll.docs.get_mut(&doc_id) {
+            // Index this doc's current segments by id for an O(1) lookup, so a
+            // re-ingest that shuffled/replaced segments still fills correctly and
+            // stale ids from a superseded generation are simply absent.
+            let mut by_id: HashMap<u64, &mut Segment> = doc
+                .segments
+                .iter_mut()
+                .map(|s| (s.segment_id, s))
+                .collect();
+
+            for (i, &sid) in segment_ids.iter().enumerate() {
+                // Blank text was marked skip at accept; leave vector None.
+                if embed_texts.get(i).map(|t| t.is_empty()).unwrap_or(true) {
+                    continue;
                 }
-                _ => {
-                    // Non-finite / all-zero vector → fail, but keep going.
-                    failed += 1;
+                // Stale id (doc re-ingested) → segment absent → skip silently.
+                let seg = match by_id.get_mut(&sid) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                match vectors.get(i) {
+                    Some(v) if v.iter().all(|x| x.is_finite()) && v.iter().any(|&x| x != 0.0) => {
+                        seg.vector = Some(v.clone());
+                        embedded += 1;
+                    }
+                    _ => {
+                        // Non-finite / all-zero vector → fail, but keep going.
+                        failed += 1;
+                    }
                 }
             }
         }
     }
-
-    let coll = core
-        .collections
-        .get_mut(&collection)
-        .expect("checked contains_key above");
-
-    // --- atomic upsert by doc_id: replace ALL of this doc's segments ---
-    coll.docs.insert(doc.doc_id.clone(), doc);
 
     coll.embedded = coll.embedded.saturating_add(embedded);
     coll.failed = coll.failed.saturating_add(failed);
@@ -569,6 +606,8 @@ pub struct SearchRequest {
     pub min_score: Option<f32>,
     pub max_per_doc: Option<usize>,
     pub include_text: bool,
+    /// Combinable meta filters over the hit's effective meta (empty ⇒ no-op).
+    pub filter: MetaFilter,
 }
 
 /// One search hit.
@@ -627,6 +666,11 @@ pub fn search(core: &Core, req: SearchRequest) -> SearchResult {
                     Some(v) => v,
                     None => continue, // not embedded (or skipped) → ignore
                 };
+                // Meta filter over the hit's effective meta (doc ∪ segment,
+                // segment wins). Cheap no-op when no filter was supplied.
+                if !req.filter.matches_doc_seg(&doc.meta, &seg.meta) {
+                    continue;
+                }
                 let score = dot(&qvec, v);
                 if let Some(min) = req.min_score {
                     if score < min {
@@ -882,6 +926,51 @@ mod tests {
     }
 
     #[test]
+    fn text_is_installed_synchronously_at_accept() {
+        // Carried-forward fix (Task 1): the doc's TEXT segments must be present
+        // in the store the instant accept returns — BEFORE the worker embeds.
+        let _g = test_lock();
+        {
+            // Hold the WRITE lock across accept + inspection. The worker needs the
+            // write lock to apply vectors, so while we hold it the worker is
+            // blocked — making "text present, vectors still None, Building" a
+            // deterministic observation rather than a race.
+            let mut c = CORE.write().unwrap();
+            let req = IndexRequest {
+                collection: "docs".to_string(),
+                doc_id: "d1".to_string(),
+                name: "doc d1".to_string(),
+                meta: json!({}),
+                segments: vec![seg("alpha text here"), seg("beta text here")],
+            };
+            accept_index(&mut c, req);
+
+            let coll = c.collections.get("docs").unwrap();
+            assert!(coll.text_ready, "text must be ready at accept");
+            let doc = coll.docs.get("d1").expect("doc installed synchronously");
+            assert_eq!(doc.segments.len(), 2, "both text segments present");
+            assert!(doc.segments.iter().any(|s| s.text == "alpha text here"));
+            assert!(doc.segments.iter().any(|s| s.text == "beta text here"));
+            // Vectors are NOT yet filled — that is the worker's job.
+            assert!(
+                doc.segments.iter().all(|s| s.vector.is_none()),
+                "vectors must still be None right after accept"
+            );
+            // The collection is Building until the worker finishes.
+            assert_eq!(coll.vector_status, VectorStatus::Building);
+        } // write lock released here → worker can now apply.
+
+        // And the worker still fills vectors in place afterwards.
+        assert!(wait_until_ready("docs", Duration::from_secs(5)));
+        let c = CORE.read().unwrap();
+        let doc = c.collections.get("docs").unwrap().docs.get("d1").unwrap();
+        assert!(
+            doc.segments.iter().all(|s| s.vector.is_some()),
+            "worker must fill the already-installed segments' vectors"
+        );
+    }
+
+    #[test]
     fn search_finds_shared_token_doc() {
         let _g = test_lock();
         index("docs", "db", &["database connection pool tuning"]);
@@ -898,6 +987,7 @@ mod tests {
                 min_score: None,
                 max_per_doc: None,
                 include_text: true,
+                filter: MetaFilter::default(),
             },
         );
         assert!(!res.partial);
@@ -927,6 +1017,7 @@ mod tests {
                 min_score: None,
                 max_per_doc: None,
                 include_text: true,
+                filter: MetaFilter::default(),
             },
         );
         assert_eq!(res.hits.len(), 2, "k must cap hits");
@@ -941,6 +1032,7 @@ mod tests {
                 min_score: None,
                 max_per_doc: Some(1),
                 include_text: true,
+                filter: MetaFilter::default(),
             },
         );
         let mut counts: HashMap<String, usize> = HashMap::new();
@@ -959,6 +1051,7 @@ mod tests {
                 min_score: Some(0.99),
                 max_per_doc: None,
                 include_text: true,
+                filter: MetaFilter::default(),
             },
         );
         assert!(
@@ -990,6 +1083,7 @@ mod tests {
                 min_score: None,
                 max_per_doc: None,
                 include_text: true,
+                filter: MetaFilter::default(),
             },
         );
         assert!(res.partial, "search over a Building collection must be partial");
