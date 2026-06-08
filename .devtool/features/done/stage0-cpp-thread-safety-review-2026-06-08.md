@@ -1,12 +1,12 @@
 ---
 id: "stage0-cpp-thread-safety-review-2026-06-08"
-status: "todo"
+status: "done"
 priority: "high"
 assignee: null
 dueDate: null
 created: "2026-06-08T18:03:21.000Z"
-modified: "2026-06-08T18:13:44.000Z"
-completedAt: null
+modified: "2026-06-08T20:47:25.000Z"
+completedAt: "2026-06-08T20:47:25.000Z"
 labels: ["stage-0", "cpp-glue"]
 order: "a5"
 ---
