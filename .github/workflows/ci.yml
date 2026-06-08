@@ -36,7 +36,7 @@ jobs:
         shell: bash
         run: cargo test --manifest-path rust-core/Cargo.toml
 
-      - name: Build DLL (Release)
+      - name: Build DLL (Release, lite)
         shell: bash
         run: |
           cd http-1c-dll
@@ -45,6 +45,20 @@ jobs:
           cd build
           cmake .. -G "Ninja" -DCMAKE_BUILD_TYPE=Release
           cmake --build .
+
+      # Full ("RAG") build check: compile the rcore.dll cdylib with the
+      # fastembed feature and the dynamic CRT (ort/onnxruntime needs /MD). This
+      # catches fastembed/ort build breakage without re-running CMake. The model
+      # is fetched at runtime, so nothing is downloaded here. Rust is cached
+      # above (Swatinem/rust-cache), so this stays cheap after the first run.
+      - name: Build rcore.dll (fastembed, dynamic CRT)
+        shell: bash
+        env:
+          RUSTFLAGS: "-C target-feature=-crt-static"
+        run: |
+          cargo build --release --features fastembed \
+            --target x86_64-pc-windows-msvc \
+            --manifest-path rust-core/Cargo.toml
 
       - name: Build tests
         shell: bash

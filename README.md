@@ -63,6 +63,7 @@ This means the project is not a fixed set of built-in utilities. It is an MCP tr
 - **Tool annotations** — `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`
 - **Output schemas** — typed response contracts for tool results
 - **Dynamic registration** — register/update tools, resources, prompts at runtime from 1C
+- **Built-in semantic search (RAG)** — optional `search` / `grep` / `get_segment` tools backed by a Rust search core (`rcore`) with dense/keyword/hybrid retrieval (see [Search Subsystem](#search-subsystem-rag))
 
 ## Architecture
 
@@ -358,6 +359,62 @@ Events sent from the native component to 1C:
 | `analyze1CData` | `topic` (optional) | System prompt for data analysis with metadata context |
 | `generate1CCode` | `task` (required) | System prompt for BSL code generation with conventions |
 
+## Search Subsystem (RAG)
+
+The component ships with an optional semantic-search subsystem so a 1C MCP server can index its own content (documentation, code, catalog descriptions, logs) and let AI clients search it. The retrieval engine is a small Rust core, crate `rcore`, that runs entirely in-process.
+
+### MCP tools
+
+Three search tools are served **natively by the component** — they are handled inside the DLL and are *not* forwarded to 1C via `ExternalEvent`:
+
+| Tool | Purpose |
+|------|---------|
+| `search` | Semantic / keyword / hybrid ranked search over indexed segments. Returns hits with `doc_id`, `name`, `collection`, `score`, segment line ranges, and (optionally) text. |
+| `grep` | RE2 regex search (linear time, no backreferences/lookaround) over the stored document text. Works the instant a document is ingested — no vectors needed. |
+| `get_segment` | O(1) line-range slice of a raw document by `doc_id` via an offset table. Out-of-range requests are clamped and the actual range is returned. |
+
+`search` supports three retrieval modes via the `mode` argument:
+
+- **dense** (default) — cosine/dot-product similarity over normalized embedding vectors.
+- **keyword** — lexical scoring, no vectors required.
+- **hybrid** — Reciprocal Rank Fusion (RRF) of the dense and keyword result lists.
+
+Both `search` and `grep` accept metadata filters (`all`/`any` clauses) and a `collection` to scope the query.
+
+### Ingest
+
+Documents are pushed into the core through `rcore`'s JSON ABI. Ingest is **asynchronous**: the call is accepted under a short lock and returns immediately, while a background worker embeds the segments off-thread. Text-based tools (`grep`, `get_segment`) work right after acceptance; dense `search` becomes available once embedding finishes (`stats` exposes per-collection progress).
+
+- **`index_segments`** — ingest a document as a list of pre-chunked segments (each with optional `embed_text`, line range, and per-segment `meta`). `doc_id` is required so segments can be upserted/deleted.
+- **`index_raw`** — ingest a raw multi-line document; the core normalizes line endings, builds a line-offset table, stores the full text, and chunks it (line-snapped, by token budget, with overlap). `doc_id` is optional (auto-assigned and returned in the ack).
+
+Supporting methods include `configure`, `stats`, `reset`, `delete_document`, and `delete_collection`.
+
+### Lite vs full
+
+The same `libhttp1cWin.dll` ships in **two distributions**. The component is pure C++ built `/MT` and does **not** link the Rust core; instead it loads an optional **`rcore.dll`** at runtime (`LoadLibrary` + `GetProcAddress`, resolved next to the component DLL — see `http-1c-dll/src/RustCore.h`):
+
+| Distribution | Contents | Search behavior |
+|--------------|----------|-----------------|
+| **lite** | `libhttp1cWin.dll` only | `search` / `grep` / `get_segment` are advertised in `tools/list` but return a structured error (`code: rag_not_installed`) telling the caller to install the RAG package. |
+| **full** | `libhttp1cWin.dll` + `rcore.dll` + `DirectML.dll` | Real fastembed/onnxruntime search core; the three tools run for real. |
+
+Detection is automatic at runtime: if `rcore.dll` is present next to the component **and** all four ABI entry points (`rcore_version` / `rcore_dispatch` / `rcore_free_string` / `rcore_shutdown`) resolve, the component runs the full search path. A missing, partial, or version-mismatched `rcore.dll` degrades cleanly to the lite path (an "install RAG" error) — never a crash. The tool schemas are identical in both distributions, so a client sees the same `tools/list` either way.
+
+### GPU / CPU (DirectML)
+
+The full search core uses onnxruntime's **DirectML** execution provider for GPU acceleration, with **automatic CPU fallback** when no compatible GPU is available. The device is selected via the `configure` method's `device` field:
+
+| `device` | Behavior |
+|----------|----------|
+| `auto` (default) | DirectML with onnxruntime's automatic CPU fallback. |
+| `dml` | Force the DirectML (GPU) execution provider. |
+| `cpu` | Force CPU execution. |
+
+> **`DirectML.dll` is a hard dependency of the full package.** ort's prebuilt onnxruntime bundles the DirectML provider, so `rcore.dll` hard-imports `DirectML.dll`. The **full** bundle must ship `DirectML.dll` alongside `rcore.dll`, otherwise `rcore.dll` fails to load and the component silently falls back to the lite "install RAG" behavior. On Windows it lives at `C:\Windows\System32\DirectML.dll`. (Version-coupling caveat: this `DirectML.dll` is paired with the bundled onnxruntime; a future CPU-only onnxruntime build would remove the import and this DLL could be dropped.)
+
+The embedding model itself is **fetched at runtime**, not at build time — nothing model-related is downloaded during the build or in CI.
+
 ## Repository Layout
 
 ```text
@@ -378,7 +435,11 @@ Events sent from the native component to 1C:
 │   └── src/
 │       ├── AddInNative.cpp/h           # Generic 1C add-in framework
 │       ├── HttpServerComponent.cpp/h   # MCP server implementation
+│       ├── RustCore.h                  # Runtime loader for rcore.dll (search)
 │       └── AddInNative.def             # DLL export definitions
+├── rust-core/                          # `rcore` — Rust search core (rcore.dll)
+│   ├── Cargo.toml                      # cdylib crate, `fastembed` feature
+│   └── src/                            # dispatch, embed, grep, filter, core
 ├── http-1c-dp/
 │   ├── http1c.xml                      # 1C data processor XML source
 │   └── http1c/
@@ -395,6 +456,7 @@ Events sent from the native component to 1C:
 - **[nlohmann/json](https://github.com/nlohmann/json)** — JSON parser
 - **1C Native API** — integration with 1C:Enterprise
 - **OneScript** — EPF compilation from XML
+- **Rust** (`rcore` crate) + **[fastembed](https://github.com/Anush008/fastembed-rs)** / **onnxruntime (ort)** — optional search core in `rcore.dll` (full distribution only)
 
 Based on [lintest/AddinTemplate](https://github.com/lintest/AddinTemplate) for the native add-in layer.
 
@@ -455,6 +517,46 @@ After a successful DLL build, the top-level build scripts also package the nativ
 
 ```text
 http-1c-dp/http1c/Templates/http1c/Ext/Template.bin
+```
+
+### Building the search core (full distribution)
+
+By default the build produces the **lite** component only — pure C++, no Rust/cargo involved. To also build the **full** search core (`rcore.dll`), configure CMake with `-DRCORE_FASTEMBED=ON`:
+
+```bash
+cd http-1c-dll && mkdir -p build && cd build
+# lite — libhttp1cWin.dll alone (no cargo):
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build .
+
+# full — also builds rcore.dll via cargo:
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DRCORE_FASTEMBED=ON
+cmake --build .
+```
+
+The full build invokes `cargo build --release --features fastembed` (handled inside CMake) and drops `rcore.dll` next to the component in `http-1c-dll/bin/`. The embedding model is fetched at runtime, so no model is downloaded at build time.
+
+**Why two binaries (`/MT` vs `/MD`).** The C++ component is built with the **static** CRT (`/MT`) — it cannot compile under `/MD` because MSVC's `char16_t` stream code hits error C2491. onnxruntime (via `ort`), however, requires the **dynamic** CRT (`/MD`). Linking the two together is impossible, so the search core is a *separate* `rcore.dll` (a cdylib) that the `/MT` component loads at runtime instead of linking. CMake builds the cdylib with the dynamic CRT by removing the `+crt-static` default (`RUSTFLAGS=-C target-feature=-crt-static`); this is independent of the component's `/MT` and they never link together.
+
+### Packaging the add-in (lite / full)
+
+`build/package-http1c-addin.sh` assembles a 1C add-in ZIP (and updates `Template.bin`). The variant is selected via the `VARIANT` env var:
+
+```bash
+# lite (default) — libhttp1cWin.dll only:
+VARIANT=lite bash build/package-http1c-addin.sh
+
+# full — also bundles rcore.dll + DirectML.dll:
+VARIANT=full bash build/package-http1c-addin.sh
+```
+
+The **full** packaging step copies `DirectML.dll` from `C:\Windows\System32\DirectML.dll` (override with `DIRECTML_SRC`) into the bundle — it is a hard dependency of `rcore.dll` (see [GPU / CPU](#gpu--cpu-directml)) and the script fails clearly if it is missing. Set `SKIP_TEMPLATE=1` to produce only the ZIP without overwriting the committed `Template.bin` (which tracks the lite bundle).
+
+The release workflow (`.github/workflows/release.yml`) builds both variants and attaches both ZIPs to the GitHub release:
+
+```text
+http1c-addin-lite-v<version>.zip   # libhttp1cWin.dll
+http1c-addin-full-v<version>.zip   # libhttp1cWin.dll + rcore.dll + DirectML.dll
 ```
 
 ## Running the 1C Side

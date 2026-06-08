@@ -17,7 +17,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-    
+
     steps:
       - uses: actions/checkout@v4
 
@@ -26,8 +26,9 @@ jobs:
         with:
           arch: x64
 
-      # The DLL build invokes `cargo build` (via CMake) to produce rust-core's
-      # staticlib, so the Rust toolchain must be present.
+      # The full ("RAG") build invokes `cargo build` (via CMake) to produce the
+      # rcore.dll cdylib (fastembed search core), so the Rust toolchain must be
+      # present. The lite build is pure C++ and needs no cargo.
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -38,7 +39,9 @@ jobs:
         with:
           workspaces: rust-core
 
-      - name: Build DLL (Release)
+      # ---- LITE variant: libhttp1cWin.dll alone (no cargo, search returns
+      # "install RAG"). The committed Template.bin tracks this bundle. ----
+      - name: Build DLL (Release, lite)
         shell: bash
         run: |
           cd http-1c-dll
@@ -59,9 +62,29 @@ jobs:
           cmake --build .
           ./http1c_tests.exe
 
-      - name: Package add-in
+      - name: Package add-in (lite)
         shell: bash
-        run: bash build/package-http1c-addin.sh
+        run: VARIANT=lite bash build/package-http1c-addin.sh
+
+      # ---- FULL variant: also build rcore.dll (real fastembed search core).
+      # -DRCORE_FASTEMBED=ON makes CMake invoke cargo with the dynamic-CRT
+      # RUSTFLAGS and drop rcore.dll next to the component. The model is fetched
+      # at RUNTIME, so nothing extra is downloaded at build time. Packaging adds
+      # rcore.dll + DirectML.dll (from System32) to the bundle; SKIP_TEMPLATE=1
+      # keeps the committed lite Template.bin from being clobbered. ----
+      - name: Build DLL + rcore.dll (Release, full)
+        shell: bash
+        run: |
+          cd http-1c-dll
+          rm -rf build
+          mkdir build
+          cd build
+          cmake .. -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DRCORE_FASTEMBED=ON
+          cmake --build .
+
+      - name: Package add-in (full)
+        shell: bash
+        run: VARIANT=full SKIP_TEMPLATE=1 bash build/package-http1c-addin.sh
 
       - name: Extract version
         id: version
@@ -82,7 +105,8 @@ jobs:
         shell: bash
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
-          cp "build/artifacts/http1c-addin.zip" "build/artifacts/http1c-addin-v${VERSION}.zip"
+          cp "build/artifacts/http1c-addin.zip"      "build/artifacts/http1c-addin-lite-v${VERSION}.zip"
+          cp "build/artifacts/http1c-addin-full.zip" "build/artifacts/http1c-addin-full-v${VERSION}.zip"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -91,4 +115,5 @@ jobs:
           name: "http1c v${{ steps.version.outputs.VERSION }}"
           generate_release_notes: true
           files: |
-            build/artifacts/http1c-addin-v${{ steps.version.outputs.VERSION }}.zip
+            build/artifacts/http1c-addin-lite-v${{ steps.version.outputs.VERSION }}.zip
+            build/artifacts/http1c-addin-full-v${{ steps.version.outputs.VERSION }}.zip
