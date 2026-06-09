@@ -1702,4 +1702,74 @@ mod tests {
         let s = call("stats", "");
         assert_eq!(s["result"]["dim"].as_u64().unwrap(), 384);
     }
+
+    // -- Offline / air-gapped local-model init (gated; needs a staged model dir) -
+    //
+    // Empirically closes §11.4: `configure` with a local `model_path` routes to
+    // FastEmbedder::new_local (try_new_from_user_defined over on-disk bytes — no
+    // hf-hub). Runs ONLY when RCORE_TEST_MODEL_DIR points at a pre-staged model
+    // directory (onnx/model.onnx + the four tokenizer/config files); skipped
+    // otherwise, so the normal suite and CI stay unaffected. The runner blocks
+    // network (a dead HTTP(S) proxy + HF_HUB_OFFLINE=1), so a PASS proves the
+    // local path makes no implicit egress on first `configure` or first embed.
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn fastembed_offline_local_init() {
+        let dir = match std::env::var("RCORE_TEST_MODEL_DIR") {
+            Ok(d) if !d.trim().is_empty() => d,
+            _ => {
+                eprintln!(
+                    "RCORE_TEST_MODEL_DIR not set — skipping offline local-init test \
+                     (set it to a staged model dir to run)"
+                );
+                return;
+            }
+        };
+        let _g = e2e_guard();
+
+        // Local path → new_local. dim 384 proves the staged e5-small loaded; a 64
+        // would mean new_local failed and we silently fell back to the mock.
+        let payload = format!(r#"{{"model_path":{},"device":"cpu"}}"#, json!(dir));
+        let v = call("configure", &payload);
+        assert_eq!(v["ok"], json!(true), "offline configure failed: {v}");
+        assert_eq!(
+            v["result"]["dim"].as_u64().unwrap(),
+            384,
+            "offline local e5-small must report dim 384 (got {}); a 64 means new_local \
+             failed to load the staged files and we fell back to the mock",
+            v["result"]["dim"]
+        );
+
+        // Exercise the real embed path offline (where any hidden egress in
+        // try_new_from_user_defined / inference would surface as a failure).
+        call(
+            "index_segments",
+            r#"{"collection":"off","doc_id":"ru","name":"ru-contract",
+                "segments":[{"text":"Договор поставки товара №123 от 5 июня"}]}"#,
+        );
+        call(
+            "index_segments",
+            r#"{"collection":"off","doc_id":"cat","name":"uk-cat",
+                "segments":[{"text":"Кіт сидить на вікні"}]}"#,
+        );
+        assert!(
+            store::wait_until_ready("off", std::time::Duration::from_secs(180)),
+            "offline collection did not reach Ready — the worker failed to embed \
+             (an unexpected network dependency would surface here)"
+        );
+
+        let v = call(
+            "search",
+            r#"{"query":"договор на поставку товаров","collection":"off","mode":"dense","k":10,"include_text":true}"#,
+        );
+        assert_eq!(v["ok"], json!(true), "offline search failed: {v}");
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "offline search returned no hits: {v}");
+        assert_eq!(
+            hits[0]["doc_id"],
+            json!("ru"),
+            "offline dense search must rank the contract above the cat: {v}"
+        );
+        eprintln!("offline local-init OK: dim=384, top hit=ru, network blocked");
+    }
 }
