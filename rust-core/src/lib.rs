@@ -98,6 +98,12 @@ fn guard<F: FnOnce() -> String>(f: F) -> String {
     }
 }
 
+/// Lock-free process-global counter of dispatched calls, surfaced via `stats`.
+/// Kept OUT of the `RwLock`-guarded store so a `search`/`grep` never has to take
+/// the exclusive write lock merely to bump a counter (which would serialize
+/// otherwise-concurrent readers).
+static CALLS_HANDLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // ---------------------------------------------------------------------------
 // Method dispatch (pure Rust, no FFI types — easy to unit-test)
 // ---------------------------------------------------------------------------
@@ -120,10 +126,10 @@ fn dispatch(method: &str, payload_json: &str) -> String {
         }
     };
 
-    // Count every dispatched call so `stats` observes real shared state.
-    if let Ok(mut core) = CORE.write() {
-        core.calls_handled = core.calls_handled.saturating_add(1);
-    }
+    // Count every dispatched call (surfaced via `stats`) WITHOUT taking the
+    // index write lock — a lock-free atomic, so concurrent search/grep calls
+    // don't serialize on the exclusive lock just to bump a counter.
+    CALLS_HANDLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let envelope = match method {
         // Liveness probe. Echoes the payload back so the C++ side can verify a
@@ -166,7 +172,7 @@ fn dispatch(method: &str, payload_json: &str) -> String {
                 "n_docs": total_docs,
                 "n_segments": total_segments,
                 "collections": collections,
-                "callsHandled": core.calls_handled,
+                "callsHandled": CALLS_HANDLED.load(std::sync::atomic::Ordering::Relaxed),
             }))
         }
 

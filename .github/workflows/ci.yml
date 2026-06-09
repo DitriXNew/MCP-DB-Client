@@ -18,10 +18,19 @@ jobs:
         with:
           arch: x64
 
-      # The DLL build invokes `cargo build` (via CMake) to produce rust-core's
-      # staticlib, so the Rust toolchain must be present. windows-latest ships
-      # Rust preinstalled, but pin it explicitly for a deterministic build and
-      # to guarantee the x86_64-pc-windows-msvc target.
+      # Git for Windows ships a GNU coreutils `link.exe` in usr/bin; under
+      # `shell: bash` it shadows the MSVC linker on PATH, so cargo/rustc link
+      # steps fail with a GNU `link` invoked on MSVC args. Remove it so cargo
+      # finds MSVC's link.exe.
+      - name: Remove GNU link.exe (shadows MSVC linker under bash)
+        shell: pwsh
+        run: |
+          $p = "C:\Program Files\Git\usr\bin\link.exe"
+          if (Test-Path $p) { Remove-Item $p -Force }
+
+      # The full (RAG) build produces the rcore.dll cdylib via `cargo build`
+      # (the lite C++ build needs no cargo), and the Rust-core tests below need
+      # cargo. Pin the toolchain for a deterministic, msvc-targeted build.
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:

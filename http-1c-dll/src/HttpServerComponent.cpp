@@ -193,8 +193,11 @@ bool isNativeTool(const std::string& toolName) {
            toolName == "grep";
 }
 
-// Shared `meta_filters` schema fragment (free key-value, OR via `any` /
-// AND via `all`; no domain-specific fields — the core stays generic).
+// Shared `filter` schema fragment (free key-value, OR via `any` / AND via
+// `all`; no domain-specific fields — the core stays generic). The property is
+// named `filter` to match what the Rust core parses (MetaFilter::parse reads
+// the top-level `filter` object); advertising `meta_filters` would be silently
+// ignored.
 json metaFiltersSchema() {
     return json{
         {"type", "object"},
@@ -262,7 +265,7 @@ json nativeToolDefinitions() {
                     {"description", "Include the full segment text in each hit "
                                     "(default true). When false a short preview is returned."}
                 }},
-                {"meta_filters", metaFiltersSchema()}
+                {"filter", metaFiltersSchema()}
             }},
             {"required", json::array({"query"})},
             {"additionalProperties", false}
@@ -341,7 +344,7 @@ json nativeToolDefinitions() {
                     {"minimum", 1},
                     {"description", "Cap the number of matches returned per document."}
                 }},
-                {"meta_filters", metaFiltersSchema()}
+                {"filter", metaFiltersSchema()}
             }},
             {"required", json::array({"pattern"})},
             {"additionalProperties", false}

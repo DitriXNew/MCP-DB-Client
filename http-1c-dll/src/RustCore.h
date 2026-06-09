@@ -1,5 +1,5 @@
-#ifndef __RUSTCORE_H__
-#define __RUSTCORE_H__
+#ifndef HTTP1C_RUSTCORE_H
+#define HTTP1C_RUSTCORE_H
 
 // ---------------------------------------------------------------------------
 // RustCore.h — C++ surface for the Rust search core (rust-core/, crate `rcore`).
@@ -276,4 +276,4 @@ inline RustString dispatch(const std::string& method, const std::string& payload
 
 } // namespace RCore
 
-#endif // __RUSTCORE_H__
+#endif // HTTP1C_RUSTCORE_H

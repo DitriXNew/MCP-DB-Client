@@ -225,8 +225,6 @@ pub struct Core {
     pub config: Config,
     /// Named collections of indexed documents.
     pub collections: HashMap<String, Collection>,
-    /// Monotonic counter of dispatched calls — surfaced via `stats`.
-    pub calls_handled: u64,
     /// Source of stable, unique segment ids.
     next_segment_id: u64,
     /// The background worker, spawned lazily on first ingest.
@@ -243,7 +241,6 @@ impl Default for Core {
             embedder: None,
             config: Config::default(),
             collections: HashMap::new(),
-            calls_handled: 0,
             next_segment_id: 1,
             worker: None,
             progress: Arc::new((Mutex::new(()), Condvar::new())),
@@ -265,7 +262,7 @@ impl Core {
         self.config = Config::default();
         self.collections.clear();
         self.next_segment_id = 1;
-        // `calls_handled` is a lifetime-of-process counter; not cleared.
+        // (the dispatch counter lives in lib.rs as a lifetime-of-process atomic.)
         // Wake any waiters so a `wait_until_ready` on a cleared collection
         // returns promptly instead of hanging to its timeout.
         self.progress.1.notify_all();

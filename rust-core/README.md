@@ -1,107 +1,113 @@
-# rcore — Rust search core (Stage 0 FFI skeleton)
+# rcore — Rust search core
 
-`rcore` is the Rust core that will provide semantic + regex search for the 1C
-MCP component. It compiles to a **staticlib** and is linked directly into the
-C++ DLL (`libhttp1cWin64`). This Stage 0 deliverable is the **FFI skeleton
-only**: the C ABI boundary, the memory-ownership convention, the CRT match, and
-the process-global singleton. The ML pieces (`fastembed` / `ort` /
-`tokenizers`) and the real `configure` / `index_segments` / `search` methods
-arrive in **Stage 1**.
+`rcore` provides semantic + keyword + hybrid search, regex (`grep`), and line
+slicing (`get_segment`) for the 1C MCP component, over a JSON-in / JSON-out C
+ABI.
+
+It compiles to a **cdylib** (`rcore.dll`) that the C++ component loads at
+**runtime** (`LoadLibrary` + `GetProcAddress`, see
+[`http-1c-dll/src/RustCore.h`](../http-1c-dll/src/RustCore.h)) — it is **not**
+linked into the component. This is deliberate: ort/onnxruntime require the
+dynamic CRT (`/MD`), but the C++ 1C component can't compile under `/MD`
+(`std::basic_stringstream<char16_t>` hits MSVC C2491), so the search core ships
+as a separate `/MD` DLL with a self-contained static onnxruntime. One
+`libhttp1cWin.dll` then serves both distributions:
+
+- **lite** — `rcore.dll` absent → the `search`/`grep`/`get_segment` tools return
+  a structured `rag_not_installed` result.
+- **full** — `rcore.dll` present (next to the component) + `DirectML.dll` → real
+  search.
 
 ## Crate layout
 
 ```
 rust-core/
-├── Cargo.toml            # staticlib, pinned deps (serde, serde_json, once_cell)
-├── .cargo/config.toml    # +crt-static for x86_64-pc-windows-msvc (matches /MT)
-├── README.md             # this file
+├── Cargo.toml             # cdylib; pinned deps; feature-gated `fastembed`
+├── .cargo/config.toml     # +crt-static for the MOCK/staticlib path (see CRT note)
 └── src/
-    ├── lib.rs            # C ABI boundary + dispatch + unit tests
-    ├── core.rs           # process-global singleton (Lazy<RwLock<Core>>)
-    └── protocol.rs       # JSON success/error envelope types
+    ├── lib.rs                 # C ABI + JSON dispatch + request parsing + e2e tests
+    ├── core.rs                # process-global store (Lazy<RwLock<Core>>) + async worker
+    ├── embed.rs               # Embedder trait + deterministic MockEmbedder (tests)
+    ├── fastembed_embedder.rs  # real FastEmbedder (feature `fastembed`; DirectML/CPU)
+    ├── filter.rs              # combinable meta filters (`filter` field: any/all/tags)
+    ├── grep.rs                # RE2-style regex scan over stored segment text
+    └── protocol.rs            # JSON success/error envelope + error codes
 ```
 
 ## FFI contract
 
-All data crosses the boundary as **JSON strings**. The surface is four
-`extern "C"` functions:
+All data crosses as **JSON strings**. Four `extern "C"` exports:
 
-| Function | Signature | Returns |
-|----------|-----------|---------|
-| `rcore_version` | `char* rcore_version(void)` | JSON `{"name","version","abi"}` |
-| `rcore_dispatch` | `char* rcore_dispatch(const char* method, const char* payload_json)` | JSON envelope |
-| `rcore_free_string` | `void rcore_free_string(char* s)` | — |
-| `rcore_shutdown` | `void rcore_shutdown(void)` | — |
+| Function | Signature |
+|----------|-----------|
+| `rcore_version` | `char* rcore_version(void)` → `{"name","version","abi"}` |
+| `rcore_dispatch` | `char* rcore_dispatch(const char* method, const char* payload_json)` → envelope |
+| `rcore_free_string` | `void rcore_free_string(char* s)` |
+| `rcore_shutdown` | `void rcore_shutdown(void)` |
 
-`rcore_dispatch` is the single generic entry point. Response envelope:
+`rcore_dispatch` is the single generic entry point. Envelope: success
+`{"ok":true,"result":...}`, failure `{"ok":false,"error":{"code","message"}}`.
+Unknown method → `unknown_method`; bad JSON → `bad_payload`; bad regex →
+`bad_pattern`. Panics are caught at the boundary (`catch_unwind`) and surface as
+`internal` — they never unwind across the C ABI.
 
-- Success: `{"ok": true, "result": <method-specific>}`
-- Failure: `{"ok": false, "error": {"code": "...", "message": "..."}}`
+**Methods:** `configure`, `index_segments`, `index_raw`, `search`
+(`mode: dense|keyword|hybrid`), `grep`, `get_segment`, `stats`, `reset`,
+`delete_document`, `delete_collection`. Ingest is **async** (returns
+immediately; a background worker embeds; collections expose a two-axis
+`text_ready` / `vector_status` state, polled via `stats`).
 
-Stub methods implemented in Stage 0:
+## Embedder: mock (tests) vs real (`fastembed` feature)
 
-- `ping` — echoes the payload: `{"ok":true,"result":{"pong":true,"echo":<payload>}}`.
-- `stats` — reports singleton state: `configured`, `collections`, `callsHandled`.
-- `reset` — clears mutable state; idempotent.
+The `Embedder` trait has two impls:
 
-Any **unknown method** returns a *structural* error
-(`{"ok":false,"error":{"code":"unknown_method",...}}`) — never a panic.
-A malformed payload returns `code: "bad_payload"`. Panics are caught at the
-boundary (`catch_unwind`) and surface as `code: "internal"`; they never unwind
-across the C ABI (which would be UB).
+- **`MockEmbedder`** (dim 64, deterministic token hash) — used by `cargo test`
+  and as a fallback. **Test-only**; not a production search backend.
+- **`FastEmbedder`** (feature `fastembed`) — fastembed 5.16 + ort 2.0.0-rc.12 +
+  multilingual-e5-small (dim 384, L2-normalized, `query:`/`passage:` prefixes).
+  Two separately-loaded model instances (`bulk` + `query`) because
+  `fastembed::embed` is `&mut self`, so a shared mutex would let a bulk reindex
+  block queries.
 
-Stage 1 adds `configure` / `index_segments` / `search` as new match arms in
-`dispatch()`.
+`configure` selects the backend: `model` / `model_path` non-empty (with the
+feature compiled in) → `FastEmbedder`, else `MockEmbedder`.
+**GPU:** `configure` `device: cpu | dml | auto` (default `auto`) registers the
+DirectML execution provider with **automatic CPU fallback** (ort registers it
+best-effort; no GPU/driver → CPU). The full package therefore ships
+`DirectML.dll` (a hard import of the onnxruntime prebuilt).
 
 ## Memory-ownership rule (critical)
 
 > Every `char*` returned to C is allocated by **Rust** (`CString::into_raw`) and
-> must be freed **only** by `rcore_free_string` (`CString::from_raw`).
-> **Never** call C's `free`/`delete` on these pointers — that is a cross-CRT
-> free and corrupts the heap.
+> must be freed **only** by `rcore_free_string`. **Never** call C's
+> `free`/`delete` — that is a cross-CRT / cross-DLL free and corrupts the heap.
 
-- Input pointers (`method`, `payload_json`) are *borrowed*; Rust never frees them.
-- `rcore_free_string(NULL)` is a safe no-op. Double-free is the caller's contract
-  to avoid — the C++ `RustString` RAII wrapper (`http-1c-dll/src/RustCore.h`)
-  enforces single-free on the C++ side.
+Input pointers are borrowed (never freed by Rust). The C++ `RustString` RAII
+wrapper frees via the **loaded** `rcore_free_string`, keeping ownership inside
+`rcore.dll`.
 
-## CRT match: `+crt-static` ⇄ `/MT`
+## CRT: mock `/MT` vs fastembed `/MD`
 
-The C++ DLL uses the **static** CRT (`/MT` Release, `/MTd` Debug; see
-`http-1c-dll/CMakeLists.txt` lines ~62-68). The Rust staticlib **must** use the
-static CRT too, or you get duplicate-CRT linker errors and heap-ownership UB.
-This is configured in [`.cargo/config.toml`](.cargo/config.toml):
-
-```toml
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
-```
-
-When linking a Rust MSVC staticlib you must also provide the system import
-libraries the Rust std runtime pulls in. CMake adds:
-`ntdll userenv bcrypt advapi32 ws2_32 kernel32` (see `CMakeLists.txt`).
+- The **mock** path keeps the static CRT (`+crt-static` in
+  [`.cargo/config.toml`](.cargo/config.toml)) to match the C++ component's `/MT`.
+- The **fastembed** `rcore.dll` needs the **dynamic** CRT (`/MD`): ort's prebuilt
+  onnxruntime is `/MD`, so `+crt-static` fails to link (`__imp_*` unresolved).
+  Build it with `RUSTFLAGS="-C target-feature=-crt-static"` (which CMake's
+  `RCORE_FASTEMBED=ON` path sets automatically). onnxruntime is statically linked
+  into `rcore.dll` — there is **no** `onnxruntime.dll`.
 
 ## Build
 
 ```sh
-# from rust-core/
-cargo build --release --target x86_64-pc-windows-msvc
-# → target/x86_64-pc-windows-msvc/release/rcore.lib
-
-# Debug:
-cargo build --target x86_64-pc-windows-msvc
-
-# Run the unit tests (round-trip + free path). Tests use the host target;
-# +crt-static is scoped to *-msvc so it does not interfere on other hosts:
+# Mock unit tests (fast, no ort):
 cargo test
+
+# Real embedder tests (compiles ort; needs the dynamic CRT + network for the model):
+RUSTFLAGS="-C target-feature=-crt-static" cargo test --features fastembed
+
+# Production rcore.dll (cdylib) — usually via CMake's full build:
+#   cmake .. -DRCORE_FASTEMBED=ON      (drops rcore.dll next to the component)
+RUSTFLAGS="-C target-feature=-crt-static" \
+  cargo build --release --features fastembed --target x86_64-pc-windows-msvc
+# → target/x86_64-pc-windows-msvc/release/rcore.dll
 ```
-
-CMake invokes `cargo build` automatically as part of the DLL build (custom
-target `rcore_staticlib`) and links the produced `.lib`. The crate is not built
-standalone for production — it is a link-time dependency of `http1c`.
-
-## Status
-
-Stage 0 skeleton. **Not yet build/link-verified in this environment** (no Rust /
-Cargo / MSVC toolchain present). Verify with the commands above plus a full
-CMake build of `http-1c-dll`.

@@ -26,6 +26,14 @@ jobs:
         with:
           arch: x64
 
+      # Git for Windows' GNU `link.exe` (usr/bin) shadows the MSVC linker under
+      # `shell: bash`, breaking cargo/rustc link steps — remove it.
+      - name: Remove GNU link.exe (shadows MSVC linker under bash)
+        shell: pwsh
+        run: |
+          $p = "C:\Program Files\Git\usr\bin\link.exe"
+          if (Test-Path $p) { Remove-Item $p -Force }
+
       # The full ("RAG") build invokes `cargo build` (via CMake) to produce the
       # rcore.dll cdylib (fastembed search core), so the Rust toolchain must be
       # present. The lite build is pure C++ and needs no cargo.
