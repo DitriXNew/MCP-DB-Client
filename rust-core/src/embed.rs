@@ -126,7 +126,29 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
     }
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    // Manual 8-lane chunking gives LLVM a trivially auto-vectorizable shape: 8
+    // independent f32 accumulators with no cross-lane dependency, so it can lower
+    // the inner loop to packed SIMD multiply-adds. The previous `.zip().map().sum()`
+    // form is a single serial f32 accumulator — one long dependency chain LLVM
+    // will not vectorize (reassociating f32 adds changes results, which the
+    // optimizer is not allowed to do on its own). Vectors are L2-normalized, so
+    // this still equals cosine; only the summation grouping changes (negligible,
+    // and ranking is robust to it).
+    const LANES: usize = 8;
+    let mut acc = [0.0f32; LANES];
+    let mut ca = a.chunks_exact(LANES);
+    let mut cb = b.chunks_exact(LANES);
+    for (xa, xb) in ca.by_ref().zip(cb.by_ref()) {
+        for l in 0..LANES {
+            acc[l] += xa[l] * xb[l];
+        }
+    }
+    let mut sum: f32 = acc.iter().sum();
+    // Tail (len % 8) — at most 7 elements.
+    for (x, y) in ca.remainder().iter().zip(cb.remainder().iter()) {
+        sum += x * y;
+    }
+    sum
 }
 
 #[cfg(test)]

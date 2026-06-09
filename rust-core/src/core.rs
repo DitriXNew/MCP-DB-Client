@@ -651,7 +651,7 @@ fn apply_job(job: EmbedJob, vectors: Option<Vec<Vec<f32>>>) {
     let mut embedded = 0u64;
     let mut failed = 0u64;
 
-    if let Some(vectors) = vectors {
+    if let Some(mut vectors) = vectors {
         // Locate the (possibly re-ingested) doc once; if it's gone, every id is
         // stale and we just fall through to the bookkeeping below.
         if let Some(doc) = coll.docs.get_mut(&doc_id) {
@@ -674,13 +674,16 @@ fn apply_job(job: EmbedJob, vectors: Option<Vec<Vec<f32>>>) {
                     Some(s) => s,
                     None => continue,
                 };
-                match vectors.get(i) {
+                // MOVE the vector out of the job (leaving an empty Vec behind)
+                // instead of cloning it under the write lock — each embedding is
+                // `dim` f32s and we hold the exclusive lock here.
+                match vectors.get_mut(i).map(std::mem::take) {
                     Some(v) if v.iter().all(|x| x.is_finite()) && v.iter().any(|&x| x != 0.0) => {
-                        seg.vector = Some(v.clone());
+                        seg.vector = Some(v);
                         embedded += 1;
                     }
                     _ => {
-                        // Non-finite / all-zero vector → fail, but keep going.
+                        // Non-finite / all-zero / absent vector → fail, keep going.
                         failed += 1;
                     }
                 }
@@ -1272,19 +1275,53 @@ fn keyword_score(seg_text: &str, query_terms: &[String]) -> f32 {
     distinct_present as f32 + 0.1 * total_occurrences as f32
 }
 
-/// Build a fresh [`Hit`] for a segment with a given score. Centralizes the
-/// (verbose) field copy so the dense / keyword scanners stay terse.
-fn make_hit(doc: &Document, seg: &Segment, collection: &str, score: f32) -> Hit {
+/// Character budget of the `preview` the FFI layer emits when `include_text` is
+/// false (mirror of the truncation in `lib.rs::hit_to_json`). When a caller does
+/// not want full text we materialize only this prefix, so a long segment's text
+/// is never cloned in full just to be thrown away at serialization.
+const PREVIEW_CHARS: usize = 120;
+
+/// A scored segment, held by reference — the lightweight intermediate the
+/// scanners produce. Carrying borrows (not clones) means scoring the *whole*
+/// corpus allocates nothing per segment; the expensive [`Hit`] (which clones
+/// `doc.meta` + the segment text) is built only for the ≤k survivors, in
+/// [`make_hit`], after top-k selection. The borrow is tied to the `&Core` the
+/// search holds for its whole duration, so the refs stay valid until hits are
+/// materialized.
+struct Scored<'a> {
+    score: f32,
+    segment_id: u64,
+    doc: &'a Document,
+    seg: &'a Segment,
+    collection: &'a str,
+}
+
+/// Descending score comparator (NaN treated as lowest), shared by every ranking
+/// step so the order semantics are identical across channels.
+fn cmp_score_desc(a: f32, b: f32) -> std::cmp::Ordering {
+    b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// Materialize one [`Hit`] from a scored ref. This is the ONLY place that clones
+/// `doc.meta` and segment text, and it now runs only for the final survivors.
+/// When `include_text` is false we clone just the `PREVIEW_CHARS`-char prefix the
+/// wire payload will show, not the whole (possibly large) segment text.
+fn make_hit(s: &Scored, include_text: bool) -> Hit {
+    let text = if include_text {
+        s.seg.text.clone()
+    } else {
+        s.seg.text.chars().take(PREVIEW_CHARS).collect()
+    };
     Hit {
-        doc_id: doc.doc_id.clone(),
-        name: doc.name.clone(),
-        collection: collection.to_string(),
-        meta: doc.meta.clone(),
-        segment_id: seg.segment_id,
-        line_start: seg.line_start,
-        line_end: seg.line_end,
-        score,
-        text: seg.text.clone(),
+        doc_id: s.doc.doc_id.clone(),
+        name: s.doc.name.clone(),
+        collection: s.collection.to_string(),
+        meta: s.doc.meta.clone(),
+        segment_id: s.seg.segment_id,
+        line_start: s.seg.line_start,
+        line_end: s.seg.line_end,
+        score: s.score,
+        text,
     }
 }
 
@@ -1296,24 +1333,39 @@ fn in_scope(want: &Option<String>, cname: &str) -> bool {
     }
 }
 
-/// Stable descending sort by score (NaN treated as lowest; segment ordering is
-/// otherwise preserved by `sort_by`, which is stable).
-fn sort_desc(scored: &mut [Hit]) {
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+/// Descending sort of scored refs by score (NaN lowest). Cheap: it reorders
+/// `Scored` (a few words each), never `Hit`.
+fn sort_scored_desc(scored: &mut [Scored]) {
+    scored.sort_by(|a, b| cmp_score_desc(a.score, b.score));
+}
+
+/// Select the top-`k` scored refs **without** a full sort of the candidate set.
+/// `select_nth_unstable_by` partitions in O(N) so the k highest land in `[..k]`
+/// (unordered); we then sort just those k. For N ≫ k this replaces O(N log N)
+/// with O(N + k log k). Tie order among equal scores is unspecified — which is
+/// already true of the existing path, since the corpus is walked in `HashMap`
+/// iteration order — so no observable contract changes.
+fn top_k_scored(mut scored: Vec<Scored>, k: usize) -> Vec<Scored> {
+    if k == 0 {
+        return Vec::new();
+    }
+    if scored.len() > k {
+        scored.select_nth_unstable_by(k - 1, |a, b| cmp_score_desc(a.score, b.score));
+        scored.truncate(k);
+    }
+    sort_scored_desc(&mut scored);
+    scored
 }
 
 /// Dense channel: embed the query and score every *vectorized* segment in scope
 /// by dot product (== cosine over normalized vectors). Applies the meta filter.
-/// `min_score`, when given, is an absolute cosine floor. Returns the ranked
-/// (descending) list and whether any in-scope collection is still `Building`.
+/// `min_score`, when given, is an absolute cosine floor. Returns the scored refs
+/// (UNSORTED — selection/sorting happens once in [`finalize`]) plus whether any
+/// in-scope collection is still `Building`.
 ///
 /// Segments without a vector (not embedded yet, or skipped) are ignored — dense
 /// is the only channel that needs vectors.
-fn dense_channel(core: &Core, req: &SearchRequest, apply_min: bool) -> (Vec<Hit>, bool) {
+fn dense_channel<'a>(core: &'a Core, req: &SearchRequest, apply_min: bool) -> (Vec<Scored<'a>>, bool) {
     let embedder = match core.embedder.as_ref() {
         Some(e) => e,
         None => return (Vec::new(), false),
@@ -1321,7 +1373,7 @@ fn dense_channel(core: &Core, req: &SearchRequest, apply_min: bool) -> (Vec<Hit>
     let qvec = embedder.embed_query(&req.query);
 
     let mut partial = false;
-    let mut scored: Vec<Hit> = Vec::new();
+    let mut scored: Vec<Scored> = Vec::new();
     for (cname, coll) in core.collections.iter() {
         if !in_scope(&req.collection, cname) {
             continue;
@@ -1349,11 +1401,16 @@ fn dense_channel(core: &Core, req: &SearchRequest, apply_min: bool) -> (Vec<Hit>
                         }
                     }
                 }
-                scored.push(make_hit(doc, seg, cname, score));
+                scored.push(Scored {
+                    score,
+                    segment_id: seg.segment_id,
+                    doc,
+                    seg,
+                    collection: cname,
+                });
             }
         }
     }
-    sort_desc(&mut scored);
     (scored, partial)
 }
 
@@ -1361,16 +1418,16 @@ fn dense_channel(core: &Core, req: &SearchRequest, apply_min: bool) -> (Vec<Hit>
 /// needed, so it works the instant a doc is accepted (even while `Building`).
 /// Scores by [`keyword_score`], drops zero-score (non-matching) segments, and
 /// applies the meta filter. `min_score`, when given and `apply_min`, is a floor
-/// on the *match score* (not a cosine). Returns the ranked (descending) list.
+/// on the *match score* (not a cosine). Returns the scored refs (UNSORTED).
 ///
 /// Note `partial` is irrelevant to keyword (it never reads vectors), so this
 /// returns only the list; the caller decides the result-level `partial` flag.
-fn keyword_channel(core: &Core, req: &SearchRequest, apply_min: bool) -> Vec<Hit> {
+fn keyword_channel<'a>(core: &'a Core, req: &SearchRequest, apply_min: bool) -> Vec<Scored<'a>> {
     let query_terms = distinct(keyword_tokens(&req.query));
     if query_terms.is_empty() {
         return Vec::new(); // no terms ⇒ nothing can match
     }
-    let mut scored: Vec<Hit> = Vec::new();
+    let mut scored: Vec<Scored> = Vec::new();
     for (cname, coll) in core.collections.iter() {
         if !in_scope(&req.collection, cname) {
             continue;
@@ -1391,11 +1448,16 @@ fn keyword_channel(core: &Core, req: &SearchRequest, apply_min: bool) -> Vec<Hit
                         }
                     }
                 }
-                scored.push(make_hit(doc, seg, cname, score));
+                scored.push(Scored {
+                    score,
+                    segment_id: seg.segment_id,
+                    doc,
+                    seg,
+                    collection: cname,
+                });
             }
         }
     }
-    sort_desc(&mut scored);
     scored
 }
 
@@ -1418,55 +1480,68 @@ fn distinct(tokens: Vec<String>) -> Vec<String> {
 /// point: an exact-identifier match that dense misses, or a semantic match the
 /// keyword scan misses, both get fused in. The fused `score` replaces the raw
 /// per-channel score; its magnitude is relative (see [`SearchMode`] docs).
-fn rrf_fuse(dense: Vec<Hit>, keyword: Vec<Hit>) -> Vec<Hit> {
-    // Accumulate fused scores keyed by segment_id, keeping one representative
-    // Hit per segment (the first we encounter carries the displayable fields).
+fn rrf_fuse<'a>(mut dense: Vec<Scored<'a>>, mut keyword: Vec<Scored<'a>>) -> Vec<Scored<'a>> {
+    // RRF scores by *rank* within each channel, so each list must be ranked
+    // descending first. These sorts are over lightweight `Scored` refs (no
+    // clones), and RRF inherently needs the full per-channel ranking.
+    sort_scored_desc(&mut dense);
+    sort_scored_desc(&mut keyword);
+
+    // Accumulate fused scores keyed by segment_id, keeping one representative ref
+    // per segment (the first we encounter carries the displayable fields).
     let mut fused: HashMap<u64, f32> = HashMap::new();
-    let mut rep: HashMap<u64, Hit> = HashMap::new();
+    let mut rep: HashMap<u64, Scored> = HashMap::new();
 
-    for (rank, hit) in dense.into_iter().enumerate() {
-        *fused.entry(hit.segment_id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32);
-        rep.entry(hit.segment_id).or_insert(hit);
+    for (rank, s) in dense.into_iter().enumerate() {
+        *fused.entry(s.segment_id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32);
+        rep.entry(s.segment_id).or_insert(s);
     }
-    for (rank, hit) in keyword.into_iter().enumerate() {
-        *fused.entry(hit.segment_id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32);
-        rep.entry(hit.segment_id).or_insert(hit);
+    for (rank, s) in keyword.into_iter().enumerate() {
+        *fused.entry(s.segment_id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32);
+        rep.entry(s.segment_id).or_insert(s);
     }
 
-    // Materialize the fused hits, overwriting each representative's score with
-    // its fused RRF score, then rank descending.
-    let mut out: Vec<Hit> = rep
-        .into_iter()
-        .map(|(sid, mut hit)| {
-            hit.score = fused.get(&sid).copied().unwrap_or(0.0);
-            hit
+    // Overwrite each representative's score with its fused RRF score. Left
+    // UNSORTED — `finalize` does the single top-k selection for the whole search.
+    rep.into_iter()
+        .map(|(sid, mut s)| {
+            s.score = fused.get(&sid).copied().unwrap_or(0.0);
+            s
         })
-        .collect();
-    sort_desc(&mut out);
-    out
+        .collect()
 }
 
-/// Apply `max_per_doc` (cap hits per (collection, doc_id)) then truncate to `k`.
-/// Shared final stage for every mode so the limit semantics are identical.
-fn limit_hits(scored: Vec<Hit>, k: usize, max_per_doc: Option<usize>) -> Vec<Hit> {
-    if let Some(max_per_doc) = max_per_doc {
-        let mut per_doc: HashMap<(String, String), usize> = HashMap::new();
-        let mut kept: Vec<Hit> = Vec::new();
-        for hit in scored {
-            let key = (hit.collection.clone(), hit.doc_id.clone());
-            let count = per_doc.entry(key).or_insert(0);
-            if *count < max_per_doc {
-                *count += 1;
-                kept.push(hit);
+/// Final stage shared by every mode: select the top `k` (honoring `max_per_doc`)
+/// from the scored refs, then materialize a [`Hit`] for each survivor — so the
+/// `doc.meta` / text clones happen only for what is actually returned.
+///
+/// Without `max_per_doc` we take a bounded top-k via [`top_k_scored`] (no full
+/// sort). With `max_per_doc`, capping needs the ranked superset, so we sort the
+/// (lightweight) refs once and walk them applying the per-doc cap and the `k`
+/// limit — identical semantics to the previous `limit_hits`.
+fn finalize(scored: Vec<Scored>, k: usize, max_per_doc: Option<usize>, include_text: bool) -> Vec<Hit> {
+    let selected: Vec<Scored> = match max_per_doc {
+        None => top_k_scored(scored, k),
+        Some(max_per_doc) => {
+            let mut scored = scored;
+            sort_scored_desc(&mut scored);
+            let mut per_doc: HashMap<(&str, &str), usize> = HashMap::new();
+            let mut kept: Vec<Scored> = Vec::new();
+            for s in scored {
+                let key = (s.collection, s.doc.doc_id.as_str());
+                let count = per_doc.entry(key).or_insert(0);
+                if *count < max_per_doc {
+                    *count += 1;
+                    kept.push(s);
+                }
+                if kept.len() >= k {
+                    break;
+                }
             }
-            if kept.len() >= k {
-                break;
-            }
+            kept
         }
-        kept
-    } else {
-        scored.into_iter().take(k).collect()
-    }
+    };
+    selected.iter().map(|s| make_hit(s, include_text)).collect()
 }
 
 /// Mode-aware search over the store. Honors `mode` (`dense` | `keyword` |
@@ -1502,7 +1577,7 @@ pub fn search(core: &Core, req: SearchRequest) -> SearchResult {
         }
     };
 
-    let hits = limit_hits(scored, req.k, req.max_per_doc);
+    let hits = finalize(scored, req.k, req.max_per_doc, req.include_text);
     SearchResult { hits, partial }
 }
 
@@ -1989,6 +2064,80 @@ mod tests {
         assert!(
             res.hits.iter().all(|h| h.score >= 0.99),
             "all hits must meet min_score"
+        );
+    }
+
+    #[test]
+    fn top_k_selection_is_descending_and_bounded() {
+        // Locks in the bounded top-k path (no max_per_doc, N > k): results must be
+        // exactly k, ranked strictly non-increasing by score — i.e. selection +
+        // sort preserve ordering even though the candidate set is never fully
+        // sorted.
+        let _g = test_lock();
+        index(
+            "docs",
+            "d1",
+            &[
+                "alpha beta gamma delta",
+                "alpha beta gamma",
+                "alpha beta",
+                "alpha",
+                "unrelated tokens entirely",
+            ],
+        );
+        assert!(wait_until_ready("docs", Duration::from_secs(5)));
+        let c = CORE.read().unwrap();
+        let res = search(
+            &c,
+            SearchRequest {
+                query: "alpha beta gamma delta".to_string(),
+                collection: Some("docs".to_string()),
+                mode: SearchMode::Keyword,
+                k: 3,
+                min_score: None,
+                max_per_doc: None,
+                include_text: true,
+                filter: MetaFilter::default(),
+            },
+        );
+        assert_eq!(res.hits.len(), 3, "k must bound the result");
+        for w in res.hits.windows(2) {
+            assert!(
+                w[0].score >= w[1].score,
+                "hits must be ranked descending: {} then {}",
+                w[0].score,
+                w[1].score
+            );
+        }
+    }
+
+    #[test]
+    fn include_text_false_caps_hit_text_to_preview() {
+        // The new `make_hit` clones only the preview-length prefix when the caller
+        // doesn't want full text, so a long segment's text is never copied whole.
+        let _g = test_lock();
+        let long: String = "слово ".repeat(200); // ~1200 chars, well past PREVIEW_CHARS
+        index("docs", "d1", &[long.as_str()]);
+        assert!(wait_until_ready("docs", Duration::from_secs(5)));
+        let c = CORE.read().unwrap();
+        let res = search(
+            &c,
+            SearchRequest {
+                query: "слово".to_string(),
+                collection: Some("docs".to_string()),
+                mode: SearchMode::Keyword,
+                k: 1,
+                min_score: None,
+                max_per_doc: None,
+                include_text: false,
+                filter: MetaFilter::default(),
+            },
+        );
+        assert_eq!(res.hits.len(), 1);
+        assert_eq!(
+            res.hits[0].text.chars().count(),
+            PREVIEW_CHARS,
+            "include_text:false must materialize only the preview prefix"
         );
     }
 
