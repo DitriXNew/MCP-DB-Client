@@ -91,7 +91,17 @@ Procedure ExternalEvent(Source, Event, Data)
 	Else
 		Return;
 	EndIf;
-	
+
+EndProcedure
+
+// ---------------------------------------------------------------------------
+// OnOpen — prefill the RAG demo fields with sensible defaults.
+// ---------------------------------------------------------------------------
+&AtClient
+Procedure OnOpen(Cancel)
+
+	EnsureRagDefaults();
+
 EndProcedure
 
 #EndRegion
@@ -2024,6 +2034,276 @@ Procedure SendHTTPResponse(ID, Status, ResponseData, ContentType = "application/
 		SerializeToJson(Response));
 	
 EndProcedure
+
+#EndRegion
+
+
+// ============================================================================
+// RAG / SEARCH DEMO
+// ============================================================================
+//
+// Drives the Rust search core (rcore.dll) from 1C via the component's
+// RagDispatch(method, payloadJson) method. Ingest/admin calls (configure,
+// index_segments, stats, search, delete_collection) are issued from here; the
+// search/grep/get_segment MCP tools are served by the component itself (no 1C
+// round-trip), so once data is indexed an MCP client can search it too.
+//
+// End-to-end test flow:
+//   1. Connect              - load the native component.
+//   2. Configure RAG        - select the e5 model (needs the FULL package + a
+//                             staged model; the lite component answers
+//                             rag_not_installed).
+//   3. Index demo data      - this base's catalog + document metadata as segments.
+//   4. Stats                - watch vector_status go building -> ready.
+//   5. Search               - dense / keyword / hybrid.
+// ============================================================================
+
+#Region RAGDemo
+
+&AtClient
+Procedure EnsureRagDefaults()
+
+	If Not ValueIsFilled(RagModel) Then
+		RagModel = "multilingual-e5-small";
+	EndIf;
+	If Not ValueIsFilled(RagDevice) Then
+		RagDevice = "auto";
+	EndIf;
+	If Not ValueIsFilled(RagCollection) Then
+		RagCollection = "metadata";
+	EndIf;
+	If Not ValueIsFilled(RagMode) Then
+		RagMode = "hybrid";
+	EndIf;
+
+EndProcedure
+
+// ---- Command handlers ----
+
+&AtClient
+Procedure RagConfigure(Command)
+
+	EnsureRagDefaults();
+
+	Payload = New Structure;
+	If RagModelLooksLikePath(RagModel) Then
+		Payload.Insert("model_path", RagModel);
+	Else
+		Payload.Insert("model", RagModel);
+	EndIf;
+	Payload.Insert("device", RagDevice);
+
+	RagCall("configure", SerializeToJson(Payload), "RagConfigureEnd");
+
+EndProcedure
+
+&AtClient
+Procedure RagConfigureEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+
+	ShowRagResult("configure", ResultJson);
+
+EndProcedure
+
+&AtClient
+Procedure RagIndexDemo(Command)
+
+	EnsureRagDefaults();
+
+	PayloadJson = BuildMetadataSegmentsJSON(RagCollection);
+	RagCall("index_segments", PayloadJson, "RagIndexDemoEnd");
+
+EndProcedure
+
+&AtClient
+Procedure RagIndexDemoEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+
+	ShowRagResult("index_segments", ResultJson);
+
+EndProcedure
+
+&AtClient
+Procedure RagStats(Command)
+
+	RagCall("stats", "{}", "RagStatsEnd");
+
+EndProcedure
+
+&AtClient
+Procedure RagStatsEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+
+	ShowRagResult("stats", ResultJson);
+
+EndProcedure
+
+&AtClient
+Procedure RagSearch(Command)
+
+	EnsureRagDefaults();
+
+	If Not ValueIsFilled(RagQuery) Then
+		ShowMessageBox(, "Enter a search query first.");
+		Return;
+	EndIf;
+
+	Payload = New Structure;
+	Payload.Insert("query", RagQuery);
+	Payload.Insert("collection", RagCollection);
+	Payload.Insert("mode", RagMode);
+	Payload.Insert("k", 10);
+	Payload.Insert("include_text", True);
+
+	RagCall("search", SerializeToJson(Payload), "RagSearchEnd");
+
+EndProcedure
+
+&AtClient
+Procedure RagSearchEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+
+	ShowRagResult("search", ResultJson);
+
+EndProcedure
+
+&AtClient
+Procedure RagClear(Command)
+
+	EnsureRagDefaults();
+
+	Payload = New Structure("collection", RagCollection);
+	RagCall("delete_collection", SerializeToJson(Payload), "RagClearEnd");
+
+EndProcedure
+
+&AtClient
+Procedure RagClearEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+
+	ShowRagResult("delete_collection", ResultJson);
+
+EndProcedure
+
+// ---- Helpers ----
+
+&AtClient
+Function RagModelLooksLikePath(Value)
+
+	Return StrFind(Value, "\") > 0 Or StrFind(Value, "/") > 0 Or StrFind(Value, ":") > 0;
+
+EndFunction
+
+&AtClient
+Procedure RagCall(Method, PayloadJson, CallbackName)
+
+	If Component = Undefined Then
+		ShowMessageBox(, "Component is not connected. Press Connect first.");
+		Return;
+	EndIf;
+
+	Try
+		Component.BeginCallingRagDispatch(
+			New NotifyDescription(CallbackName, ThisObject),
+			Method, PayloadJson);
+	Except
+		ShowMessageBox(, "RagDispatch('" + Method + "') failed: " + ErrorDescription());
+	EndTry;
+
+EndProcedure
+
+&AtClient
+Procedure ShowRagResult(Label, ResultJson)
+
+	Envelope = ParseJsonArgument(ResultJson, Undefined);
+
+	Lines = New Array;
+	Lines.Add("=== " + Label + " ===");
+
+	If Envelope = Undefined Then
+		Lines.Add("(unparseable response)");
+		Lines.Add(Left(ResultJson, 4000));
+		RagOutput = JoinRagLines(Lines);
+		Return;
+	EndIf;
+
+	If GetArg(Envelope, "ok") = True Then
+		ResultValue = GetArg(Envelope, "result");
+		Hits = Undefined;
+		If TypeOf(ResultValue) = Type("Map") Then
+			Hits = ResultValue["hits"];
+		EndIf;
+
+		If Hits <> Undefined Then
+			Lines.Add("hits: " + String(Hits.Count()));
+			For Each Hit In Hits Do
+				DocId = GetArg(Hit, "doc_id");
+				Score = GetArg(Hit, "score");
+				Text = GetArg(Hit, "text");
+				Snippet = "";
+				If Text <> Undefined Then
+					Snippet = Left(StrReplace(String(Text), Chars.LF, " "), 100);
+				EndIf;
+				ScoreStr = ?(Score = Undefined, "", Format(Score, "NFD=4; NG=0"));
+				Lines.Add("  [" + ScoreStr + "] " + String(DocId) + " — " + Snippet);
+			EndDo;
+		Else
+			Lines.Add("OK: " + SerializeToJson(ResultValue));
+		EndIf;
+	Else
+		ErrorObj = GetArg(Envelope, "error");
+		Lines.Add("ERROR [" + String(GetArg(ErrorObj, "code")) + "]: "
+			+ String(GetArg(ErrorObj, "message")));
+	EndIf;
+
+	RagOutput = JoinRagLines(Lines);
+
+EndProcedure
+
+&AtClient
+Function JoinRagLines(Lines)
+
+	Result = "";
+	For Each Line In Lines Do
+		Result = Result + Line + Chars.LF;
+	EndDo;
+	Return Result;
+
+EndFunction
+
+&AtServer
+Function BuildMetadataSegmentsJSON(Collection)
+
+	// Index this base's catalog + document metadata as searchable segments
+	// (a single doc_id "metadata" with many segments). Capped so a very large
+	// configuration does not build an enormous payload for a demo.
+	MaxSegments = 500;
+
+	Segments = New Array;
+
+	For Each Cat In Metadata.Catalogs Do
+		If Segments.Count() >= MaxSegments Then
+			Break;
+		EndIf;
+		Segments.Add(New Structure("text",
+			"Справочник " + Cat.Name + " — " + String(Cat.Synonym)));
+	EndDo;
+
+	For Each Doc In Metadata.Documents Do
+		If Segments.Count() >= MaxSegments Then
+			Break;
+		EndIf;
+		Segments.Add(New Structure("text",
+			"Документ " + Doc.Name + " — " + String(Doc.Synonym)));
+	EndDo;
+
+	Payload = New Structure;
+	Payload.Insert("collection", Collection);
+	Payload.Insert("doc_id", "metadata");
+	Payload.Insert("name", "1C metadata (catalogs + documents)");
+	Payload.Insert("segments", Segments);
+
+	JSONWriter = New JSONWriter;
+	JSONWriter.SetString();
+	WriteJSON(JSONWriter, Payload);
+	Return JSONWriter.Close();
+
+EndFunction
 
 #EndRegion
 

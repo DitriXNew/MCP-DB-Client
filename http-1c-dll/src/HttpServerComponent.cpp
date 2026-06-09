@@ -647,6 +647,42 @@ HttpServerComponent::HttpServerComponent()
         nullptr,
         [&](VH var) { this->doSetAuthToken((std::u16string)var); });
 
+    // Drive the Rust search core (rcore.dll) directly from 1C — the ingest/admin
+    // methods that are NOT MCP tools: configure, index_segments, index_raw,
+    // stats, reset, delete_document, delete_collection. (search / get_segment /
+    // grep stay served by the component itself inside tools/call and are NOT
+    // routed here.) Returns the rcore JSON envelope verbatim:
+    //   {"ok":true,"result":...}  /  {"ok":false,"error":{"code","message"}}
+    // On the lite component (rcore.dll absent) returns a rag_not_installed
+    // envelope so the 1C side can detect it and prompt to install the RAG package.
+    AddFunction(u"RagDispatch", u"RagВыполнить",
+        [&](VH method, VH payload) {
+            std::u16string method16 = (std::u16string)method;
+            std::u16string payload16 = (std::u16string)payload;
+            std::string methodUtf8 = WCHAR2MB(std::basic_string_view<WCHAR_T>(
+                reinterpret_cast<const WCHAR_T*>(method16.data()), method16.size()));
+            std::string payloadUtf8 = WCHAR2MB(std::basic_string_view<WCHAR_T>(
+                reinterpret_cast<const WCHAR_T*>(payload16.data()), payload16.size()));
+            if (payloadUtf8.empty()) {
+                payloadUtf8 = "{}";
+            }
+
+            std::string envelope;
+            if (!RCore::available()) {
+                envelope =
+                    R"({"ok":false,"error":{"code":"rag_not_installed","message":"Semantic search backend (rcore.dll) is not installed — this is the lite component. Install the RAG (full) package to enable search."}})";
+            } else {
+                RustString raw = RCore::dispatch(methodUtf8, payloadUtf8);
+                envelope = raw.str();
+                if (envelope.empty()) {
+                    envelope =
+                        R"({"ok":false,"error":{"code":"internal","message":"rust core returned an empty response"}})";
+                }
+            }
+            this->result = MB2WCHAR(envelope);
+        },
+        {{1, std::u16string(u"{}")}});
+
     // Capture screenshots of all visible windows belonging to a process.
     // pid=0 means current process. Returns base64-encoded images.
     // format: "jpeg" (default, smaller for AI) or "png" (lossless).

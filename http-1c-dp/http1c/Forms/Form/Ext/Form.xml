@@ -22,6 +22,7 @@
 	<Events>
 		<Event name="ExternalEvent">ExternalEvent</Event>
 		<Event name="AddInDetachmentOnError">AddInDetachmentOnError</Event>
+		<Event name="OnOpen">OnOpen</Event>
 	</Events>
 	<ChildItems>
 		<InputField name="Port" id="1">
@@ -111,6 +112,78 @@
 					<VerticalStretch>true</VerticalStretch>
 					<Height>15</Height>
 				</PictureField>
+			</ChildItems>
+		</UsualGroup>
+		<UsualGroup name="RAGGroup" id="45">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>RAG / Search</v8:content>
+				</v8:item>
+			</Title>
+			<Group>Vertical</Group>
+			<Representation>NormalSeparation</Representation>
+			<ChildItems>
+				<UsualGroup name="RagConfigGroup" id="46">
+					<Group>AlwaysHorizontal</Group>
+					<Representation>None</Representation>
+					<ChildItems>
+						<InputField name="RagModelField" id="47">
+							<DataPath>RagModel</DataPath>
+						</InputField>
+						<InputField name="RagDeviceField" id="48">
+							<DataPath>RagDevice</DataPath>
+						</InputField>
+						<Button name="RagConfigureButton" id="49">
+							<Type>CommandBarButton</Type>
+							<CommandName>Form.Command.RagConfigure</CommandName>
+						</Button>
+					</ChildItems>
+				</UsualGroup>
+				<UsualGroup name="RagIndexGroup" id="50">
+					<Group>AlwaysHorizontal</Group>
+					<Representation>None</Representation>
+					<ChildItems>
+						<InputField name="RagCollectionField" id="51">
+							<DataPath>RagCollection</DataPath>
+						</InputField>
+						<Button name="RagIndexDemoButton" id="52">
+							<Type>CommandBarButton</Type>
+							<CommandName>Form.Command.RagIndexDemo</CommandName>
+						</Button>
+						<Button name="RagStatsButton" id="53">
+							<Type>CommandBarButton</Type>
+							<CommandName>Form.Command.RagStats</CommandName>
+						</Button>
+						<Button name="RagClearButton" id="54">
+							<Type>CommandBarButton</Type>
+							<CommandName>Form.Command.RagClear</CommandName>
+						</Button>
+					</ChildItems>
+				</UsualGroup>
+				<UsualGroup name="RagSearchGroup" id="55">
+					<Group>AlwaysHorizontal</Group>
+					<Representation>None</Representation>
+					<ChildItems>
+						<InputField name="RagQueryField" id="56">
+							<DataPath>RagQuery</DataPath>
+						</InputField>
+						<InputField name="RagModeField" id="57">
+							<DataPath>RagMode</DataPath>
+						</InputField>
+						<Button name="RagSearchButton" id="58">
+							<Type>CommandBarButton</Type>
+							<CommandName>Form.Command.RagSearch</CommandName>
+						</Button>
+					</ChildItems>
+				</UsualGroup>
+				<InputField name="RagOutputField" id="59">
+					<DataPath>RagOutput</DataPath>
+					<MultiLine>true</MultiLine>
+					<ReadOnly>true</ReadOnly>
+					<HorizontalStretch>true</HorizontalStretch>
+					<Height>12</Height>
+				</InputField>
 			</ChildItems>
 		</UsualGroup>
 	</ChildItems>
@@ -251,6 +324,96 @@
 				<v8:Type>xs:boolean</v8:Type>
 			</Type>
 		</Attribute>
+		<Attribute name="RagModel" id="11">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Model / path</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="RagDevice" id="12">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Device</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="RagCollection" id="13">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Collection</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="RagQuery" id="14">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Query</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="RagMode" id="15">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Mode (dense/keyword/hybrid)</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="RagOutput" id="16">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>RAG output</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
 	</Attributes>
 	<Commands>
 		<Command name="Connect" id="1">
@@ -330,6 +493,51 @@
 				</v8:item>
 			</Title>
 			<Action>NextScreenshot</Action>
+		</Command>
+		<Command name="RagConfigure" id="7">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Configure RAG</v8:content>
+				</v8:item>
+			</Title>
+			<Action>RagConfigure</Action>
+		</Command>
+		<Command name="RagIndexDemo" id="8">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Index demo</v8:content>
+				</v8:item>
+			</Title>
+			<Action>RagIndexDemo</Action>
+		</Command>
+		<Command name="RagStats" id="9">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Stats</v8:content>
+				</v8:item>
+			</Title>
+			<Action>RagStats</Action>
+		</Command>
+		<Command name="RagSearch" id="10">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Search</v8:content>
+				</v8:item>
+			</Title>
+			<Action>RagSearch</Action>
+		</Command>
+		<Command name="RagClear" id="11">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Clear</v8:content>
+				</v8:item>
+			</Title>
+			<Action>RagClear</Action>
 		</Command>
 	</Commands>
 </Form>
