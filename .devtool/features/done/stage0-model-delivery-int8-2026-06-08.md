@@ -1,12 +1,12 @@
 ---
 id: "stage0-model-delivery-int8-2026-06-08"
-status: "review"
+status: "done"
 priority: "critical"
 assignee: null
 dueDate: null
 created: "2026-06-08T18:03:21.000Z"
-modified: "2026-06-08T18:13:44.000Z"
-completedAt: null
+modified: "2026-06-09T09:00:00.000Z"
+completedAt: "2026-06-09T09:00:00.000Z"
 labels: ["stage-0", "infra", "investigation", "blocker"]
 order: "a2"
 ---
@@ -120,3 +120,17 @@ This cannot be measured without running inference. The procedure for when it is 
   - Increase keyword-channel weight for the steps collection (hybrid BM25+vector with higher alpha on BM25 side).
   - Use fp32 pointwise for the steps collection only (`model_path` per-collection config, planned for stage 5).
 - If delta is under 1% and no top-1 flips on close pairs → ship int8 as the production model for all collections.
+
+---
+
+## Resolution (2026-06-09) — empirically de-risked end-to-end in real 1C
+
+The delivery mechanism and int8 viability are now **proven on a running 1C box** (via the http1c self-test, see [[onec-test-harness]] / `onec-rag-selftest` skill):
+
+- **int8 e5-small staged offline and loaded**: downloaded `Xenova/multilingual-e5-small` `model_quantized.onnx` (**118 MB** vs 470 MB fp32), dropped it in as `<model-dir>/onnx/model.onnx` (tokenizer files unchanged), pointed `configure(model_path=…)` at it → `new_local` loaded it with **zero network**, `configure` echoed `dim:384` (NOT the mock-64 fallback) and real hybrid search returned correct hits. **Delivery = swap one ONNX file at the model_path dir** — confirmed, no code change.
+- **Measured (CPU-only box, no GPU):** model **load** 6.7 s (fp32) → 4.3 s (int8) → 0.5 s (MiniLM-L6). **Memory** ~4× lower on int8.
+- **KEY finding — int8 is a MEMORY/LOAD win, NOT a CPU-inference-speed win:** dynamic-int8 e5-small embedded at the *same* rate as fp32 (~7 seg/s on long scenario text; ~77 seg/s on short titles) because the quantize/dequantize overhead offsets the int8 matmul gains on ORT CPU. The real CPU speed lever is **fewer layers**: `all-MiniLM-L6-v2` int8 (6 layers, 23 MB) ran **~2.7× faster** (~19 seg/s) — drop-in via the same `model_path` swap (different tokenizer set).
+- **Multilingual confirmed in practice:** e5-small int8 returned correct ru hits on the Vanessa steps; MiniLM-L6 is English-leaning (great on the English IRP features, weaker on ru) — documented as the speed/quality trade-off.
+- **GPU path wired for later:** `device:"auto"` (DirectML + CPU fallback) is the default; to be validated on a GPU box.
+
+**Deferred (not blocking):** bullet 5's *formal* int8-vs-fp32 nDCG@5 on a labelled ru/uk gold set — empirically search quality looked correct on both models, but the quantitative retrieval-delta measurement still needs a gold set (carry to stage 5 / a quality card). Sidecar-zip + manifest packaging (bullets 1–2) remains the documented plan; CI release wiring is a packaging task, not a research blocker.
