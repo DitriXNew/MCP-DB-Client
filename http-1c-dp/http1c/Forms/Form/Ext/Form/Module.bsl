@@ -57,6 +57,12 @@ Var ScreenshotDataArray;
 &AtClient
 Var ScreenshotCurrentIndex;
 
+&AtClient
+Var SelfTestCtx;
+
+&AtClient
+Var SelfTestWaitTicks;
+
 #EndRegion
 
 
@@ -100,7 +106,116 @@ EndProcedure
 &AtClient
 Procedure OnOpen(Cancel)
 
+	// TEMP TRACE: confirm OnOpen fires at all + capture the launch parameter.
+	Try
+		TraceWriter = New TextWriter("D:\GitHub\MCP-DB-Client\rust-core\target\onopen-trace.txt", TextEncoding.UTF8);
+		TraceWriter.Write("OnOpen fired " + String(CurrentDate())
+			+ " build=" + BuildVersion() + Chars.LF
+			+ "LaunchParameter=[" + String(LaunchParameter) + "]");
+		TraceWriter.Close();
+	Except
+	EndTry;
+
 	EnsureRagDefaults();
+
+	// Attach the component on open (attach-only — NO InstallAddIn, which pops a
+	// modal "external component installed" dialog and blocks headless runs).
+	// Attaching from the bundle loads the component from a session-temp COPY that
+	// holds only libhttp1cWin.dll, so rcore.dll (a plain dependency DLL) is not
+	// beside it -> rag_not_installed. For the headless RAG self-test we instead
+	// attach the on-disk DLL in ExtCompT IN-PLACE (full component already
+	// installed there: libhttp1cWin.dll + rcore.dll + DirectML.dll side by side),
+	// so rcore.dll is found beside it and real search is enabled. The shipping
+	// path keeps the bundle attach (lite).
+	LPOpen = "";
+	Try
+		LPOpen = Lower(String(LaunchParameter));
+	Except
+	EndTry;
+	If StrFind(LPOpen, "ragselftest") > 0 Then
+		AttachSelfTestComponent(0);
+	Else
+		AddInPath = GetDefaultAddInSource();
+		BeginAttachingAddIn(New NotifyDescription("OnOpenAttachEnd", ThisObject),
+			AddInPath, "http1c", AddInType.Native);
+	EndIf;
+
+EndProcedure
+
+&AtClient
+Function SelfTestAttachCandidates()
+	// In-place attach locations for the headless self-test, tried in order until
+	// one connects. The full component is installed flat in ExtCompT, so loading
+	// the DLL there in-place puts rcore.dll right beside it.
+	L = New Array;
+	L.Add("C:\Users\DitriX\AppData\Roaming\1C\1cv8\ExtCompT\libhttp1cWin.dll");
+	L.Add("C:\Users\DitriX\AppData\Roaming\1C\1cv8\ExtCompT");
+	Return L;
+EndFunction
+
+&AtClient
+Procedure AttachSelfTestComponent(Index)
+	Cands = SelfTestAttachCandidates();
+	If Index >= Cands.Count() Then
+		TraceLine("all self-test attach candidates failed");
+		Return;
+	EndIf;
+	AddInPath = Cands[Index];
+	TraceLine("self-test attach attempt " + String(Index) + " -> " + AddInPath);
+	BeginAttachingAddIn(New NotifyDescription("OnOpenAttachEnd", ThisObject, Index),
+		AddInPath, "http1c", AddInType.Native);
+EndProcedure
+
+&AtClient
+Function BuildVersion()
+	// Bump on EVERY source change so the log proves a fresh .epf is running.
+	Return "selftest-build-4-lite-bundle";
+EndFunction
+
+&AtClient
+Procedure TraceLine(Text)
+	Try
+		W = New TextWriter("D:\GitHub\MCP-DB-Client\rust-core\target\onopen-trace.txt",
+			TextEncoding.UTF8, , True);
+		W.WriteLine("" + Text);
+		W.Close();
+	Except
+	EndTry;
+EndProcedure
+
+&AtClient
+Procedure OnOpenAttachEnd(Connected, AdditionalParameters) Export
+
+	TraceLine("OnOpenAttachEnd Connected=" + String(Connected) + " source=" + String(AddInPath));
+	If Not Connected Then
+		// Self-test attaches pass the candidate index; try the next location.
+		If TypeOf(AdditionalParameters) = Type("Number") Then
+			AttachSelfTestComponent(AdditionalParameters + 1);
+		EndIf;
+		Return;
+	EndIf;
+	Try
+		Component = New("AddIn.http1c.HttpServer");
+		Component.LoggingEnabled = EnableLogging;
+		Component.LogPath = LogPath;
+		Component.Timeout = 120;
+		TraceLine("Component created, version=" + String(Component.Version));
+	Except
+		TraceLine("Component create EXCEPTION: " + ErrorDescription());
+		Return;
+	EndTry;
+
+	// If launched for the headless self-test, run the RAG chain now that the
+	// component is attached.
+	LP = "";
+	Try
+		LP = Lower(String(LaunchParameter));
+	Except
+	EndTry;
+	If StrFind(LP, "ragselftest") > 0 Then
+		TraceLine("scheduling RunRagSelfTestDeferred");
+		AttachIdleHandler("RunRagSelfTestDeferred", 1, True);
+	EndIf;
 
 EndProcedure
 
@@ -113,13 +228,15 @@ EndProcedure
 Procedure Connect(Command)
 	
 	EnsureLoggingDefaults();
-	
+
+	// Attach-only (no InstallAddIn — it pops a modal install dialog). The
+	// component ships in the declared template bundle, so attach loads it directly.
 	AddInPath = GetDefaultAddInSource();
 
-	BeginInstallAddIn(
-		New NotifyDescription("InstallAddInEnd", ThisObject),
-		AddInPath);
-	
+	BeginAttachingAddIn(
+		New NotifyDescription("AttachAddInEnd", ThisObject),
+		AddInPath, "http1c", AddInType.Native);
+
 EndProcedure
 
 &AtClient
@@ -1846,7 +1963,17 @@ Function GetDefaultAddInSource()
 	Tmp = Obj.GetTemplate("http1c");
 	Addr = PutToTempStorage(Tmp, UUID);
 	Return Addr;
-	
+
+EndFunction
+
+&AtClient
+Function ExtCompTRegistryDir()
+	// Filesystem directory the launcher populates with registry.xml +
+	// libhttp1cWin.dll + rcore.dll + DirectML.dll. Attaching a native component
+	// from this path makes 1C load it in-place, so rcore.dll (loaded at runtime
+	// by the component) is found beside it and real search is enabled. Mirrors
+	// Vanessa Automation's silent registry.xml technique without any install modal.
+	Return "D:\GitHub\MCP-DB-Client\rust-core\target\extcomp";
 EndFunction
 
 #EndRegion
@@ -2063,6 +2190,9 @@ EndProcedure
 &AtClient
 Procedure EnsureRagDefaults()
 
+	If Port = 0 Then
+		Port = 8888;
+	EndIf;
 	If Not ValueIsFilled(RagModel) Then
 		RagModel = "multilingual-e5-small";
 	EndIf;
@@ -2304,6 +2434,317 @@ Function BuildMetadataSegmentsJSON(Collection)
 	Return JSONWriter.Close();
 
 EndFunction
+
+#EndRegion
+
+
+#Region RAGSelfTest
+
+// Headless self-test driven by the /C"ragselftest" launch parameter (see OnOpen).
+// Synchronously attaches the component and round-trips RagDispatch, writing the
+// envelopes to rust-core/target/ragselftest-result.txt. The launcher reads that
+// file and terminates the 1C process it itself started (by its own PID).
+
+// Async full-chain self-test (this config forbids synchronous component calls).
+// attach-only: the component is already cached in ExtCompT (the launcher stages
+// libhttp1cWin.dll + rcore.dll + DirectML.dll there), so no InstallAddIn is
+// needed and rcore.dll loaded beside the component enables real search.
+// Flow: attach -> configure(local e5 model) -> index steps.json -> wait for
+// embedding -> hybrid search. Each step is logged; the launcher waits for "DONE".
+
+&AtClient
+Procedure RunRagSelfTestDeferred()
+
+	Ctx = New Structure;
+	Ctx.Insert("Log", New Array);
+	SelfTestAppend(Ctx, "STARTED " + String(CurrentDate()) + " build=" + BuildVersion());
+
+	// The component was already attached on open from the on-disk registry.xml
+	// directory (rcore.dll beside it), so go straight to configure — no install,
+	// no re-attach, no modal.
+	If Component = Undefined Then
+		SelfTestAppend(Ctx, "Component not attached on open");
+		SelfTestAppend(Ctx, "DONE");
+		Return;
+	EndIf;
+	Try
+		SelfTestAppend(Ctx, "version = " + Component.Version);
+	Except
+		SelfTestAppend(Ctx, "Version EXCEPTION: " + ErrorDescription());
+	EndTry;
+
+	// Point at the locally-staged offline e5 model (CPU) so rcore loads via
+	// new_local with no network fetch. On the lite component this returns
+	// rag_not_installed and the chain stops at SelfTest_ConfigureEnd.
+	Cfg = New Structure;
+	Cfg.Insert("model_path", "D:\GitHub\MCP-DB-Client\rust-core\target\offline-model");
+	Cfg.Insert("device", "cpu");
+	Component.BeginCallingRagDispatch(
+		New NotifyDescription("SelfTest_ConfigureEnd", ThisObject, Ctx),
+		"configure", SerializeToJson(Cfg));
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_ConfigureEnd(ResultJson, ParametersCall, Ctx) Export
+
+	SelfTestAppend(Ctx, "configure -> " + Left(ResultJson, 300));
+	If StrFind(ResultJson, """ok"":true") = 0 Then
+		SelfTestAppend(Ctx, "DONE");
+		Return;
+	EndIf;
+
+	StepsJson = BuildStepsSegmentsJSON("steps", 300);
+	SelfTestAppend(Ctx, "indexing step segments (" + String(StrLen(StepsJson)) + " bytes)");
+	Component.BeginCallingRagDispatch(
+		New NotifyDescription("SelfTest_IndexEnd", ThisObject, Ctx),
+		"index_segments", StepsJson);
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_IndexEnd(ResultJson, ParametersCall, Ctx) Export
+
+	SelfTestAppend(Ctx, "index_segments -> " + Left(ResultJson, 200));
+	// Poll stats until the background embedder finishes (vector_status "ready"),
+	// then search — so the demo shows true semantic (cosine) ranking, not the
+	// lexical fallback that "partial":true returns while vectors are still building.
+	SelfTestCtx = Ctx;
+	SelfTestWaitTicks = 0;
+	AttachIdleHandler("SelfTest_SearchTick", 5, True);
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_SearchTick() Export
+
+	Component.BeginCallingRagDispatch(
+		New NotifyDescription("SelfTest_StatsEnd", ThisObject, SelfTestCtx), "stats", "{}");
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_StatsEnd(ResultJson, ParametersCall, Ctx) Export
+
+	SelfTestWaitTicks = SelfTestWaitTicks + 1;
+	SelfTestAppend(Ctx, "stats[" + String(SelfTestWaitTicks) + "] -> " + Left(ResultJson, 300));
+
+	// Keep waiting while vectors are still building (cap the wait so a stuck
+	// embedder can't hang the run; the launcher's deadline is the backstop).
+	Ready = (StrFind(ResultJson, """vector_status"":""ready""") > 0);
+	If Not Ready And SelfTestWaitTicks < 18 Then
+		AttachIdleHandler("SelfTest_SearchTick", 5, True);
+		Return;
+	EndIf;
+
+	SelfTestAppend(Ctx, "vectors " + ?(Ready, "ready", "wait-timeout") + " after "
+		+ String(SelfTestWaitTicks) + " ticks; searching");
+	Sp = New Structure;
+	Sp.Insert("query", "удаление пользователя");
+	Sp.Insert("collection", "steps");
+	Sp.Insert("mode", "hybrid");
+	Sp.Insert("k", 5);
+	Sp.Insert("include_text", True);
+	Component.BeginCallingRagDispatch(
+		New NotifyDescription("SelfTest_SearchEnd", ThisObject, Ctx),
+		"search", SerializeToJson(Sp));
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_SearchEnd(ResultJson, ParametersCall, Ctx) Export
+
+	SelfTestAppend(Ctx, "steps search -> " + ResultJson);
+
+	// Phase 2: index the real IRP Gherkin features (scenario titles) as a second
+	// collection and search them too — proves the chain on a second real corpus.
+	FeatJson = BuildFeaturesSegmentsJSON("features", 400);
+	SelfTestAppend(Ctx, "indexing feature segments (" + String(StrLen(FeatJson)) + " bytes)");
+	Component.BeginCallingRagDispatch(
+		New NotifyDescription("SelfTest_FeatIndexEnd", ThisObject, Ctx),
+		"index_segments", FeatJson);
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_FeatIndexEnd(ResultJson, ParametersCall, Ctx) Export
+
+	SelfTestAppend(Ctx, "features index_segments -> " + Left(ResultJson, 200));
+	SelfTestCtx = Ctx;
+	SelfTestWaitTicks = 0;
+	AttachIdleHandler("SelfTest_FeatTick", 5, True);
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_FeatTick() Export
+
+	Component.BeginCallingRagDispatch(
+		New NotifyDescription("SelfTest_FeatStatsEnd", ThisObject, SelfTestCtx), "stats", "{}");
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_FeatStatsEnd(ResultJson, ParametersCall, Ctx) Export
+
+	SelfTestWaitTicks = SelfTestWaitTicks + 1;
+	SelfTestAppend(Ctx, "features stats[" + String(SelfTestWaitTicks) + "] -> " + Left(ResultJson, 320));
+
+	// Wait until no collection is still "building" (steps is already ready).
+	Building = (StrFind(ResultJson, """vector_status"":""building""") > 0);
+	If Building And SelfTestWaitTicks < 18 Then
+		AttachIdleHandler("SelfTest_FeatTick", 5, True);
+		Return;
+	EndIf;
+
+	SelfTestAppend(Ctx, "feature vectors " + ?(Building, "wait-timeout", "ready")
+		+ " after " + String(SelfTestWaitTicks) + " ticks; searching");
+	Sp = New Structure;
+	Sp.Insert("query", "filter documents by company");
+	Sp.Insert("collection", "features");
+	Sp.Insert("mode", "hybrid");
+	Sp.Insert("k", 5);
+	Sp.Insert("include_text", True);
+	Component.BeginCallingRagDispatch(
+		New NotifyDescription("SelfTest_FeatSearchEnd", ThisObject, Ctx),
+		"search", SerializeToJson(Sp));
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_FeatSearchEnd(ResultJson, ParametersCall, Ctx) Export
+
+	SelfTestAppend(Ctx, "features search -> " + ResultJson);
+	SelfTestAppend(Ctx, "DONE");
+
+EndProcedure
+
+&AtClient
+Procedure SelfTestAppend(Ctx, Line)
+
+	Ctx.Log.Add(Line);
+	WriteSelfTestResult(Ctx.Log);
+
+EndProcedure
+
+&AtServer
+Function BuildStepsSegmentsJSON(Collection, MaxSegments)
+
+	Path = "D:\GitHub\MCP-DB-Client\test\steps.json";
+	Segments = New Array;
+	Try
+		Reader = New TextReader(Path, TextEncoding.UTF8);
+		Content = Reader.Read();
+		Reader.Close();
+		JsonReader = New JSONReader;
+		JsonReader.SetString(Content);
+		Steps = ReadJSON(JsonReader, True);
+		For Each StepItem In Steps Do
+			If Segments.Count() >= MaxSegments Then
+				Break;
+			EndIf;
+			Name = "";
+			Descr = "";
+			If TypeOf(StepItem) = Type("Map") Then
+				Name = StepItem["ИмяШага"];
+				Descr = StepItem["ОписаниеШага"];
+			EndIf;
+			SegText = String(Name);
+			If ValueIsFilled(Descr) Then
+				SegText = SegText + " — " + String(Descr);
+			EndIf;
+			If ValueIsFilled(SegText) Then
+				Segments.Add(New Structure("text", SegText));
+			EndIf;
+		EndDo;
+	Except
+		// best-effort: index whatever parsed
+	EndTry;
+
+	Payload = New Structure;
+	Payload.Insert("collection", Collection);
+	Payload.Insert("doc_id", "vanessa-steps");
+	Payload.Insert("name", "Vanessa steps");
+	Payload.Insert("segments", Segments);
+
+	JsonWriter = New JSONWriter;
+	JsonWriter.SetString();
+	WriteJSON(JsonWriter, Payload);
+	Return JsonWriter.Close();
+
+EndFunction
+
+&AtServer
+Function BuildFeaturesSegmentsJSON(Collection, MaxSegments)
+
+	Dir = "C:\Users\DitriX\Downloads\IRP-develop\features";
+	Segments = New Array;
+	Try
+		Files = FindFiles(Dir, "*.feature", True);
+		For Each File In Files Do
+			If Segments.Count() >= MaxSegments Then
+				Break;
+			EndIf;
+			If Not File.IsFile() Then
+				Continue;
+			EndIf;
+			Reader = New TextReader(File.FullName, TextEncoding.UTF8);
+			Line = Reader.ReadLine();
+			While Line <> Undefined Do
+				If Segments.Count() >= MaxSegments Then
+					Break;
+				EndIf;
+				Trimmed = TrimAll(Line);
+				Title = "";
+				If StrStartsWith(Trimmed, "Scenario Outline:") Then
+					Title = TrimAll(Mid(Trimmed, StrLen("Scenario Outline:") + 1));
+				ElsIf StrStartsWith(Trimmed, "Scenario:") Then
+					Title = TrimAll(Mid(Trimmed, StrLen("Scenario:") + 1));
+				ElsIf StrStartsWith(Trimmed, "Структура сценария:") Then
+					Title = TrimAll(Mid(Trimmed, StrLen("Структура сценария:") + 1));
+				ElsIf StrStartsWith(Trimmed, "Сценарий:") Then
+					Title = TrimAll(Mid(Trimmed, StrLen("Сценарий:") + 1));
+				EndIf;
+				If ValueIsFilled(Title) Then
+					Segments.Add(New Structure("text", Title));
+				EndIf;
+				Line = Reader.ReadLine();
+			EndDo;
+			Reader.Close();
+		EndDo;
+	Except
+		// best-effort: index whatever parsed
+	EndTry;
+
+	Payload = New Structure;
+	Payload.Insert("collection", Collection);
+	Payload.Insert("doc_id", "irp-features");
+	Payload.Insert("name", "IRP features");
+	Payload.Insert("segments", Segments);
+
+	JsonWriter = New JSONWriter;
+	JsonWriter.SetString();
+	WriteJSON(JsonWriter, Payload);
+	Return JsonWriter.Close();
+
+EndFunction
+
+&AtClient
+Procedure WriteSelfTestResult(Out)
+
+	Text = "";
+	For Each Line In Out Do
+		Text = Text + Line + Chars.LF;
+	EndDo;
+	Try
+		Writer = New TextWriter("D:\GitHub\MCP-DB-Client\rust-core\target\ragselftest-result.txt", TextEncoding.UTF8);
+		Writer.Write(Text);
+		Writer.Close();
+	Except
+		// best-effort; nothing to do if the file can't be written
+	EndTry;
+
+EndProcedure
 
 #EndRegion
 
