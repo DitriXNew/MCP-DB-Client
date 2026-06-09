@@ -17,6 +17,11 @@
 				<CommandName>Form.Command.GetStatus</CommandName>
 				<ExtendedTooltip name="FormGetStatusExtendedTooltip" id="10"/>
 			</Button>
+			<Button name="InstallComponentButton" id="108">
+				<Type>CommandBarButton</Type>
+				<CommandName>Form.Command.InstallComponent</CommandName>
+				<ExtendedTooltip name="InstallComponentButtonExtendedTooltip" id="109"/>
+			</Button>
 		</ChildItems>
 	</AutoCommandBar>
 	<Events>
@@ -674,6 +679,21 @@
 				</v8:item>
 			</ToolTip>
 			<Action>SyncVector</Action>
+		</Command>
+		<Command name="InstallComponent" id="301">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Install component</v8:content>
+				</v8:item>
+			</Title>
+			<ToolTip>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Register the http1c component into ExtCompT (shows the platform install dialog), then attach</v8:content>
+				</v8:item>
+			</ToolTip>
+			<Action>InstallComponent</Action>
 		</Command>
 	</Commands>
 </Form>

@@ -261,7 +261,7 @@ EndProcedure
 &AtClient
 Function BuildVersion()
 	// Bump on EVERY source change so the log proves a fresh .epf is running.
-	Return "selftest-build-24-coll-registry";
+	Return "selftest-build-25-install-btn";
 EndFunction
 
 &AtClient
@@ -338,6 +338,20 @@ Procedure Connect(Command)
 	BeginAttachingAddIn(
 		New NotifyDescription("AttachAddInEnd", ThisObject),
 		AddInPath, "http1c", AddInType.Native);
+
+EndProcedure
+
+// Explicit, USER-INITIATED install: registers the http1c component into the
+// platform's ExtCompT (the standard `BeginInstallAddIn` flow that shows the
+// install dialog), then attaches. Restored under its own button — kept OFF the
+// open/Connect path so nothing pops a modal automatically (the attach-only
+// default stays). Installs the component shipped as the .epf template; once
+// registered it persists in ExtCompT across sessions.
+&AtClient
+Procedure InstallComponent(Command)
+
+	AddInPath = GetDefaultAddInSource();
+	BeginInstallAddIn(New NotifyDescription("InstallAddInEnd", ThisObject), AddInPath);
 
 EndProcedure
 
@@ -2064,16 +2078,6 @@ Function GetDefaultAddInSource()
 	Addr = PutToTempStorage(Tmp, UUID);
 	Return Addr;
 
-EndFunction
-
-&AtClient
-Function ExtCompTRegistryDir()
-	// Filesystem directory the launcher populates with registry.xml +
-	// libhttp1cWin.dll + rcore.dll + DirectML.dll. Attaching a native component
-	// from this path makes 1C load it in-place, so rcore.dll (loaded at runtime
-	// by the component) is found beside it and real search is enabled. Mirrors
-	// Vanessa Automation's silent registry.xml technique without any install modal.
-	Return "D:\GitHub\MCP-DB-Client\rust-core\target\extcomp";
 EndFunction
 
 #EndRegion
