@@ -218,7 +218,7 @@ EndProcedure
 &AtClient
 Function BuildVersion()
 	// Bump on EVERY source change so the log proves a fresh .epf is running.
-	Return "selftest-build-17-rich-meta";
+	Return "selftest-build-18-perf-appendlog";
 EndFunction
 
 &AtClient
@@ -1820,13 +1820,11 @@ Function GetMetadataSummaryOnServer()
 	For Each Doc In Metadata.Documents Do
 		Lines.Add("  - Document." + Doc.Name + " (" + String(Doc.Synonym) + ")");
 	EndDo;
-	
-	Result = "";
-	For Each Line In Lines Do
-		Result = Result + Line + Chars.LF;
-	EndDo;
-	Return Result;
-	
+
+	// One StrConcat over the ready array instead of +-in-a-loop (which reallocates
+	// the whole growing string on every iteration). Trailing LF preserved.
+	Return StrConcat(Lines, Chars.LF) + Chars.LF;
+
 EndFunction
 
 &AtClient
@@ -2496,11 +2494,11 @@ EndProcedure
 &AtClient
 Function JoinRagLines(Lines)
 
-	Result = "";
-	For Each Line In Lines Do
-		Result = Result + Line + Chars.LF;
-	EndDo;
-	Return Result;
+	// StrConcat over the ready array instead of +-in-a-loop (O(N) vs O(N^2)).
+	If Lines.Count() = 0 Then
+		Return "";
+	EndIf;
+	Return StrConcat(Lines, Chars.LF) + Chars.LF;
 
 EndFunction
 
@@ -3005,20 +3003,16 @@ EndFunction
 Procedure SelfTestAppend(Ctx, Line)
 
 	Ctx.Log.Add(Line);
-	WriteSelfTestResult(Ctx.Log);
-
-EndProcedure
-
-&AtClient
-Procedure WriteSelfTestResult(Out)
-
-	Text = "";
-	For Each Line In Out Do
-		Text = Text + Line + Chars.LF;
-	EndDo;
+	// Append ONLY the new line to the result file — O(1) per call. The previous
+	// implementation re-concatenated the entire log and truncate-rewrote the whole
+	// file on every call (O(N^2) in both string building and I/O). The first line
+	// truncates (Append=False) so each run starts clean; the rest append — the
+	// same pattern TraceLine uses. Ctx.Log is still kept in memory for any
+	// whole-log consumer.
 	Try
-		Writer = New TextWriter(SelfTestOutFile("ragselftest-result.txt"), TextEncoding.UTF8);
-		Writer.Write(Text);
+		IsFirst = (Ctx.Log.Count() = 1);
+		Writer = New TextWriter(SelfTestOutFile("ragselftest-result.txt"), TextEncoding.UTF8, Chars.LF, Not IsFirst);
+		Writer.WriteLine(Line);
 		Writer.Close();
 	Except
 		// best-effort; nothing to do if the file can't be written
