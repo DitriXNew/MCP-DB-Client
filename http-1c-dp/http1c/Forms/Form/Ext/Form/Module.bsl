@@ -218,7 +218,7 @@ EndProcedure
 &AtClient
 Function BuildVersion()
 	// Bump on EVERY source change so the log proves a fresh .epf is running.
-	Return "selftest-build-16-dedup-fix";
+	Return "selftest-build-17-rich-meta";
 EndFunction
 
 &AtClient
@@ -2787,15 +2787,19 @@ Function SelfTestCases()
 	Cases.Add(SelfTestCase("find_step_usages", "qa_scenarios", "", "", "search",
 		SearchJson("я удаляю пользователя", "qa_scenarios", "keyword", 5), "VanessaUser1", 0));
 
-	// 4. Products adapter: list from a string array + tags as metadata.
-	Cases.Add(SelfTestCase("Products", "products", "index_segments",
+	// 4. Products adapter: catalog from a stub array; semantic intent (dense).
+	Cases.Add(SelfTestCase("Products (semantic)", "products", "index_segments",
 		ProductsPayload(), "search",
 		SearchJson("ноутбук", "products", "hybrid", 5), "Lenovo", 0));
 
-	// 5. Clients adapter + dedup: raw list has duplicates; assert the indexed
-	//    segment count equals the unique count (dedup happened).
+	// 5. Products by exact article/SKU via the keyword channel (already indexed).
+	Cases.Add(SelfTestCase("Products by article (keyword/SKU)", "products", "", "", "search",
+		SearchJson("ART-1003", "products", "keyword", 5), "DeLonghi", 0));
+
+	// 6. Clients adapter + dedup by exact INN: raw list has duplicate INNs; assert
+	//    the indexed segment count equals the unique count (dedup happened).
 	Unique = ClientsDedup(StubClients());
-	Cases.Add(SelfTestCase("Clients (dedup)", "clients", "index_segments",
+	Cases.Add(SelfTestCase("Clients (dedup by INN)", "clients", "index_segments",
 		ClientsPayload(Unique), "search",
 		SearchJson("Ромашка", "clients", "keyword", 5), "Ромашка", Unique.Count()));
 
@@ -2887,43 +2891,49 @@ Function StubScenarios()
 EndFunction
 
 &AtClient
-Function StubProduct(Name, Tags)
-	Return New Structure("name, tags", Name, Tags);
+Function StubProduct(Name, Brand, Category, Sku, Article, Tags)
+	Return New Structure("name, brand, category, sku, article, tags",
+		Name, Brand, Category, Sku, Article, Tags);
 EndFunction
 
 &AtClient
 Function StubProducts()
 	P = New Array;
-	P.Add(StubProduct("Ноутбук Lenovo ThinkPad X1 Carbon", "электроника,ноутбуки"));
-	P.Add(StubProduct("Смартфон Samsung Galaxy S24 Ultra", "электроника,смартфоны"));
-	P.Add(StubProduct("Кофемашина DeLonghi Magnifica", "техника,кухня"));
-	P.Add(StubProduct("Монитор Dell UltraSharp 27", "электроника,мониторы"));
-	P.Add(StubProduct("Наушники Sony WH-1000XM5", "электроника,аудио"));
+	P.Add(StubProduct("Ноутбук Lenovo ThinkPad X1 Carbon", "Lenovo", "Ноутбуки", "SKU-NB-001", "ART-1001", "электроника,ноутбуки"));
+	P.Add(StubProduct("Смартфон Samsung Galaxy S24 Ultra", "Samsung", "Смартфоны", "SKU-SM-002", "ART-1002", "электроника,смартфоны"));
+	P.Add(StubProduct("Кофемашина DeLonghi Magnifica", "DeLonghi", "Кухонная техника", "SKU-KM-003", "ART-1003", "техника,кухня"));
+	P.Add(StubProduct("Монитор Dell UltraSharp 27", "Dell", "Мониторы", "SKU-MN-004", "ART-1004", "электроника,мониторы"));
+	P.Add(StubProduct("Наушники Sony WH-1000XM5", "Sony", "Аудио", "SKU-AU-005", "ART-1005", "электроника,аудио"));
 	Return P;
+EndFunction
+
+&AtClient
+Function StubClient(Name, Inn, City, Segment)
+	Return New Structure("name, inn, city, segment", Name, Inn, City, Segment);
 EndFunction
 
 &AtClient
 Function StubClients()
 	C = New Array;
-	C.Add("ООО ""Ромашка""");
-	C.Add("ООО ""Ромашка""");          // exact duplicate
-	C.Add("ИП Иванов И.И.");
-	C.Add("ооо ""ромашка""");          // case duplicate
-	C.Add("ООО ""Рога и Копыта""");
-	C.Add("  ИП Иванов И.И.  ");        // whitespace duplicate
-	C.Add("ООО ""Василёк""");
+	C.Add(StubClient("ООО ""Ромашка""", "7701000001", "Москва", "опт"));
+	C.Add(StubClient("ООО ""Ромашка"" (филиал)", "7701000001", "Москва", "опт"));   // same INN -> dup
+	C.Add(StubClient("ИП Иванов И.И.", "500100000010", "Химки", "розница"));
+	C.Add(StubClient("ООО ""Рога и Копыта""", "7702000002", "Казань", "опт"));
+	C.Add(StubClient("Иванов Иван (ИП)", "500100000010", "Химки", "розница"));      // same INN -> dup
+	C.Add(StubClient("ООО ""Василёк""", "7703000003", "Тверь", "розница"));
 	Return C;
 EndFunction
 
 &AtClient
 Function ClientsDedup(Raw)
+	// Adapter-side dedup: exact INN match decides "one entity" (NOT in the core).
 	Seen = New Map;
 	Unique = New Array;
-	For Each ClientName In Raw Do
-		NormKey = Lower(TrimAll(ClientName));
+	For Each Cl In Raw Do
+		NormKey = TrimAll(Cl.inn);
 		If Seen[NormKey] = Undefined Then
 			Seen.Insert(NormKey, True);
-			Unique.Add(TrimAll(ClientName));
+			Unique.Add(Cl);
 		EndIf;
 	EndDo;
 	Return Unique;
@@ -2967,8 +2977,12 @@ Function ProductsPayload()
 	Segments = New Array;
 	For Each Pr In StubProducts() Do
 		Seg = New Structure;
-		Seg.Insert("text", Pr.name);
-		Seg.Insert("meta", New Structure("type, tags, collection", "product", Pr.tags, "products"));
+		// text carries the article/SKU so the keyword channel finds exact ids;
+		// embed_text carries name+brand+category for semantic (dense) intent.
+		Seg.Insert("text", Pr.name + " (арт. " + Pr.article + ", " + Pr.sku + ")");
+		Seg.Insert("embed_text", Pr.name + " | " + Pr.brand + " | " + Pr.category);
+		Seg.Insert("meta", New Structure("type, sku, article, category, brand, tags",
+			"product", Pr.sku, Pr.article, Pr.category, Pr.brand, Pr.tags));
 		Segments.Add(Seg);
 	EndDo;
 	Return SegmentsPayload("products", "products-catalog", "Products", Segments);
@@ -2977,10 +2991,11 @@ EndFunction
 &AtClient
 Function ClientsPayload(Unique)
 	Segments = New Array;
-	For Each Name In Unique Do
+	For Each Cl In Unique Do
 		Seg = New Structure;
-		Seg.Insert("text", Name);
-		Seg.Insert("meta", New Structure("type", "client"));
+		Seg.Insert("text", Cl.name + " (ИНН " + Cl.inn + ")");
+		Seg.Insert("embed_text", Cl.name + " " + Cl.city + " " + Cl.segment);
+		Seg.Insert("meta", New Structure("type, inn, city, segment", "client", Cl.inn, Cl.city, Cl.segment));
 		Segments.Add(Seg);
 	EndDo;
 	Return SegmentsPayload("clients", "clients-catalog", "Clients", Segments);
