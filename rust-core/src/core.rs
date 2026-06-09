@@ -354,9 +354,11 @@ fn build_embedder(config: &Config) -> (Arc<dyn Embedder>, bool) {
             _ => Device::Auto, // "auto" and any unrecognized value.
         };
         // Prefer local files when a path is given (offline); else the built-in.
+        // `intra_threads` tunes the ONNX session pools (see `tunings`): query runs
+        // on a small CPU pool, bulk gets the configured device + remaining cores.
         let built = match config.model_path.as_deref().filter(|p| !p.trim().is_empty()) {
-            Some(path) => FastEmbedder::new_local(path, device),
-            None => FastEmbedder::new_builtin(device),
+            Some(path) => FastEmbedder::new_local(path, device, config.intra_threads),
+            None => FastEmbedder::new_builtin(device, config.intra_threads),
         };
         match built {
             Ok(fe) => return (Arc::new(fe), true),

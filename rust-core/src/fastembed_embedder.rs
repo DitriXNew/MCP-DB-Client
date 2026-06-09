@@ -85,6 +85,46 @@ impl Device {
     }
 }
 
+/// Per-session ONNX tuning. The two model instances are tuned for *different*
+/// workloads, not just split across locks:
+///   * **bulk** (background reindex): the configured device (GPU/DirectML when
+///     asked) and the bulk of the cores.
+///   * **query** (search path): **CPU** + a small intra-op pool. A single short
+///     query is latency-bound, and DirectML routinely loses to CPU on it because
+///     of host↔device copy overhead; a small thread pool also avoids spin-up cost.
+///
+/// Thread budgets are sized so `bulk + query ≤ ncpu` (no oversubscription, which
+/// is what let reindex and queries fight over cores under the old all-cores-each
+/// default).
+struct SessionTuning {
+    device: Device,
+    threads: usize,
+}
+
+/// Derive (bulk, query) tunings from the configured device + optional intra-op
+/// override. Query gets `min(2, ncpu)` CPU threads; bulk gets the explicit
+/// override if given, else the remaining cores (`ncpu - query`, ≥1).
+fn tunings(device: Device, intra_threads: Option<u64>) -> (SessionTuning, SessionTuning) {
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let query_threads = ncpu.min(2).max(1);
+    let bulk_threads = match intra_threads {
+        Some(t) if t >= 1 => (t as usize).min(ncpu),
+        _ => ncpu.saturating_sub(query_threads).max(1),
+    };
+    (
+        SessionTuning {
+            device,
+            threads: bulk_threads,
+        },
+        SessionTuning {
+            device: Device::Cpu,
+            threads: query_threads,
+        },
+    )
+}
+
 /// Production embedder: two separately-loaded fastembed models behind their own
 /// mutexes (see the module docs for the two-instance rationale).
 pub struct FastEmbedder {
@@ -112,12 +152,14 @@ impl FastEmbedder {
     /// Returns a descriptive error string (never panics) so the FFI boundary can
     /// surface a clean structural error if model load fails (e.g. offline with a
     /// cold cache, or onnxruntime not loadable).
-    pub fn new_builtin(device: Device) -> Result<Self, String> {
+    pub fn new_builtin(device: Device, intra_threads: Option<u64>) -> Result<Self, String> {
         // Two independent loads of the SAME model (see module docs: this is what
-        // decouples bulk-reindex latency from query latency). Both get the same
-        // device/EP selection.
-        let bulk = Self::load_builtin(device).map_err(|e| format!("load bulk model: {e}"))?;
-        let query = Self::load_builtin(device).map_err(|e| format!("load query model: {e}"))?;
+        // decouples bulk-reindex latency from query latency). The two sessions get
+        // DIFFERENT tunings (bulk: configured device + most cores; query: CPU +
+        // few threads) — see `tunings`.
+        let (bulk_t, query_t) = tunings(device, intra_threads);
+        let bulk = Self::load_builtin(bulk_t).map_err(|e| format!("load bulk model: {e}"))?;
+        let query = Self::load_builtin(query_t).map_err(|e| format!("load query model: {e}"))?;
 
         let mut me = FastEmbedder {
             bulk: Mutex::new(bulk),
@@ -148,11 +190,12 @@ impl FastEmbedder {
     /// (see [`Device`]). NOTE: this path is implemented but, unlike
     /// `new_builtin`, is **not exercised by the integration test** (it needs a
     /// pre-staged model directory). It is here so production can run offline.
-    pub fn new_local(model_path: &str, device: Device) -> Result<Self, String> {
+    pub fn new_local(model_path: &str, device: Device, intra_threads: Option<u64>) -> Result<Self, String> {
+        let (bulk_t, query_t) = tunings(device, intra_threads);
         let bulk =
-            Self::load_local(model_path, device).map_err(|e| format!("load bulk model: {e}"))?;
+            Self::load_local(model_path, bulk_t).map_err(|e| format!("load bulk model: {e}"))?;
         let query =
-            Self::load_local(model_path, device).map_err(|e| format!("load query model: {e}"))?;
+            Self::load_local(model_path, query_t).map_err(|e| format!("load query model: {e}"))?;
 
         let mut me = FastEmbedder {
             bulk: Mutex::new(bulk),
@@ -166,11 +209,12 @@ impl FastEmbedder {
     /// Load one built-in MultilingualE5Small instance (download/cache via HF),
     /// requesting `device`'s execution providers (empty ⇒ CPU; DirectML otherwise,
     /// with ort's automatic CPU fallback).
-    fn load_builtin(device: Device) -> Result<TextEmbedding, String> {
+    fn load_builtin(tuning: SessionTuning) -> Result<TextEmbedding, String> {
         TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::MultilingualE5Small)
                 .with_show_download_progress(true)
-                .with_execution_providers(device.execution_providers()),
+                .with_intra_threads(tuning.threads)
+                .with_execution_providers(tuning.device.execution_providers()),
         )
         .map_err(|e| e.to_string())
     }
@@ -178,7 +222,7 @@ impl FastEmbedder {
     /// Load one user-defined instance from on-disk ONNX + tokenizer files,
     /// requesting `device`'s execution providers (same CPU/DirectML semantics as
     /// [`Self::load_builtin`]).
-    fn load_local(model_path: &str, device: Device) -> Result<TextEmbedding, String> {
+    fn load_local(model_path: &str, tuning: SessionTuning) -> Result<TextEmbedding, String> {
         use std::path::Path;
         let dir = Path::new(model_path);
         let read = |rel: &str| -> Result<Vec<u8>, String> {
@@ -206,7 +250,8 @@ impl FastEmbedder {
         TextEmbedding::try_new_from_user_defined(
             model,
             InitOptionsUserDefined::new()
-                .with_execution_providers(device.execution_providers()),
+                .with_intra_threads(tuning.threads)
+                .with_execution_providers(tuning.device.execution_providers()),
         )
         .map_err(|e| e.to_string())
     }
