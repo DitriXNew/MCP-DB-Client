@@ -69,6 +69,9 @@ Var SelfTestCfg;
 &AtClient
 Var EmbedCtx;
 
+&AtClient
+Var SyncCtx;
+
 #EndRegion
 
 
@@ -146,7 +149,8 @@ EndProcedure
 // processor — the launcher (dev tooling) supplies them.
 &AtClient
 Function ParseLaunchConfig()
-	Cfg = New Structure("selftest, model, out, extcompt, perf, embedperf, batch, workers", False, "", "", "", 0, "", 500, 1);
+	Cfg = New Structure("selftest, model, out, extcompt, perf, embedperf, batch, workers, synctest, steps, corpus, coll",
+		False, "", "", "", 0, "", 500, 1, False, "", "", "");
 	LP = "";
 	Try
 		LP = String(LaunchParameter);
@@ -188,6 +192,16 @@ Function ParseLaunchConfig()
 			Except
 				Cfg.workers = 1;
 			EndTry;
+		ElsIf Lower(Part) = "synctest" Then
+			// Dev-only headless trigger for the Sync-with-vector button: prefills the
+			// form fields from steps=/corpus=/coll= and fires SyncVector on open.
+			Cfg.synctest = True;
+		ElsIf StrStartsWith(Part, "steps=") Then
+			Cfg.steps = Mid(Part, StrLen("steps=") + 1);
+		ElsIf StrStartsWith(Part, "corpus=") Then
+			Cfg.corpus = Mid(Part, StrLen("corpus=") + 1);
+		ElsIf StrStartsWith(Part, "coll=") Then
+			Cfg.coll = Mid(Part, StrLen("coll=") + 1);
 		EndIf;
 	EndDo;
 	Return Cfg;
@@ -247,7 +261,7 @@ EndProcedure
 &AtClient
 Function BuildVersion()
 	// Bump on EVERY source change so the log proves a fresh .epf is running.
-	Return "selftest-build-22-multiworker";
+	Return "selftest-build-23-sync-ui";
 EndFunction
 
 &AtClient
@@ -294,7 +308,10 @@ Procedure OnOpenAttachEnd(Connected, AdditionalParameters) Export
 		LP = Lower(String(LaunchParameter));
 	Except
 	EndTry;
-	If ValueIsFilled(SelfTestCfg.embedperf) Then
+	If SelfTestCfg.synctest Then
+		TraceLine("scheduling Sync_TestTrigger");
+		AttachIdleHandler("Sync_TestTrigger", 1, True);
+	ElsIf ValueIsFilled(SelfTestCfg.embedperf) Then
 		TraceLine("scheduling RunEmbedPerfDeferred");
 		AttachIdleHandler("RunEmbedPerfDeferred", 1, True);
 	ElsIf StrFind(LP, "ragselftest") > 0 Then
@@ -2381,6 +2398,306 @@ EndProcedure
 Procedure RagStats(Command)
 
 	RagCall("stats", "{}", "RagStatsEnd");
+
+EndProcedure
+
+// "Synchronize with the vector store": index the steps file + every corpus
+// source row (real embedding) into named collections, each carrying a
+// description (so an AI client can later list collections + descriptions and
+// search a subset). Async (this config forbids sync component calls). Paths are
+// taken from the form — nothing is prefilled or auto-loaded.
+&AtClient
+Procedure SyncVector(Command)
+
+	If Component = Undefined Then
+		RagOutput = "Компонента не подключена. Нажмите Connect (нужна полная компонента с rcore.dll).";
+		Return;
+	EndIf;
+
+	Groups = BuildSyncGroups();
+	Total = 0;
+	Names = New Array;
+	For Each G In Groups Do
+		Total = Total + G.segments.Count();
+		Names.Add(G.collection);
+	EndDo;
+	If Total = 0 Then
+		RagOutput = "Нечего синхронизировать: укажите путь к шагам и/или строки таблицы корпуса (с существующими папками).";
+		Return;
+	EndIf;
+
+	SyncCtx = New Structure;
+	SyncCtx.Insert("Groups", Groups);
+	SyncCtx.Insert("GIndex", 0);
+	SyncCtx.Insert("Pos", 0);
+	SyncCtx.Insert("Batch", 500);
+	SyncCtx.Insert("Total", Total);
+	SyncCtx.Insert("CollNames", Names);
+	SyncCtx.Insert("T0", Ms());
+
+	RagOutput = "Синхронизация: " + String(Total) + " сегментов → " + String(Groups.Count())
+		+ " коллекций (" + StrConcat(Names, ", ") + "). Конфигурирую модель...";
+
+	Cfg = New Structure;
+	Cfg.Insert("model_path", RagModel);
+	Cfg.Insert("device", ?(ValueIsFilled(RagDevice), RagDevice, "auto"));
+	Cfg.Insert("embed_workers", 1);
+	Try
+		Component.BeginCallingRagDispatch(
+			New NotifyDescription("Sync_ConfigureEnd", ThisObject), "configure", SerializeToJson(Cfg));
+	Except
+		RagOutput = "FAIL configure dispatch: " + ErrorDescription();
+	EndTry;
+
+EndProcedure
+
+&AtClient
+Procedure Sync_ConfigureEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+
+	If StrFind(ResultJson, """ok"":true") = 0 Then
+		RagOutput = "FAIL configure (нужна полная компонента с rcore.dll): " + Left(ResultJson, 300);
+		Return;
+	EndIf;
+	SyncCtx.T0 = Ms();
+	Sync_SubmitNext();
+
+EndProcedure
+
+&AtClient
+Procedure Sync_SubmitNext()
+
+	// Skip past any finished groups.
+	While SyncCtx.GIndex < SyncCtx.Groups.Count() Do
+		G = SyncCtx.Groups[SyncCtx.GIndex];
+		If SyncCtx.Pos < G.segments.Count() Then
+			Break;
+		EndIf;
+		SyncCtx.GIndex = SyncCtx.GIndex + 1;
+		SyncCtx.Pos = 0;
+	EndDo;
+
+	If SyncCtx.GIndex >= SyncCtx.Groups.Count() Then
+		SelfTestWaitTicks = 0;
+		AttachIdleHandler("Sync_Tick", 1, True);
+		Return;
+	EndIf;
+
+	G = SyncCtx.Groups[SyncCtx.GIndex];
+	Upper = SyncCtx.Pos + SyncCtx.Batch - 1;
+	If Upper > G.segments.Count() - 1 Then
+		Upper = G.segments.Count() - 1;
+	EndIf;
+	Slice = New Array;
+	For i = SyncCtx.Pos To Upper Do
+		Slice.Add(G.segments[i]);
+	EndDo;
+	SyncCtx.Pos = Upper + 1;
+
+	// The collection's description rides on the doc "name" (and is what a later
+	// list-collections surfaces to an AI client).
+	DocId = G.collection + "-batch-" + String(SyncCtx.Pos);
+	Payload = SegmentsPayload(G.collection, DocId, G.description, Slice);
+	Try
+		Component.BeginCallingRagDispatch(
+			New NotifyDescription("Sync_BatchEnd", ThisObject), "index_segments", Payload);
+	Except
+		RagOutput = "FAIL index dispatch: " + ErrorDescription();
+	EndTry;
+
+EndProcedure
+
+&AtClient
+Procedure Sync_BatchEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+
+	Sync_SubmitNext();
+
+EndProcedure
+
+&AtClient
+Procedure Sync_Tick() Export
+
+	Component.BeginCallingRagDispatch(
+		New NotifyDescription("Sync_StatsEnd", ThisObject), "stats", "{}");
+
+EndProcedure
+
+&AtClient
+Procedure Sync_StatsEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+
+	SelfTestWaitTicks = SelfTestWaitTicks + 1;
+	EmbDone = 0;
+	AllReady = True;
+	Lines = New Array;
+	Try
+		R = New JSONReader;
+		R.SetString(ResultJson);
+		Obj = ReadJSON(R, True);
+		Colls = Obj["result"]["collections"];
+		For Each Name In SyncCtx.CollNames Do
+			C = ?(Colls = Undefined, Undefined, Colls[Name]);
+			If C = Undefined Then
+				AllReady = False;
+				Continue;
+			EndIf;
+			Emb = C["embedded"];
+			NSeg = C["n_segments"];
+			St = C["vector_status"];
+			EmbDone = EmbDone + Emb;
+			If St <> "ready" Then
+				AllReady = False;
+			EndIf;
+			Lines.Add("  " + Name + ": " + String(Emb) + "/" + String(NSeg) + " (" + St + ")");
+		EndDo;
+	Except
+	EndTry;
+
+	ShowEmbedProgress("Эмбеддинг корпуса", EmbDone, SyncCtx.Total);
+	Head = "Синхронизация (" + String(Ms() - SyncCtx.T0) + " ms):";
+	RagOutput = Head + Chars.LF + StrConcat(Lines, Chars.LF);
+
+	If Not AllReady And SelfTestWaitTicks < 6000 Then
+		AttachIdleHandler("Sync_Tick", 1, True);
+		Return;
+	EndIf;
+
+	RagOutput = RagOutput + Chars.LF + "ГОТОВО за " + String(Ms() - SyncCtx.T0)
+		+ " ms — коллекции готовы к поиску.";
+
+EndProcedure
+
+// Build the list of {collection, description, segments[]} groups from the form:
+// the steps file (one "steps" collection) + each corpus-source row (one
+// collection, or one per subfolder when "By subfolders" is set).
+&AtClient
+Function BuildSyncGroups()
+
+	Groups = New Array;
+
+	If ValueIsFilled(StepsPath) Then
+		StepSegs = ReadVanessaSteps(StepsPath);
+		If StepSegs.Count() > 0 Then
+			Groups.Add(New Structure("collection, description, segments",
+				"steps", "Шаги Vanessa — определения шагов Gherkin (ИмяШага/ОписаниеШага)", StepSegs));
+		EndIf;
+	EndIf;
+
+	For Each Row In CorpusSources Do
+		If Not ValueIsFilled(Row.Path) Then
+			Continue;
+		EndIf;
+		Coll = ?(ValueIsFilled(Row.Collection), Row.Collection, "corpus");
+		If Row.BySubfolders Then
+			For Each Sub In FindSubfolders(Row.Path) Do
+				Segs = ReadFeatureScenarios(Sub.FullName);
+				If Segs.Count() > 0 Then
+					Descr = ?(ValueIsFilled(Row.Description), Row.Description + " / " + Sub.Name, Sub.Name);
+					Groups.Add(New Structure("collection, description, segments",
+						Coll + "_" + Sub.Name, Descr, Segs));
+				EndIf;
+			EndDo;
+		Else
+			Segs = ReadFeatureScenarios(Row.Path);
+			If Segs.Count() > 0 Then
+				Groups.Add(New Structure("collection, description, segments", Coll, Row.Description, Segs));
+			EndIf;
+		EndIf;
+	EndDo;
+
+	Return Groups;
+
+EndFunction
+
+// Read Vanessa step definitions from a steps.json array
+// [{ИмяШага, ОписаниеШага, ПолныйТипШага}, ...] into segment structures.
+&AtClient
+Function ReadVanessaSteps(StepsFile)
+
+	Segments = New Array;
+	Data = Undefined;
+	Try
+		F = New File(StepsFile);
+		If Not F.Exists() Then
+			Return Segments;
+		EndIf;
+		R = New JSONReader;
+		R.OpenFile(StepsFile);
+		Data = ReadJSON(R, True);
+		R.Close();
+	Except
+		Return Segments;
+	EndTry;
+	If TypeOf(Data) <> Type("Array") Then
+		Return Segments;
+	EndIf;
+	For Each St In Data Do
+		Name = GetArg(St, "ИмяШага");
+		Descr = GetArg(St, "ОписаниеШага");
+		StepType = GetArg(St, "ПолныйТипШага");
+		If Not ValueIsFilled(Name) Then
+			Continue;
+		EndIf;
+		Seg = New Structure;
+		Seg.Insert("text", Name);
+		Seg.Insert("embed_text", ?(ValueIsFilled(Descr), Name + " " + Descr, Name));
+		Seg.Insert("meta", New Structure("type, stepType", "step", String(StepType)));
+		Segments.Add(Seg);
+	EndDo;
+	Return Segments;
+
+EndFunction
+
+&AtClient
+Function FindSubfolders(Dir)
+
+	Result = New Array;
+	Try
+		For Each F In FindFiles(Dir, "*", False) Do
+			If F.IsDirectory() Then
+				Result.Add(F);
+			EndIf;
+		EndDo;
+	Except
+	EndTry;
+	Return Result;
+
+EndFunction
+
+// Dev-only headless test of the Sync button: prefill the form fields from the
+// launch config and fire SyncVector, then mirror RagOutput to the result file so
+// the headless runner can observe progress + DONE.
+&AtClient
+Procedure Sync_TestTrigger() Export
+
+	StepsPath = SelfTestCfg.steps;
+	If ValueIsFilled(SelfTestCfg.corpus) Then
+		Row = CorpusSources.Add();
+		Row.Path = SelfTestCfg.corpus;
+		Row.Collection = ?(ValueIsFilled(SelfTestCfg.coll), SelfTestCfg.coll, "corpus");
+		Row.Description = "synctest corpus";
+		Row.BySubfolders = False;
+	EndIf;
+	RagModel = SelfTestCfg.model;
+	SyncVector(Undefined);
+	AttachIdleHandler("Sync_TestDump", 2, True);
+
+EndProcedure
+
+&AtClient
+Procedure Sync_TestDump() Export
+
+	Try
+		W = New TextWriter(SelfTestOutFile("ragselftest-result.txt"), TextEncoding.UTF8, Chars.LF, False);
+		W.WriteLine("build=" + BuildVersion() + " SYNCTEST");
+		W.WriteLine(RagOutput);
+		If StrFind(RagOutput, "ГОТОВО") > 0 Or StrFind(RagOutput, "FAIL") > 0 Then
+			W.WriteLine("DONE");
+			W.Close();
+			Return;
+		EndIf;
+		W.Close();
+	Except
+	EndTry;
+	AttachIdleHandler("Sync_TestDump", 2, True);
 
 EndProcedure
 

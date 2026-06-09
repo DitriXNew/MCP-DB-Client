@@ -186,6 +186,43 @@
 				</InputField>
 			</ChildItems>
 		</UsualGroup>
+		<UsualGroup name="CorpusSyncGroup" id="100">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Corpus sync (vector store)</v8:content>
+				</v8:item>
+			</Title>
+			<Group>Vertical</Group>
+			<Representation>NormalSeparation</Representation>
+			<ChildItems>
+				<InputField name="StepsPathField" id="101">
+					<DataPath>StepsPath</DataPath>
+					<HorizontalStretch>true</HorizontalStretch>
+				</InputField>
+				<Table name="CorpusSourcesTable" id="102">
+					<DataPath>CorpusSources</DataPath>
+					<ChildItems>
+						<Column name="CorpusPathColumn" id="103">
+							<DataPath>CorpusSources.Path</DataPath>
+						</Column>
+						<Column name="CorpusCollectionColumn" id="104">
+							<DataPath>CorpusSources.Collection</DataPath>
+						</Column>
+						<Column name="CorpusDescriptionColumn" id="105">
+							<DataPath>CorpusSources.Description</DataPath>
+						</Column>
+						<Column name="CorpusBySubfoldersColumn" id="106">
+							<DataPath>CorpusSources.BySubfolders</DataPath>
+						</Column>
+					</ChildItems>
+				</Table>
+				<Button name="SyncVectorButton" id="107">
+					<Type>CommandBarButton</Type>
+					<CommandName>Form.Command.SyncVector</CommandName>
+				</Button>
+			</ChildItems>
+		</UsualGroup>
 	</ChildItems>
 	<Attributes>
 		<Attribute name="Object" id="1">
@@ -414,6 +451,90 @@
 				</v8:StringQualifiers>
 			</Type>
 		</Attribute>
+		<Attribute name="StepsPath" id="200">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Steps file (steps.json)</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="CorpusSources" id="201">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Corpus sources</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>v8:ValueTable</v8:Type>
+			</Type>
+			<Columns>
+				<Column name="Path" id="202">
+					<Title>
+						<v8:item>
+							<v8:lang>en</v8:lang>
+							<v8:content>Folder</v8:content>
+						</v8:item>
+					</Title>
+					<Type>
+						<v8:Type>xs:string</v8:Type>
+						<v8:StringQualifiers>
+							<v8:Length>0</v8:Length>
+							<v8:AllowedLength>Variable</v8:AllowedLength>
+						</v8:StringQualifiers>
+					</Type>
+				</Column>
+				<Column name="Collection" id="203">
+					<Title>
+						<v8:item>
+							<v8:lang>en</v8:lang>
+							<v8:content>Collection</v8:content>
+						</v8:item>
+					</Title>
+					<Type>
+						<v8:Type>xs:string</v8:Type>
+						<v8:StringQualifiers>
+							<v8:Length>0</v8:Length>
+							<v8:AllowedLength>Variable</v8:AllowedLength>
+						</v8:StringQualifiers>
+					</Type>
+				</Column>
+				<Column name="Description" id="204">
+					<Title>
+						<v8:item>
+							<v8:lang>en</v8:lang>
+							<v8:content>Description (for AI)</v8:content>
+						</v8:item>
+					</Title>
+					<Type>
+						<v8:Type>xs:string</v8:Type>
+						<v8:StringQualifiers>
+							<v8:Length>0</v8:Length>
+							<v8:AllowedLength>Variable</v8:AllowedLength>
+						</v8:StringQualifiers>
+					</Type>
+				</Column>
+				<Column name="BySubfolders" id="205">
+					<Title>
+						<v8:item>
+							<v8:lang>en</v8:lang>
+							<v8:content>By subfolders</v8:content>
+						</v8:item>
+					</Title>
+					<Type>
+						<v8:Type>xs:boolean</v8:Type>
+					</Type>
+				</Column>
+			</Columns>
+		</Attribute>
 	</Attributes>
 	<Commands>
 		<Command name="Connect" id="1">
@@ -538,6 +659,21 @@
 				</v8:item>
 			</Title>
 			<Action>RagClear</Action>
+		</Command>
+		<Command name="SyncVector" id="300">
+			<Title>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Sync with vector store</v8:content>
+				</v8:item>
+			</Title>
+			<ToolTip>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Index the steps file + corpus sources into the vector store (real embedding)</v8:content>
+				</v8:item>
+			</ToolTip>
+			<Action>SyncVector</Action>
 		</Command>
 	</Commands>
 </Form>
