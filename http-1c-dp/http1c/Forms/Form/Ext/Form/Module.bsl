@@ -64,19 +64,7 @@ Var SelfTestCtx;
 Var SelfTestWaitTicks;
 
 &AtClient
-Var RawFileList;
-
-&AtClient
-Var RawFileIndex;
-
-&AtClient
-Var ScenAll;
-
-&AtClient
-Var ScenSkip;
-
-&AtClient
-Var ScenBatchNo;
+Var SelfTestCfg;
 
 #EndRegion
 
@@ -121,33 +109,26 @@ EndProcedure
 &AtClient
 Procedure OnOpen(Cancel)
 
-	// TEMP TRACE: confirm OnOpen fires at all + capture the launch parameter.
+	SelfTestCfg = ParseLaunchConfig();
+
+	// Trace that OnOpen fired + capture the launch parameter (best-effort).
 	Try
-		TraceWriter = New TextWriter("D:\GitHub\MCP-DB-Client\rust-core\target\onopen-trace.txt", TextEncoding.UTF8);
-		TraceWriter.Write("OnOpen fired " + String(CurrentDate())
+		W = New TextWriter(SelfTestOutFile("onopen-trace.txt"), TextEncoding.UTF8);
+		W.Write("OnOpen fired " + String(CurrentDate())
 			+ " build=" + BuildVersion() + Chars.LF
 			+ "LaunchParameter=[" + String(LaunchParameter) + "]");
-		TraceWriter.Close();
+		W.Close();
 	Except
 	EndTry;
 
 	EnsureRagDefaults();
 
-	// Attach the component on open (attach-only — NO InstallAddIn, which pops a
-	// modal "external component installed" dialog and blocks headless runs).
-	// Attaching from the bundle loads the component from a session-temp COPY that
-	// holds only libhttp1cWin.dll, so rcore.dll (a plain dependency DLL) is not
-	// beside it -> rag_not_installed. For the headless RAG self-test we instead
-	// attach the on-disk DLL in ExtCompT IN-PLACE (full component already
-	// installed there: libhttp1cWin.dll + rcore.dll + DirectML.dll side by side),
-	// so rcore.dll is found beside it and real search is enabled. The shipping
-	// path keeps the bundle attach (lite).
-	LPOpen = "";
-	Try
-		LPOpen = Lower(String(LaunchParameter));
-	Except
-	EndTry;
-	If StrFind(LPOpen, "ragselftest") > 0 Then
+	// Attach the component on open (attach-only — no InstallAddIn modal). Shipping
+	// path attaches the declared template bundle (lite). The headless self-test
+	// instead attaches the on-disk DLL in ExtCompT IN-PLACE so rcore.dll is found
+	// beside libhttp1cWin.dll (real search) — its location comes from the launch
+	// config, never hardcoded.
+	If SelfTestCfg.selftest Then
 		AttachSelfTestComponent(0);
 	Else
 		AddInPath = GetDefaultAddInSource();
@@ -157,14 +138,67 @@ Procedure OnOpen(Cancel)
 
 EndProcedure
 
+// Parse "ragselftest;model=<path>;out=<dir>;extcompt=<dllpath>" from the launch
+// parameter so every environment-specific absolute path stays OUT of the
+// processor — the launcher (dev tooling) supplies them.
+&AtClient
+Function ParseLaunchConfig()
+	Cfg = New Structure("selftest, model, out, extcompt", False, "", "", "");
+	LP = "";
+	Try
+		LP = String(LaunchParameter);
+	Except
+	EndTry;
+	For Each Part In StrSplit(LP, ";", False) Do
+		Part = TrimAll(Part);
+		If Lower(Part) = "ragselftest" Then
+			Cfg.selftest = True;
+		ElsIf StrStartsWith(Part, "model=") Then
+			Cfg.model = Mid(Part, StrLen("model=") + 1);
+		ElsIf StrStartsWith(Part, "out=") Then
+			Cfg.out = Mid(Part, StrLen("out=") + 1);
+		ElsIf StrStartsWith(Part, "extcompt=") Then
+			Cfg.extcompt = Mid(Part, StrLen("extcompt=") + 1);
+		EndIf;
+	EndDo;
+	Return Cfg;
+EndFunction
+
+&AtClient
+Function SelfTestOutDir()
+	Dir = "";
+	Try
+		If TypeOf(SelfTestCfg) = Type("Structure") And ValueIsFilled(SelfTestCfg.out) Then
+			Dir = SelfTestCfg.out;
+		EndIf;
+	Except
+	EndTry;
+	If Not ValueIsFilled(Dir) Then
+		Dir = TempFilesDir();
+	EndIf;
+	If Right(Dir, 1) <> "\" And Right(Dir, 1) <> "/" Then
+		Dir = Dir + "\";
+	EndIf;
+	Return Dir;
+EndFunction
+
+&AtClient
+Function SelfTestOutFile(Name)
+	Return SelfTestOutDir() + Name;
+EndFunction
+
 &AtClient
 Function SelfTestAttachCandidates()
-	// In-place attach locations for the headless self-test, tried in order until
-	// one connects. The full component is installed flat in ExtCompT, so loading
-	// the DLL there in-place puts rcore.dll right beside it.
+	// In-place attach locations for the headless self-test (from launch config):
+	// loading the on-disk DLL in ExtCompT puts rcore.dll right beside it.
 	L = New Array;
-	L.Add("C:\Users\DitriX\AppData\Roaming\1C\1cv8\ExtCompT\libhttp1cWin.dll");
-	L.Add("C:\Users\DitriX\AppData\Roaming\1C\1cv8\ExtCompT");
+	If TypeOf(SelfTestCfg) = Type("Structure") And ValueIsFilled(SelfTestCfg.extcompt) Then
+		L.Add(SelfTestCfg.extcompt);
+		Sep = StrFind(SelfTestCfg.extcompt, "\", SearchDirection.FromEnd);
+		If Sep > 1 Then
+			L.Add(Left(SelfTestCfg.extcompt, Sep - 1));
+		EndIf;
+	EndIf;
 	Return L;
 EndFunction
 
@@ -172,7 +206,7 @@ EndFunction
 Procedure AttachSelfTestComponent(Index)
 	Cands = SelfTestAttachCandidates();
 	If Index >= Cands.Count() Then
-		TraceLine("all self-test attach candidates failed");
+		TraceLine("all self-test attach candidates failed (no extcompt in launch config?)");
 		Return;
 	EndIf;
 	AddInPath = Cands[Index];
@@ -184,7 +218,7 @@ EndProcedure
 &AtClient
 Function BuildVersion()
 	// Bump on EVERY source change so the log proves a fresh .epf is running.
-	Return "selftest-build-12-cap100-filters";
+	Return "selftest-build-16-dedup-fix";
 EndFunction
 
 &AtClient
@@ -195,8 +229,7 @@ EndFunction
 &AtClient
 Procedure TraceLine(Text)
 	Try
-		W = New TextWriter("D:\GitHub\MCP-DB-Client\rust-core\target\onopen-trace.txt",
-			TextEncoding.UTF8, , True);
+		W = New TextWriter(SelfTestOutFile("onopen-trace.txt"), TextEncoding.UTF8, , True);
 		W.WriteLine("" + Text);
 		W.Close();
 	Except
@@ -2214,10 +2247,10 @@ Procedure EnsureRagDefaults()
 		Port = 8888;
 	EndIf;
 	If Not ValueIsFilled(RagModel) Then
-		// Offline MiniLM-L6 dir for fast tests (has a ":" so treated as model_path).
-		// e5-small int8 stays available at ...\offline-model if multilingual quality
-		// is needed.
-		RagModel = "D:\GitHub\MCP-DB-Client\rust-core\target\offline-model-mini";
+		// Builtin model name (no hardcoded path). For an offline/local model put a
+		// directory path here; the headless self-test takes its model_path from the
+		// launch config instead.
+		RagModel = "multilingual-e5-small";
 	EndIf;
 	If Not ValueIsFilled(RagDevice) Then
 		RagDevice = "auto";
@@ -2532,270 +2565,123 @@ Procedure RunRagSelfTestDeferred()
 
 	Ctx = New Structure;
 	Ctx.Insert("Log", New Array);
+	Ctx.Insert("CaseIndex", 0);
+	Ctx.Insert("Pass", 0);
+	Ctx.Insert("Fail", 0);
 	SelfTestAppend(Ctx, "STARTED " + String(CurrentDate()) + " build=" + BuildVersion());
 
-	// The component was already attached on open from the on-disk registry.xml
-	// directory (rcore.dll beside it), so go straight to configure — no install,
-	// no re-attach, no modal.
 	If Component = Undefined Then
-		SelfTestAppend(Ctx, "Component not attached on open");
+		SelfTestAppend(Ctx, "FAIL: component not attached on open");
+		SelfTestAppend(Ctx, "RESULT: FAIL (0/0)");
 		SelfTestAppend(Ctx, "DONE");
 		Return;
 	EndIf;
 	Try
-		SelfTestAppend(Ctx, "version = " + Component.Version);
+		SelfTestAppend(Ctx, "component version = " + Component.Version);
 	Except
-		SelfTestAppend(Ctx, "Version EXCEPTION: " + ErrorDescription());
 	EndTry;
 
-	// Point at the locally-staged offline e5 model (CPU) so rcore loads via
-	// new_local with no network fetch. On the lite component this returns
-	// rag_not_installed and the chain stops at SelfTest_ConfigureEnd.
+	// Build the stub-adapter test cases (catch any builder error instead of
+	// letting an idle-handler exception pop a blocking modal).
+	Try
+		Ctx.Insert("Cases", SelfTestCases());
+	Except
+		SelfTestAppend(Ctx, "FAIL: building test cases -> " + ErrorDescription());
+		SelfTestAppend(Ctx, "RESULT: FAIL (0/0)");
+		SelfTestAppend(Ctx, "DONE");
+		Return;
+	EndTry;
+
+	// Offline model + device come from the launch config (no hardcoded paths).
+	// device "auto" = DirectML GPU with automatic CPU fallback.
 	Cfg = New Structure;
-	Cfg.Insert("model_path", "D:\GitHub\MCP-DB-Client\rust-core\target\offline-model-mini");
-	// GPU (DirectML) with automatic CPU fallback (per user: will be tested on a
-	// GPU box). On a CPU-only machine ort silently falls back to CPU.
+	Cfg.Insert("model_path", SelfTestCfg.model);
 	Cfg.Insert("device", "auto");
 	Ctx.Insert("TCfg", Ms());
-	Component.BeginCallingRagDispatch(
-		New NotifyDescription("SelfTest_ConfigureEnd", ThisObject, Ctx),
-		"configure", SerializeToJson(Cfg));
+	Try
+		Component.BeginCallingRagDispatch(
+			New NotifyDescription("SelfTest_ConfigureEnd", ThisObject, Ctx),
+			"configure", SerializeToJson(Cfg));
+	Except
+		SelfTestAppend(Ctx, "FAIL: configure dispatch -> " + ErrorDescription());
+		SelfTestAppend(Ctx, "RESULT: FAIL (0/" + String(Ctx.Cases.Count()) + ")");
+		SelfTestAppend(Ctx, "DONE");
+	EndTry;
 
 EndProcedure
 
 &AtClient
 Procedure SelfTest_ConfigureEnd(ResultJson, ParametersCall, Ctx) Export
 
-	SelfTestAppend(Ctx, "configure (model load) took " + String(Ms() - Ctx.TCfg) + " ms");
-	SelfTestAppend(Ctx, "configure -> " + Left(ResultJson, 300));
+	SelfTestAppend(Ctx, "configure (" + String(Ms() - Ctx.TCfg) + " ms) -> " + Left(ResultJson, 240));
 	If StrFind(ResultJson, """ok"":true") = 0 Then
+		SelfTestAppend(Ctx, "FAIL: configure — real embedder unavailable (rag_not_installed / mock)");
+		SelfTestAppend(Ctx, "RESULT: FAIL (0/" + String(Ctx.Cases.Count()) + ")");
 		SelfTestAppend(Ctx, "DONE");
 		Return;
 	EndIf;
-
-	StepsJson = BuildStepsSegmentsJSON("steps", 300);
-	SelfTestAppend(Ctx, "indexing step segments (" + String(StrLen(StepsJson)) + " bytes)");
-	Component.BeginCallingRagDispatch(
-		New NotifyDescription("SelfTest_IndexEnd", ThisObject, Ctx),
-		"index_segments", StepsJson);
+	If StrFind(ResultJson, """dim"":384") = 0 Then
+		SelfTestAppend(Ctx, "WARN: model dim != 384 (mock fallback?) — semantic asserts may fail");
+	EndIf;
+	SelfTest_RunCase(Ctx);
 
 EndProcedure
 
-&AtClient
-Procedure SelfTest_IndexEnd(ResultJson, ParametersCall, Ctx) Export
+// --- Generic asserting driver: each case is index -> poll-ready -> query -> assert ---
 
-	SelfTestAppend(Ctx, "index_segments -> " + Left(ResultJson, 200));
-	// Poll stats until the background embedder finishes (vector_status "ready"),
-	// then search — so the demo shows true semantic (cosine) ranking, not the
-	// lexical fallback that "partial":true returns while vectors are still building.
+&AtClient
+Procedure SelfTest_RunCase(Ctx)
+
+	If Ctx.CaseIndex >= Ctx.Cases.Count() Then
+		SelfTest_Finalize(Ctx);
+		Return;
+	EndIf;
+	C = Ctx.Cases[Ctx.CaseIndex];
+	Ctx.Insert("CurCase", C);
+	Ctx.Insert("CaseSegments", 0);
+	SelfTestAppend(Ctx, "");
+	SelfTestAppend(Ctx, "CASE " + String(Ctx.CaseIndex + 1) + "/" + String(Ctx.Cases.Count())
+		+ ": " + C.label + " (collection " + C.collection + ")");
+
+	If Not ValueIsFilled(C.indexMethod) Then
+		// No (re)index — query an already-indexed collection directly (find_step_usages).
+		Ctx.Insert("TQuery", Ms());
+		Component.BeginCallingRagDispatch(
+			New NotifyDescription("SelfTest_CaseQueryEnd", ThisObject, Ctx),
+			C.queryMethod, C.queryPayload);
+		Return;
+	EndIf;
+
 	Ctx.Insert("TEmbed", Ms());
+	Component.BeginCallingRagDispatch(
+		New NotifyDescription("SelfTest_CaseIndexEnd", ThisObject, Ctx),
+		C.indexMethod, C.indexPayload);
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_CaseIndexEnd(ResultJson, ParametersCall, Ctx) Export
+
+	SelfTestAppend(Ctx, "  " + Ctx.CurCase.indexMethod + " -> " + Left(ResultJson, 160));
 	SelfTestCtx = Ctx;
 	SelfTestWaitTicks = 0;
-	AttachIdleHandler("SelfTest_SearchTick", 5, True);
+	AttachIdleHandler("SelfTest_CaseTick", 5, True);
 
 EndProcedure
 
 &AtClient
-Procedure SelfTest_SearchTick() Export
+Procedure SelfTest_CaseTick() Export
 
 	Component.BeginCallingRagDispatch(
-		New NotifyDescription("SelfTest_StatsEnd", ThisObject, SelfTestCtx), "stats", "{}");
+		New NotifyDescription("SelfTest_CaseStatsEnd", ThisObject, SelfTestCtx), "stats", "{}");
 
 EndProcedure
 
 &AtClient
-Procedure SelfTest_StatsEnd(ResultJson, ParametersCall, Ctx) Export
+Procedure SelfTest_CaseStatsEnd(ResultJson, ParametersCall, Ctx) Export
 
 	SelfTestWaitTicks = SelfTestWaitTicks + 1;
-	SelfTestAppend(Ctx, "stats[" + String(SelfTestWaitTicks) + "] -> " + Left(ResultJson, 300));
-
-	// Keep waiting while vectors are still building (cap the wait so a stuck
-	// embedder can't hang the run; the launcher's deadline is the backstop).
-	Ready = (StrFind(ResultJson, """vector_status"":""ready""") > 0);
-	If Not Ready And SelfTestWaitTicks < 18 Then
-		AttachIdleHandler("SelfTest_SearchTick", 5, True);
-		Return;
-	EndIf;
-
-	SelfTestAppend(Ctx, "steps embed (300 segments) took " + String(Ms() - Ctx.TEmbed)
-		+ " ms; vectors " + ?(Ready, "ready", "wait-timeout") + " after "
-		+ String(SelfTestWaitTicks) + " ticks; searching");
-	Sp = New Structure;
-	Sp.Insert("query", "удаление пользователя");
-	Sp.Insert("collection", "steps");
-	Sp.Insert("mode", "hybrid");
-	Sp.Insert("k", 5);
-	Sp.Insert("include_text", True);
-	Ctx.Insert("TSearch", Ms());
-	Component.BeginCallingRagDispatch(
-		New NotifyDescription("SelfTest_SearchEnd", ThisObject, Ctx),
-		"search", SerializeToJson(Sp));
-
-EndProcedure
-
-&AtClient
-Procedure SelfTest_SearchEnd(ResultJson, ParametersCall, Ctx) Export
-
-	SelfTestAppend(Ctx, "steps search latency = " + String(Ms() - Ctx.TSearch) + " ms");
-	SelfTestAppend(Ctx, "steps search -> " + ResultJson);
-
-	// Phase 2: index the real IRP Gherkin features (scenario titles) as a second
-	// collection and search them too — proves the chain on a second real corpus.
-	FeatJson = BuildFeaturesSegmentsJSON("features", 400);
-	SelfTestAppend(Ctx, "indexing feature segments (" + String(StrLen(FeatJson)) + " bytes)");
-	Component.BeginCallingRagDispatch(
-		New NotifyDescription("SelfTest_FeatIndexEnd", ThisObject, Ctx),
-		"index_segments", FeatJson);
-
-EndProcedure
-
-&AtClient
-Procedure SelfTest_FeatIndexEnd(ResultJson, ParametersCall, Ctx) Export
-
-	SelfTestAppend(Ctx, "features index_segments -> " + Left(ResultJson, 200));
-	Ctx.Insert("TEmbedF", Ms());
-	SelfTestCtx = Ctx;
-	SelfTestWaitTicks = 0;
-	AttachIdleHandler("SelfTest_FeatTick", 5, True);
-
-EndProcedure
-
-&AtClient
-Procedure SelfTest_FeatTick() Export
-
-	Component.BeginCallingRagDispatch(
-		New NotifyDescription("SelfTest_FeatStatsEnd", ThisObject, SelfTestCtx), "stats", "{}");
-
-EndProcedure
-
-&AtClient
-Procedure SelfTest_FeatStatsEnd(ResultJson, ParametersCall, Ctx) Export
-
-	SelfTestWaitTicks = SelfTestWaitTicks + 1;
-	SelfTestAppend(Ctx, "features stats[" + String(SelfTestWaitTicks) + "] -> " + Left(ResultJson, 320));
-
-	// Wait until no collection is still "building" (steps is already ready).
-	Building = (StrFind(ResultJson, """vector_status"":""building""") > 0);
-	If Building And SelfTestWaitTicks < 18 Then
-		AttachIdleHandler("SelfTest_FeatTick", 5, True);
-		Return;
-	EndIf;
-
-	SelfTestAppend(Ctx, "features embed (400 titles) took " + String(Ms() - Ctx.TEmbedF)
-		+ " ms; vectors " + ?(Building, "wait-timeout", "ready")
-		+ " after " + String(SelfTestWaitTicks) + " ticks; searching");
-	Sp = New Structure;
-	Sp.Insert("query", "filter documents by company");
-	Sp.Insert("collection", "features");
-	Sp.Insert("mode", "hybrid");
-	Sp.Insert("k", 5);
-	Sp.Insert("include_text", True);
-	Ctx.Insert("TSearchF", Ms());
-	Component.BeginCallingRagDispatch(
-		New NotifyDescription("SelfTest_FeatSearchEnd", ThisObject, Ctx),
-		"search", SerializeToJson(Sp));
-
-EndProcedure
-
-&AtClient
-Procedure SelfTest_FeatSearchEnd(ResultJson, ParametersCall, Ctx) Export
-
-	SelfTestAppend(Ctx, "features (titles) search latency = " + String(Ms() - Ctx.TSearchF) + " ms");
-	SelfTestAppend(Ctx, "features search -> " + ResultJson);
-
-	// Phase 3: segment the WHOLE features folder BY SCENARIO (one scenario = one
-	// segment, verbatim text + meta) and semantic-search it. Sent as a SINGLE
-	// index_segments batch so fastembed embeds it with internal rayon + ONNX
-	// parallelism — far faster than 340 tiny per-file index_raw jobs.
-	SelfTest_ScenStart(Ctx);
-
-EndProcedure
-
-&AtClient
-Function ScenBatchJson(Collection, DocId, Slice)
-	Payload = New Structure;
-	Payload.Insert("collection", Collection);
-	Payload.Insert("doc_id", DocId);
-	Payload.Insert("name", "IRP scenarios");
-	Payload.Insert("segments", Slice);
-	W = New JSONWriter;
-	W.SetString();
-	WriteJSON(W, Payload);
-	Return W.Close();
-EndFunction
-
-&AtClient
-Procedure SelfTest_ScenStart(Ctx)
-
-	// Whole folder, NO cap. Submit in batches of 500 so (a) the worker reports
-	// incremental progress (embedded climbs per batch -> percent), and (b) peak
-	// memory stays bounded (one giant batch padded ONNX tensors to ~10 GB).
-	ScenAll = BuildAllScenarioSegments(100);
-	ScenSkip = 0;
-	ScenBatchNo = 0;
-	Ctx.Insert("ScenTotal", ScenAll.Count());
-	Ctx.Insert("TScenIndex", Ms());
-	SelfTestAppend(Ctx, "PHASE 3: " + String(ScenAll.Count())
-		+ " scenarios (test subfolder, cap 100), batches of 500");
-	SelfTest_ScenSubmitNext(Ctx);
-
-EndProcedure
-
-&AtClient
-Procedure SelfTest_ScenSubmitNext(Ctx)
-
-	Total = ScenAll.Count();
-	If ScenSkip >= Total Then
-		SelfTestAppend(Ctx, "all " + String(Total) + " scenarios submitted in "
-			+ String(Ms() - Ctx.TScenIndex) + " ms (accept); embedding...");
-		Ctx.Insert("TScenEmbed", Ms());
-		SelfTestCtx = Ctx;
-		SelfTestWaitTicks = 0;
-		AttachIdleHandler("SelfTest_ScenTick", 5, True);
-		Return;
-	EndIf;
-
-	BatchSize = 500;
-	Upper = ScenSkip + BatchSize;
-	If Upper > Total Then
-		Upper = Total;
-	EndIf;
-	Slice = New Array;
-	For Idx = ScenSkip To Upper - 1 Do
-		Slice.Add(ScenAll[Idx]);
-	EndDo;
-	ScenBatchNo = ScenBatchNo + 1;
-	ScenSkip = Upper;
-	Json = ScenBatchJson("features_scenarios", "irp-scen-" + Format(ScenBatchNo, "NG=0"), Slice);
-	Component.BeginCallingRagDispatch(
-		New NotifyDescription("SelfTest_ScenSubmitEnd", ThisObject, Ctx),
-		"index_segments", Json);
-
-EndProcedure
-
-&AtClient
-Procedure SelfTest_ScenSubmitEnd(ResultJson, ParametersCall, Ctx) Export
-
-	If ScenBatchNo % 4 = 0 Then
-		SelfTestAppend(Ctx, "  submitted " + String(ScenSkip) + "/" + String(Ctx.ScenTotal) + " scenarios");
-	EndIf;
-	SelfTest_ScenSubmitNext(Ctx);
-
-EndProcedure
-
-&AtClient
-Procedure SelfTest_ScenTick() Export
-
-	Component.BeginCallingRagDispatch(
-		New NotifyDescription("SelfTest_ScenStatsEnd", ThisObject, SelfTestCtx), "stats", "{}");
-
-EndProcedure
-
-&AtClient
-Procedure SelfTest_ScenStatsEnd(ResultJson, ParametersCall, Ctx) Export
-
-	SelfTestWaitTicks = SelfTestWaitTicks + 1;
-
+	C = Ctx.CurCase;
 	Emb = 0;
 	Total = 0;
 	VecStatus = "";
@@ -2803,7 +2689,7 @@ Procedure SelfTest_ScenStatsEnd(ResultJson, ParametersCall, Ctx) Export
 		R = New JSONReader;
 		R.SetString(ResultJson);
 		Obj = ReadJSON(R, True);
-		Coll = Obj["result"]["collections"]["features_scenarios"];
+		Coll = Obj["result"]["collections"][C.collection];
 		If Coll <> Undefined Then
 			Emb = Coll["embedded"];
 			Total = Coll["n_segments"];
@@ -2811,43 +2697,294 @@ Procedure SelfTest_ScenStatsEnd(ResultJson, ParametersCall, Ctx) Export
 		EndIf;
 	Except
 	EndTry;
+	Ctx.CaseSegments = Total;
+	ShowEmbedProgress(C.label, Emb, Total);
 
-	Pct = ?(Total > 0, Int(Emb * 100 / Total), 0);
-	Elapsed = Ms() - Ctx.TScenEmbed;
-	Rate = ?(Elapsed > 0, Int(Emb * 1000 / Elapsed), 0);
-	SelfTestAppend(Ctx, "scenarios embedding " + String(Emb) + "/" + String(Total)
-		+ " (" + String(Pct) + "%) ~" + String(Rate) + " seg/s, "
-		+ String(Int(Elapsed / 1000)) + "s");
-	ShowEmbedProgress("Эмбеддинг сценариев", Emb, Total);
-
-	If VecStatus <> "ready" And SelfTestWaitTicks < 170 Then
-		AttachIdleHandler("SelfTest_ScenTick", 5, True);
+	If VecStatus <> "ready" And SelfTestWaitTicks < 60 Then
+		AttachIdleHandler("SelfTest_CaseTick", 5, True);
 		Return;
 	EndIf;
 
-	SelfTestAppend(Ctx, "scenarios embed DONE: " + String(Emb) + " segments in "
-		+ String(Elapsed) + " ms (~" + String(Rate) + " seg/s); searching");
-	Sp = New Structure;
-	Sp.Insert("query", "filter payment documents by company");
-	Sp.Insert("collection", "features_scenarios");
-	Sp.Insert("mode", "hybrid");
-	Sp.Insert("k", 5);
-	Sp.Insert("include_text", True);
-	Ctx.Insert("TScenSearch", Ms());
+	SelfTestAppend(Ctx, "  embedded " + String(Emb) + "/" + String(Total)
+		+ " in " + String(Ms() - Ctx.TEmbed) + " ms; querying");
+	Ctx.Insert("TQuery", Ms());
 	Component.BeginCallingRagDispatch(
-		New NotifyDescription("SelfTest_ScenSearchEnd", ThisObject, Ctx),
-		"search", SerializeToJson(Sp));
+		New NotifyDescription("SelfTest_CaseQueryEnd", ThisObject, Ctx),
+		C.queryMethod, C.queryPayload);
 
 EndProcedure
 
 &AtClient
-Procedure SelfTest_ScenSearchEnd(ResultJson, ParametersCall, Ctx) Export
+Procedure SelfTest_CaseQueryEnd(ResultJson, ParametersCall, Ctx) Export
 
-	SelfTestAppend(Ctx, "scenarios search latency = " + String(Ms() - Ctx.TScenSearch) + " ms");
-	SelfTestAppend(Ctx, "scenarios search -> " + ResultJson);
+	C = Ctx.CurCase;
+	SelfTestAppend(Ctx, "  " + C.queryMethod + " (" + String(Ms() - Ctx.TQuery) + " ms) -> "
+		+ Left(ResultJson, 400));
+
+	OkPass = (StrFind(ResultJson, """ok"":true") > 0);
+	TextPass = (Not ValueIsFilled(C.expectText)) Or (StrFind(ResultJson, C.expectText) > 0);
+	SegPass = (C.expectSegments = 0) Or (Ctx.CaseSegments = C.expectSegments);
+	CasePass = OkPass And TextPass And SegPass;
+
+	Detail = "ok=" + String(OkPass);
+	If ValueIsFilled(C.expectText) Then
+		Detail = Detail + " text<" + C.expectText + ">=" + String(TextPass);
+	EndIf;
+	If C.expectSegments > 0 Then
+		Detail = Detail + " segments(" + String(Ctx.CaseSegments) + "==" + String(C.expectSegments)
+			+ ")=" + String(SegPass);
+	EndIf;
+
+	If CasePass Then
+		Ctx.Pass = Ctx.Pass + 1;
+		SelfTestAppend(Ctx, "  PASS: " + C.label + " [" + Detail + "]");
+	Else
+		Ctx.Fail = Ctx.Fail + 1;
+		SelfTestAppend(Ctx, "  FAIL: " + C.label + " [" + Detail + "]");
+	EndIf;
+
+	Ctx.CaseIndex = Ctx.CaseIndex + 1;
+	SelfTest_RunCase(Ctx);
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_Finalize(Ctx)
+
+	Total = Ctx.Cases.Count();
+	SelfTestAppend(Ctx, "");
+	If Ctx.Fail = 0 Then
+		SelfTestAppend(Ctx, "RESULT: ALL PASS (" + String(Ctx.Pass) + "/" + String(Total) + ")");
+	Else
+		SelfTestAppend(Ctx, "RESULT: FAIL (" + String(Ctx.Pass) + "/" + String(Total)
+			+ " passed, " + String(Ctx.Fail) + " failed)");
+	EndIf;
 	SelfTestAppend(Ctx, "DONE");
 
 EndProcedure
+
+// ============================================================================
+// Test cases — each exercises one adapter end-to-end and asserts the result.
+// ============================================================================
+
+&AtClient
+Function SelfTestCases()
+	Cases = New Array;
+
+	// 1. QA step catalog (anti-hallucination source): canonical phrases + descriptions.
+	Cases.Add(SelfTestCase("QA step catalog", "qa_steps", "index_segments",
+		StepCatalogPayload(), "search",
+		SearchJson("удаление пользователя", "qa_steps", "hybrid", 5), "удаля", 0));
+
+	// 2. QA scenarios: verbatim text + tags + line addressing; assert the real
+	//    parameter value ("Феррон") is retrievable.
+	Cases.Add(SelfTestCase("QA scenarios", "qa_scenarios", "index_segments",
+		ScenariosPayload(), "search",
+		SearchJson("фильтр по компании", "qa_scenarios", "hybrid", 5), "Феррон", 0));
+
+	// 3. find_step_usages: reverse step -> scenario with the REAL parameter value
+	//    (keyword scan over scenario text; qa_scenarios already indexed by case 2).
+	Cases.Add(SelfTestCase("find_step_usages", "qa_scenarios", "", "", "search",
+		SearchJson("я удаляю пользователя", "qa_scenarios", "keyword", 5), "VanessaUser1", 0));
+
+	// 4. Products adapter: list from a string array + tags as metadata.
+	Cases.Add(SelfTestCase("Products", "products", "index_segments",
+		ProductsPayload(), "search",
+		SearchJson("ноутбук", "products", "hybrid", 5), "Lenovo", 0));
+
+	// 5. Clients adapter + dedup: raw list has duplicates; assert the indexed
+	//    segment count equals the unique count (dedup happened).
+	Unique = ClientsDedup(StubClients());
+	Cases.Add(SelfTestCase("Clients (dedup)", "clients", "index_segments",
+		ClientsPayload(Unique), "search",
+		SearchJson("Ромашка", "clients", "keyword", 5), "Ромашка", Unique.Count()));
+
+	Return Cases;
+EndFunction
+
+&AtClient
+Function SelfTestCase(Label, Collection, IndexMethod, IndexPayload, QueryMethod, QueryPayload, ExpectText, ExpectSegments)
+	C = New Structure;
+	C.Insert("label", Label);
+	C.Insert("collection", Collection);
+	C.Insert("indexMethod", IndexMethod);
+	C.Insert("indexPayload", IndexPayload);
+	C.Insert("queryMethod", QueryMethod);
+	C.Insert("queryPayload", QueryPayload);
+	C.Insert("expectText", ExpectText);
+	C.Insert("expectSegments", ExpectSegments);
+	Return C;
+EndFunction
+
+&AtClient
+Function SearchJson(Query, Collection, Mode, K)
+	Sp = New Structure;
+	Sp.Insert("query", Query);
+	Sp.Insert("collection", Collection);
+	Sp.Insert("mode", Mode);
+	Sp.Insert("k", K);
+	Sp.Insert("include_text", True);
+	Return SerializeToJson(Sp);
+EndFunction
+
+&AtClient
+Function SegmentsPayload(Collection, DocId, Name, Segments)
+	Payload = New Structure;
+	Payload.Insert("collection", Collection);
+	Payload.Insert("doc_id", DocId);
+	Payload.Insert("name", Name);
+	Payload.Insert("segments", Segments);
+	W = New JSONWriter;
+	W.SetString();
+	WriteJSON(W, Payload);
+	Return W.Close();
+EndFunction
+
+// ============================================================================
+// Pluggable stub data sources (no file reads, no hardcoded corpora). Swap these
+// for real adapters (Gherkin1C parse, step registry, product/client catalogs).
+// ============================================================================
+
+&AtClient
+Function StubStep(Phrase, Description, ParamTypes)
+	Return New Structure("phrase, description, paramTypes", Phrase, Description, ParamTypes);
+EndFunction
+
+&AtClient
+Function StubStepCatalog()
+	S = New Array;
+	S.Add(StubStep("Я удаляю пользователя ""Имя""", "Удаление пользователя информационной базы по имени", "Строка"));
+	S.Add(StubStep("Я создаю элемент справочника ""Имя""", "Создание нового элемента справочника", "Строка"));
+	S.Add(StubStep("Я открываю форму ""Форма""", "Открытие управляемой формы по имени", "Строка"));
+	S.Add(StubStep("Я нажимаю кнопку ""Кнопка""", "Нажатие командной кнопки на форме", "Строка"));
+	S.Add(StubStep("Я проверяю фильтр по компании ""Компания""", "Проверка фильтра списка по реквизиту Компания", "Строка"));
+	S.Add(StubStep("Я провожу документ ""Документ""", "Проведение документа", "Строка"));
+	Return S;
+EndFunction
+
+&AtClient
+Function StubScenario(Name, Feature, Tags, LineStart, LineEnd, StepsText)
+	Return New Structure("name, feature, tags, lineStart, lineEnd, steps",
+		Name, Feature, Tags, LineStart, LineEnd, StepsText);
+EndFunction
+
+&AtClient
+Function StubScenarios()
+	S = New Array;
+	S.Add(StubScenario("Удаление пользователя", "Управление пользователями", "@smoke,@users", 5, 9,
+		"Дано я авторизован как ""Администратор""" + Chars.LF
+		+ "Когда я удаляю пользователя ""VanessaUser1""" + Chars.LF
+		+ "Тогда пользователь ""VanessaUser1"" отсутствует в базе"));
+	S.Add(StubScenario("Фильтр по компании в заказе поставщику", "Фильтры документов", "@filters,@regress", 12, 17,
+		"Дано я открываю список ""Заказ поставщику""" + Chars.LF
+		+ "Когда я проверяю фильтр по компании ""Феррон""" + Chars.LF
+		+ "Тогда в списке только документы компании ""Феррон"""));
+	S.Add(StubScenario("Проведение приходной накладной", "Складские документы", "@smoke,@warehouse", 20, 24,
+		"Дано открыта форма ""Приходная накладная""" + Chars.LF
+		+ "Когда я провожу документ ""ПН-0001""" + Chars.LF
+		+ "Тогда документ ""ПН-0001"" проведён"));
+	Return S;
+EndFunction
+
+&AtClient
+Function StubProduct(Name, Tags)
+	Return New Structure("name, tags", Name, Tags);
+EndFunction
+
+&AtClient
+Function StubProducts()
+	P = New Array;
+	P.Add(StubProduct("Ноутбук Lenovo ThinkPad X1 Carbon", "электроника,ноутбуки"));
+	P.Add(StubProduct("Смартфон Samsung Galaxy S24 Ultra", "электроника,смартфоны"));
+	P.Add(StubProduct("Кофемашина DeLonghi Magnifica", "техника,кухня"));
+	P.Add(StubProduct("Монитор Dell UltraSharp 27", "электроника,мониторы"));
+	P.Add(StubProduct("Наушники Sony WH-1000XM5", "электроника,аудио"));
+	Return P;
+EndFunction
+
+&AtClient
+Function StubClients()
+	C = New Array;
+	C.Add("ООО ""Ромашка""");
+	C.Add("ООО ""Ромашка""");          // exact duplicate
+	C.Add("ИП Иванов И.И.");
+	C.Add("ооо ""ромашка""");          // case duplicate
+	C.Add("ООО ""Рога и Копыта""");
+	C.Add("  ИП Иванов И.И.  ");        // whitespace duplicate
+	C.Add("ООО ""Василёк""");
+	Return C;
+EndFunction
+
+&AtClient
+Function ClientsDedup(Raw)
+	Seen = New Map;
+	Unique = New Array;
+	For Each ClientName In Raw Do
+		NormKey = Lower(TrimAll(ClientName));
+		If Seen[NormKey] = Undefined Then
+			Seen.Insert(NormKey, True);
+			Unique.Add(TrimAll(ClientName));
+		EndIf;
+	EndDo;
+	Return Unique;
+EndFunction
+
+// ============================================================================
+// Adapters: map stub domain data -> index_segments payloads with rich metadata.
+// ============================================================================
+
+&AtClient
+Function StepCatalogPayload()
+	Segments = New Array;
+	For Each Item In StubStepCatalog() Do
+		Seg = New Structure;
+		Seg.Insert("text", Item.phrase);
+		Seg.Insert("embed_text", Item.phrase + " | " + Item.description + " | параметры: " + Item.paramTypes);
+		Seg.Insert("meta", New Structure("type, params", "step", Item.paramTypes));
+		Segments.Add(Seg);
+	EndDo;
+	Return SegmentsPayload("qa_steps", "qa-step-catalog", "QA step catalog", Segments);
+EndFunction
+
+&AtClient
+Function ScenariosPayload()
+	Segments = New Array;
+	For Each Sc In StubScenarios() Do
+		Verbatim = "Сценарий: " + Sc.name + Chars.LF + Sc.steps;
+		Seg = New Structure;
+		Seg.Insert("text", Verbatim);
+		Seg.Insert("embed_text", Sc.name + " " + StrReplace(Sc.tags, ",", " ") + " " + Sc.steps);
+		Seg.Insert("line_start", Sc.lineStart);
+		Seg.Insert("line_end", Sc.lineEnd);
+		Seg.Insert("meta", New Structure("type, feature, tags, name", "scenario", Sc.feature, Sc.tags, Sc.name));
+		Segments.Add(Seg);
+	EndDo;
+	Return SegmentsPayload("qa_scenarios", "qa-scenarios", "QA scenarios", Segments);
+EndFunction
+
+&AtClient
+Function ProductsPayload()
+	Segments = New Array;
+	For Each Pr In StubProducts() Do
+		Seg = New Structure;
+		Seg.Insert("text", Pr.name);
+		Seg.Insert("meta", New Structure("type, tags, collection", "product", Pr.tags, "products"));
+		Segments.Add(Seg);
+	EndDo;
+	Return SegmentsPayload("products", "products-catalog", "Products", Segments);
+EndFunction
+
+&AtClient
+Function ClientsPayload(Unique)
+	Segments = New Array;
+	For Each Name In Unique Do
+		Seg = New Structure;
+		Seg.Insert("text", Name);
+		Seg.Insert("meta", New Structure("type", "client"));
+		Segments.Add(Seg);
+	EndDo;
+	Return SegmentsPayload("clients", "clients-catalog", "Clients", Segments);
+EndFunction
 
 &AtClient
 Procedure SelfTestAppend(Ctx, Line)
@@ -2857,208 +2994,6 @@ Procedure SelfTestAppend(Ctx, Line)
 
 EndProcedure
 
-&AtServer
-Function BuildStepsSegmentsJSON(Collection, MaxSegments)
-
-	Path = "D:\GitHub\MCP-DB-Client\test\steps.json";
-	Segments = New Array;
-	Try
-		Reader = New TextReader(Path, TextEncoding.UTF8);
-		Content = Reader.Read();
-		Reader.Close();
-		JsonReader = New JSONReader;
-		JsonReader.SetString(Content);
-		Steps = ReadJSON(JsonReader, True);
-		For Each StepItem In Steps Do
-			If Segments.Count() >= MaxSegments Then
-				Break;
-			EndIf;
-			Name = "";
-			Descr = "";
-			If TypeOf(StepItem) = Type("Map") Then
-				Name = StepItem["ИмяШага"];
-				Descr = StepItem["ОписаниеШага"];
-			EndIf;
-			SegText = String(Name);
-			If ValueIsFilled(Descr) Then
-				SegText = SegText + " — " + String(Descr);
-			EndIf;
-			If ValueIsFilled(SegText) Then
-				Segments.Add(New Structure("text", SegText));
-			EndIf;
-		EndDo;
-	Except
-		// best-effort: index whatever parsed
-	EndTry;
-
-	Payload = New Structure;
-	Payload.Insert("collection", Collection);
-	Payload.Insert("doc_id", "vanessa-steps");
-	Payload.Insert("name", "Vanessa steps");
-	Payload.Insert("segments", Segments);
-
-	JsonWriter = New JSONWriter;
-	JsonWriter.SetString();
-	WriteJSON(JsonWriter, Payload);
-	Return JsonWriter.Close();
-
-EndFunction
-
-&AtServer
-Function BuildFeaturesSegmentsJSON(Collection, MaxSegments)
-
-	Dir = "C:\Users\DitriX\Downloads\IRP-develop\features";
-	Segments = New Array;
-	Try
-		Files = FindFiles(Dir, "*.feature", True);
-		For Each File In Files Do
-			If Segments.Count() >= MaxSegments Then
-				Break;
-			EndIf;
-			If Not File.IsFile() Then
-				Continue;
-			EndIf;
-			Reader = New TextReader(File.FullName, TextEncoding.UTF8);
-			Line = Reader.ReadLine();
-			While Line <> Undefined Do
-				If Segments.Count() >= MaxSegments Then
-					Break;
-				EndIf;
-				Trimmed = TrimAll(Line);
-				Title = "";
-				If StrStartsWith(Trimmed, "Scenario Outline:") Then
-					Title = TrimAll(Mid(Trimmed, StrLen("Scenario Outline:") + 1));
-				ElsIf StrStartsWith(Trimmed, "Scenario:") Then
-					Title = TrimAll(Mid(Trimmed, StrLen("Scenario:") + 1));
-				ElsIf StrStartsWith(Trimmed, "Структура сценария:") Then
-					Title = TrimAll(Mid(Trimmed, StrLen("Структура сценария:") + 1));
-				ElsIf StrStartsWith(Trimmed, "Сценарий:") Then
-					Title = TrimAll(Mid(Trimmed, StrLen("Сценарий:") + 1));
-				EndIf;
-				If ValueIsFilled(Title) Then
-					Segments.Add(New Structure("text", Title));
-				EndIf;
-				Line = Reader.ReadLine();
-			EndDo;
-			Reader.Close();
-		EndDo;
-	Except
-		// best-effort: index whatever parsed
-	EndTry;
-
-	Payload = New Structure;
-	Payload.Insert("collection", Collection);
-	Payload.Insert("doc_id", "irp-features");
-	Payload.Insert("name", "IRP features");
-	Payload.Insert("segments", Segments);
-
-	JsonWriter = New JSONWriter;
-	JsonWriter.SetString();
-	WriteJSON(JsonWriter, Payload);
-	Return JsonWriter.Close();
-
-EndFunction
-
-&AtServer
-Function IsScenarioLine(Trimmed)
-	Return StrStartsWith(Trimmed, "Scenario:") Or StrStartsWith(Trimmed, "Scenario Outline:")
-		Or StrStartsWith(Trimmed, "Сценарий:") Or StrStartsWith(Trimmed, "Структура сценария:");
-EndFunction
-
-&AtServer
-Function IsFeatureLine(Trimmed)
-	Return StrStartsWith(Trimmed, "Feature:") Or StrStartsWith(Trimmed, "Функционал:")
-		Or StrStartsWith(Trimmed, "Функциональность:");
-EndFunction
-
-&AtServer
-Function HeaderTitle(Trimmed)
-	Pos = StrFind(Trimmed, ":");
-	If Pos > 0 Then
-		Return TrimAll(Mid(Trimmed, Pos + 1));
-	EndIf;
-	Return Trimmed;
-EndFunction
-
-&AtServer
-Procedure FlushScenario(Segments, BlockLines, FeatureName, RelPath, MaxSegments)
-	If Segments.Count() >= MaxSegments Then
-		Return;
-	EndIf;
-	Text = TrimAll(StrConcat(BlockLines, Chars.LF));
-	If Not ValueIsFilled(Text) Then
-		Return;
-	EndIf;
-	If StrLen(Text) > 2000 Then
-		Text = Left(Text, 2000);
-	EndIf;
-	Meta = New Structure;
-	Meta.Insert("type", "scenario");
-	Meta.Insert("feature", FeatureName);
-	Meta.Insert("file", RelPath);
-	Seg = New Structure;
-	Seg.Insert("text", Text);
-	Seg.Insert("meta", Meta);
-	Segments.Add(Seg);
-EndProcedure
-
-&AtServer
-Function BuildAllScenarioSegments(MaxSegments)
-
-	// A small, coherent test subfolder (filter scenarios) for fast iteration.
-	Dir = "C:\Users\DitriX\Downloads\IRP-develop\features\Internal\_0915 Filters";
-	Root = Dir + "\";
-	Segments = New Array;
-	Try
-		Files = FindFiles(Dir, "*.feature", True);
-		For Each F In Files Do
-			If Segments.Count() >= MaxSegments Then
-				Break;
-			EndIf;
-			If Not F.IsFile() Then
-				Continue;
-			EndIf;
-			RelPath = F.FullName;
-			If StrStartsWith(RelPath, Root) Then
-				RelPath = Mid(RelPath, StrLen(Root) + 1);
-			EndIf;
-			FeatureName = RelPath;
-			BlockLines = Undefined;
-			Reader = New TextReader(F.FullName, TextEncoding.UTF8);
-			Line = Reader.ReadLine();
-			While Line <> Undefined Do
-				Trimmed = TrimAll(Line);
-				If IsFeatureLine(Trimmed) Then
-					FeatureName = HeaderTitle(Trimmed);
-				ElsIf IsScenarioLine(Trimmed) Then
-					If BlockLines <> Undefined Then
-						FlushScenario(Segments, BlockLines, FeatureName, RelPath, MaxSegments);
-					EndIf;
-					BlockLines = New Array;
-					BlockLines.Add(Line);
-				Else
-					If BlockLines <> Undefined Then
-						BlockLines.Add(Line);
-					EndIf;
-				EndIf;
-				If Segments.Count() >= MaxSegments Then
-					Break;
-				EndIf;
-				Line = Reader.ReadLine();
-			EndDo;
-			Reader.Close();
-			If BlockLines <> Undefined Then
-				FlushScenario(Segments, BlockLines, FeatureName, RelPath, MaxSegments);
-			EndIf;
-		EndDo;
-	Except
-		// best-effort: index whatever parsed
-	EndTry;
-
-	Return Segments;
-
-EndFunction
-
 &AtClient
 Procedure WriteSelfTestResult(Out)
 
@@ -3067,7 +3002,7 @@ Procedure WriteSelfTestResult(Out)
 		Text = Text + Line + Chars.LF;
 	EndDo;
 	Try
-		Writer = New TextWriter("D:\GitHub\MCP-DB-Client\rust-core\target\ragselftest-result.txt", TextEncoding.UTF8);
+		Writer = New TextWriter(SelfTestOutFile("ragselftest-result.txt"), TextEncoding.UTF8);
 		Writer.Write(Text);
 		Writer.Close();
 	Except
