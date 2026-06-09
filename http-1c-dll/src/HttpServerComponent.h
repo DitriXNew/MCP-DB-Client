@@ -160,6 +160,13 @@ private:
     void doRegisterPrompts(const std::u16string& jsonStr);
     void doSetAuthToken(const std::u16string& token);
 
+    // Async-friendly config + status. 1C has no async property accessors, so in
+    // async-only infobases (synchronous extension calls disabled) properties
+    // cannot be set/read from the client. ApplyConfig/GetStatus expose the same
+    // capabilities through async methods (BeginCalling...).
+    void doApplyConfig(const std::u16string& jsonStr);
+    std::string buildStatusJson();
+
     // JSON-RPC endpoint handler for the MCP transport.
     void handleMcpRequest(const httplib::Request& req, httplib::Response& res);
     void handleMcpGet(const httplib::Request& req, httplib::Response& res);

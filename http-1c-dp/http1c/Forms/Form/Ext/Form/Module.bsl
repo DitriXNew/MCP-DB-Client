@@ -261,7 +261,7 @@ EndProcedure
 &AtClient
 Function BuildVersion()
 	// Bump on EVERY source change so the log proves a fresh .epf is running.
-	Return "selftest-build-25-install-btn";
+	Return "selftest-build-26-async-config";
 EndFunction
 
 &AtClient
@@ -292,17 +292,31 @@ Procedure OnOpenAttachEnd(Connected, AdditionalParameters) Export
 	EndIf;
 	Try
 		Component = New("AddIn.http1c.HttpServer");
-		Component.LoggingEnabled = EnableLogging;
-		Component.LogPath = LogPath;
-		Component.Timeout = 120;
-		TraceLine("Component created, version=" + String(Component.Version));
 	Except
 		TraceLine("Component create EXCEPTION: " + ErrorDescription());
 		Return;
 	EndTry;
 
+	// Config via the async ApplyConfig method — property assignment is blocked
+	// in async-only infobases ("Cannot call synchronous methods on the client").
+	// The self-test scheduling continues in OnOpenConfigEnd once config lands.
+	Try
+		Component.BeginCallingApplyConfig(
+			New NotifyDescription("OnOpenConfigEnd", ThisObject),
+			BuildConfigJson(False));
+	Except
+		TraceLine("ApplyConfig dispatch EXCEPTION: " + ErrorDescription());
+		// Still schedule the self-test — logging config is non-essential.
+		OnOpenConfigEnd(Undefined, Undefined, Undefined);
+	EndTry;
+
+EndProcedure
+
+&AtClient
+Procedure OnOpenConfigEnd(ResultCall, ParametersCall, AdditionalParameters) Export
+
 	// If launched for the headless self-test, run the RAG chain now that the
-	// component is attached.
+	// component is attached and configured.
 	LP = "";
 	Try
 		LP = Lower(String(LaunchParameter));
@@ -630,28 +644,30 @@ Procedure AttachAddInEnd(Connected, AdditionalParameters) Export
 
 	ResetRuntimeStatus();
 	EnsureLoggingDefaults();
-	
-	// All configuration via synchronous property assignments.
+
+	// All configuration (logging/timeout + MCP tool/resource/prompt catalogs)
+	// goes through the single async ApplyConfig method. Synchronous property
+	// assignment is forbidden in async-only infobases. StartListen continues in
+	// the AttachConfigEnd callback.
 	Try
-		Component.LoggingEnabled = EnableLogging;
-		Component.LogPath = LogPath;
-		Component.Timeout = 120;
+		Component.BeginCallingApplyConfig(
+			New NotifyDescription("AttachConfigEnd", ThisObject),
+			BuildConfigJson(True));
 	Except
 		ShowMessageBox(, "Configuration failed: " + ErrorDescription());
-		Return;
 	EndTry;
-	
-	// Register MCP primitives (synchronous property assignments).
-	RegisterMCPTools();
-	RegisterMCPResources();
-	RegisterMCPPrompts();
-	
+
+EndProcedure
+
+&AtClient
+Procedure AttachConfigEnd(ResultCall, ParametersCall, AdditionalParameters) Export
+
 	// Start listening (async — returns via callback).
 	PortValue = Port;
 	If PortValue = 0 Then
 		PortValue = 8888;
 	EndIf;
-	
+
 	Try
 		Component.BeginCallingStartListen(
 			New NotifyDescription("StartListenEnd", ThisObject),
@@ -659,7 +675,7 @@ Procedure AttachAddInEnd(Connected, AdditionalParameters) Export
 	Except
 		ShowMessageBox(, "StartListen failed: " + ErrorDescription());
 	EndTry;
-	
+
 EndProcedure
 
 &AtClient
@@ -712,16 +728,19 @@ EndProcedure
 //
 // To add a new tool:
 //   1. Create a ToolXxx() function that returns the tool definition
-//   2. Add it to the Tools array in RegisterMCPTools()
+//   2. Add it to the Tools array in McpToolsJson()
 //   3. Add a handler in ProcessToolCall() dispatcher
 //   4. Implement HandleXxx() procedure with Begin* callbacks
 // ============================================================================
 
 #Region ToolDefinitions
 
+// Returns the MCP tool catalog as a JSON array string. Applied to the
+// component via the async ApplyConfig method (property assignment is forbidden
+// in async-only infobases).
 &AtClient
-Procedure RegisterMCPTools()
-	
+Function McpToolsJson()
+
 	Tools = New Array;
 	Tools.Add(ToolGetStatus());
 	Tools.Add(ToolOpenForm());
@@ -730,10 +749,10 @@ Procedure RegisterMCPTools()
 	Tools.Add(ToolRunLongTask());
 	Tools.Add(ToolTakeScreenshot());
 	Tools.Add(ToolTestScreenshot());
-	
-	Component.Tools = SerializeToJson(Tools);
-	
-EndProcedure
+
+	Return SerializeToJson(Tools);
+
+EndFunction
 
 &AtClient
 Function NewTool(Name, Description)
@@ -1050,15 +1069,15 @@ EndProcedure
 // the resource content via SendResponse().
 //
 // To add a new resource:
-//   1. Add a resource definition to RegisterMCPResources()
+//   1. Add a resource definition to McpResourcesJson()
 //   2. Add a handler in ProcessResourceRead() dispatcher
 // ============================================================================
 
 #Region ResourceDefinitions
 
 &AtClient
-Procedure RegisterMCPResources()
-	
+Function McpResourcesJson()
+
 	Resources = New Array;
 	
 	// Example: expose 1C metadata catalog list as a resource
@@ -1078,10 +1097,10 @@ Procedure RegisterMCPResources()
 		"JSON list of all document metadata objects in the current 1C infobase.");
 	Resource.Insert("mimeType", "application/json");
 	Resources.Add(Resource);
-	
-	Component.Resources = SerializeToJson(Resources);
-	
-EndProcedure
+
+	Return SerializeToJson(Resources);
+
+EndFunction
 
 #EndRegion
 
@@ -1106,15 +1125,15 @@ EndProcedure
 // ExternalEvent. The handler returns a messages array per MCP spec.
 //
 // To add a new prompt:
-//   1. Add a prompt definition to RegisterMCPPrompts()
+//   1. Add a prompt definition to McpPromptsJson()
 //   2. Add a handler in ProcessPromptGet() dispatcher
 // ============================================================================
 
 #Region PromptDefinitions
 
 &AtClient
-Procedure RegisterMCPPrompts()
-	
+Function McpPromptsJson()
+
 	Prompts = New Array;
 	
 	// Example: a prompt template for analyzing 1C data
@@ -1142,10 +1161,10 @@ Procedure RegisterMCPPrompts()
 	PromptArgs.Add(Arg);
 	Prompt.Insert("arguments", PromptArgs);
 	Prompts.Add(Prompt);
-	
-	Component.Prompts = SerializeToJson(Prompts);
-	
-EndProcedure
+
+	Return SerializeToJson(Prompts);
+
+EndFunction
 
 #EndRegion
 
@@ -2020,22 +2039,52 @@ Procedure EnsureLoggingDefaults()
 	
 EndProcedure
 
+// Build the component configuration payload for the async ApplyConfig method.
+// IncludeMcp adds the tool/resource/prompt catalogs (only needed when starting
+// the MCP listener). All component config goes through this single async path
+// because async-only infobases forbid synchronous property assignment.
+&AtClient
+Function BuildConfigJson(IncludeMcp)
+
+	EnsureLoggingDefaults();
+
+	Cfg = New Structure;
+	Cfg.Insert("logging_enabled", EnableLogging = True);
+	Cfg.Insert("log_path", LogPath);
+	Cfg.Insert("timeout", 120);
+
+	If IncludeMcp Then
+		Cfg.Insert("tools_json", McpToolsJson());
+		Cfg.Insert("resources_json", McpResourcesJson());
+		Cfg.Insert("prompts_json", McpPromptsJson());
+	EndIf;
+
+	Return SerializeToJson(Cfg);
+
+EndFunction
+
 &AtClient
 Procedure ApplyLoggingSettings()
-	
+
 	EnsureLoggingDefaults();
-	
+
 	If Component = Undefined Then
 		Return;
 	EndIf;
-	
+
 	Try
-		Component.LoggingEnabled = EnableLogging;
-		Component.LogPath = LogPath;
+		Component.BeginCallingApplyConfig(
+			New NotifyDescription("ApplyLoggingSettingsEnd", ThisObject),
+			BuildConfigJson(False));
 	Except
 		ShowMessageBox(, "ConfigureLogging failed: " + ErrorDescription());
 	EndTry;
-	
+
+EndProcedure
+
+&AtClient
+Procedure ApplyLoggingSettingsEnd(ResultCall, ParametersCall, AdditionalParameters) Export
+	// Fire-and-forget: logging config applied component-side. Nothing to do.
 EndProcedure
 
 &AtClient
@@ -2048,12 +2097,14 @@ Procedure BuildCombinedStatusJSON(Callback)
 	
 	If Component <> Undefined Then
 		Context = New Structure("Callback,StatusPayload", Callback, StatusPayload);
+		// Async status read — the Status property is unreadable in async-only
+		// infobases, so we use the GetStatus method instead.
 		Try
-			StatusJson = Component.Status;
+			Component.BeginCallingGetStatus(
+				New NotifyDescription("BuildCombinedStatusGotStatus", ThisObject, Context));
 		Except
-			StatusJson = "";
+			BuildCombinedStatusEnd("", Context);
 		EndTry;
-		BuildCombinedStatusEnd(StatusJson, Context);
 	Else
 		StatusPayload.Insert("componentStatus", New Structure("running", False));
 		ExecuteNotifyProcessing(Callback, SerializeToJson(StatusPayload));
@@ -2062,8 +2113,19 @@ Procedure BuildCombinedStatusJSON(Callback)
 EndProcedure
 
 &AtClient
+Procedure BuildCombinedStatusGotStatus(ResultJson, ParametersCall, Context) Export
+
+	StatusJson = ResultJson;
+	If StatusJson = Undefined Then
+		StatusJson = "";
+	EndIf;
+	BuildCombinedStatusEnd(StatusJson, Context);
+
+EndProcedure
+
+&AtClient
 Procedure BuildCombinedStatusEnd(ResultCall, AdditionalParameters) Export
-	
+
 	AdditionalParameters.StatusPayload.Insert("componentStatus",
 		ParseJsonArgument(ResultCall, ResultCall));
 	ExecuteNotifyProcessing(AdditionalParameters.Callback, SerializeToJson(AdditionalParameters.StatusPayload));
@@ -2950,10 +3012,6 @@ Procedure RunRagSelfTestDeferred()
 		SelfTestAppend(Ctx, "DONE");
 		Return;
 	EndIf;
-	Try
-		SelfTestAppend(Ctx, "component version = " + Component.Version);
-	Except
-	EndTry;
 
 	// Build the stub-adapter test cases (catch any builder error instead of
 	// letting an idle-handler exception pop a blocking modal).
@@ -2965,6 +3023,35 @@ Procedure RunRagSelfTestDeferred()
 		SelfTestAppend(Ctx, "DONE");
 		Return;
 	EndTry;
+
+	// Async GetStatus probe — proves the async config/status methods work and
+	// that the loaded DLL is the new build (no synchronous property access).
+	Try
+		Component.BeginCallingGetStatus(
+			New NotifyDescription("SelfTest_StatusEnd", ThisObject, Ctx));
+	Except
+		SelfTestAppend(Ctx, "FAIL: GetStatus dispatch -> " + ErrorDescription());
+		SelfTestAppend(Ctx, "RESULT: FAIL (0/" + String(Ctx.Cases.Count()) + ")");
+		SelfTestAppend(Ctx, "DONE");
+	EndTry;
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_StatusEnd(StatusJson, ParametersCall, Ctx) Export
+
+	// Hard gate (not a counted case): if the async GetStatus method is missing
+	// or returns junk, the loaded component is wrong — abort before the cases.
+	Probe = "" + StatusJson;
+	StatusOk = StrFind(Probe, """version""") > 0 And StrFind(Probe, """running""") > 0;
+	If StatusOk Then
+		SelfTestAppend(Ctx, "OK: GetStatus (async) -> " + Left(Probe, 200));
+	Else
+		SelfTestAppend(Ctx, "FAIL: GetStatus (async) returned no status JSON -> " + Left(Probe, 200));
+		SelfTestAppend(Ctx, "RESULT: FAIL (0/" + String(Ctx.Cases.Count()) + ")");
+		SelfTestAppend(Ctx, "DONE");
+		Return;
+	EndIf;
 
 	// Offline model + device come from the launch config (no hardcoded paths).
 	// device "auto" = DirectML GPU with automatic CPU fallback.
@@ -3155,10 +3242,6 @@ Procedure RunEmbedPerfDeferred()
 		SelfTestAppend(EmbedCtx, "DONE");
 		Return;
 	EndIf;
-	Try
-		SelfTestAppend(EmbedCtx, "component version = " + Component.Version);
-	Except
-	EndTry;
 
 	Cfg = New Structure;
 	Cfg.Insert("model_path", SelfTestCfg.model);

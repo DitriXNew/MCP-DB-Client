@@ -583,44 +583,11 @@ HttpServerComponent::HttpServerComponent()
             logToFile("Log path set to: " + this->logPath);
         });
 
-    // Operational status of the native listener (read-only property).
+    // Operational status of the native listener (read-only property). Async
+    // callers use the GetStatus function (property reads are blocked in
+    // async-only infobases). Both share buildStatusJson().
     AddProperty(u"Status", u"Статус",
-        [&](VH var) {
-            json status;
-            status["running"] = running.load();
-            status["port"] = listenPort;
-            {
-                std::lock_guard<std::mutex> lock(pendingMutex);
-                status["pending_requests"] = (int)pendingRequests.size();
-            }
-            {
-                std::lock_guard<std::mutex> lock(toolsMutex);
-                json tools = json::parse(cachedToolsJson, nullptr, false);
-                status["tools_registered"] = tools.is_array() ? (int)tools.size() : 0;
-            }
-            {
-                std::lock_guard<std::mutex> lock(resourcesMutex);
-                json res = json::parse(cachedResourcesJson, nullptr, false);
-                status["resources_registered"] = res.is_array() ? (int)res.size() : 0;
-            }
-            {
-                std::lock_guard<std::mutex> lock(promptsMutex);
-                json pr = json::parse(cachedPromptsJson, nullptr, false);
-                status["prompts_registered"] = pr.is_array() ? (int)pr.size() : 0;
-            }
-            {
-                std::lock_guard<std::mutex> lock(sessionMutex);
-                status["active_sessions"] = (int)sessions.size();
-            }
-            {
-                std::lock_guard<std::mutex> lock(loggingMutex);
-                status["logging_enabled"] = loggingEnabled;
-                status["log_path"] = logPath;
-            }
-            status["auth_enabled"] = !authToken.empty();
-            status["version"] = VERSION_SEMVER;
-            var = MB2WCHAR(status.dump());
-        });
+        [&](VH var) { var = MB2WCHAR(this->buildStatusJson()); });
 
     // Timeout applied to in-flight forwarded requests (read/write property).
     AddProperty(u"Timeout", u"Таймаут",
@@ -682,6 +649,23 @@ HttpServerComponent::HttpServerComponent()
             this->result = MB2WCHAR(envelope);
         },
         {{1, std::u16string(u"{}")}});
+
+    // Async configuration sink. 1C cannot set component properties in
+    // async-only infobases (synchronous extension calls disabled), so the form
+    // funnels logging/timeout/tools/resources/prompts/auth through this single
+    // async procedure. Payload is a JSON object; every field is optional:
+    //   {"logging_enabled":bool,"log_path":str,"timeout":int,
+    //    "tools_json":str,"resources_json":str,"prompts_json":str,
+    //    "auth_token":str}
+    // The *_json fields are pre-serialized JSON arrays (forwarded verbatim to
+    // the existing register handlers).
+    AddProcedure(u"ApplyConfig", u"ПрименитьНастройки",
+        [&](VH cfg) { this->doApplyConfig((std::u16string)cfg); });
+
+    // Async status read (the Status property is unreadable in async-only
+    // infobases). Returns the same JSON as the Status property.
+    AddFunction(u"GetStatus", u"ПолучитьСтатус",
+        [&]() { this->result = MB2WCHAR(this->buildStatusJson()); });
 
     // Capture screenshots of all visible windows belonging to a process.
     // pid=0 means current process. Returns base64-encoded images.
@@ -1655,4 +1639,106 @@ void HttpServerComponent::doSetAuthToken(const std::u16string& token)
 
     authToken = utf8;
     logToFile("Auth token " + std::string(utf8.empty() ? "disabled" : "set"));
+}
+
+// Build the operational-status JSON. Shared by the Status property (sync) and
+// the GetStatus function (async); the only difference is who reads it.
+std::string HttpServerComponent::buildStatusJson()
+{
+    json status;
+    status["running"] = running.load();
+    status["port"] = listenPort;
+    {
+        std::lock_guard<std::mutex> lock(pendingMutex);
+        status["pending_requests"] = (int)pendingRequests.size();
+    }
+    {
+        std::lock_guard<std::mutex> lock(toolsMutex);
+        json tools = json::parse(cachedToolsJson, nullptr, false);
+        status["tools_registered"] = tools.is_array() ? (int)tools.size() : 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(resourcesMutex);
+        json res = json::parse(cachedResourcesJson, nullptr, false);
+        status["resources_registered"] = res.is_array() ? (int)res.size() : 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(promptsMutex);
+        json pr = json::parse(cachedPromptsJson, nullptr, false);
+        status["prompts_registered"] = pr.is_array() ? (int)pr.size() : 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(sessionMutex);
+        status["active_sessions"] = (int)sessions.size();
+    }
+    {
+        std::lock_guard<std::mutex> lock(loggingMutex);
+        status["logging_enabled"] = loggingEnabled;
+        status["log_path"] = logPath;
+    }
+    status["auth_enabled"] = !authToken.empty();
+    status["version"] = VERSION_SEMVER;
+    return status.dump();
+}
+
+// Apply a batch of configuration in one async call. Each field is optional;
+// only present keys are touched. This mirrors the per-property setters but is
+// reachable from async-only infobases where property assignment is forbidden.
+void HttpServerComponent::doApplyConfig(const std::u16string& jsonStr)
+{
+    std::string utf8 = WCHAR2MB(std::basic_string_view<WCHAR_T>(
+        reinterpret_cast<const WCHAR_T*>(jsonStr.data()), jsonStr.size()));
+
+    json cfg = json::parse(utf8, nullptr, false);
+    if (cfg.is_discarded() || !cfg.is_object()) {
+        AddError(u"ApplyConfig: expected a JSON object");
+        return;
+    }
+
+    if (cfg.contains("logging_enabled") && cfg["logging_enabled"].is_boolean()) {
+        bool enabled = cfg["logging_enabled"].get<bool>();
+        {
+            std::lock_guard<std::mutex> lock(loggingMutex);
+            loggingEnabled = enabled;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_loggingMutex);
+            g_loggingEnabled = enabled;
+        }
+        logToFile("Logging " + std::string(enabled ? "enabled" : "disabled"));
+    }
+
+    if (cfg.contains("log_path") && cfg["log_path"].is_string()) {
+        std::string p = cfg["log_path"].get<std::string>();
+        if (p.empty()) {
+            p = getDefaultLogPath();
+        }
+        {
+            std::lock_guard<std::mutex> lock(loggingMutex);
+            logPath = p;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_loggingMutex);
+            g_logPath = p;
+        }
+        logToFile("Log path set to: " + p);
+    }
+
+    if (cfg.contains("timeout") && cfg["timeout"].is_number_integer()) {
+        timeout = cfg["timeout"].get<int>();
+    }
+
+    // Pre-serialized JSON arrays — forward verbatim to the existing handlers.
+    if (cfg.contains("tools_json") && cfg["tools_json"].is_string()) {
+        doRegisterTools(MB2WCHAR(cfg["tools_json"].get<std::string>()));
+    }
+    if (cfg.contains("resources_json") && cfg["resources_json"].is_string()) {
+        doRegisterResources(MB2WCHAR(cfg["resources_json"].get<std::string>()));
+    }
+    if (cfg.contains("prompts_json") && cfg["prompts_json"].is_string()) {
+        doRegisterPrompts(MB2WCHAR(cfg["prompts_json"].get<std::string>()));
+    }
+    if (cfg.contains("auth_token") && cfg["auth_token"].is_string()) {
+        doSetAuthToken(MB2WCHAR(cfg["auth_token"].get<std::string>()));
+    }
 }
