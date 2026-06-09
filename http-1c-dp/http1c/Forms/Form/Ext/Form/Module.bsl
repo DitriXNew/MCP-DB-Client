@@ -66,6 +66,9 @@ Var SelfTestWaitTicks;
 &AtClient
 Var SelfTestCfg;
 
+&AtClient
+Var EmbedCtx;
+
 #EndRegion
 
 
@@ -143,7 +146,7 @@ EndProcedure
 // processor — the launcher (dev tooling) supplies them.
 &AtClient
 Function ParseLaunchConfig()
-	Cfg = New Structure("selftest, model, out, extcompt, perf", False, "", "", "", 0);
+	Cfg = New Structure("selftest, model, out, extcompt, perf, embedperf, batch, workers", False, "", "", "", 0, "", 500, 1);
 	LP = "";
 	Try
 		LP = String(LaunchParameter);
@@ -166,6 +169,24 @@ Function ParseLaunchConfig()
 				Cfg.perf = Number(Mid(Part, StrLen("perf=") + 1));
 			Except
 				Cfg.perf = 0;
+			EndTry;
+		ElsIf StrStartsWith(Part, "embedperf=") Then
+			// embedperf=<dir> → read every *.feature under <dir>, chunk by scenario,
+			// index with REAL embedding and time the whole embedding build.
+			Cfg.embedperf = Mid(Part, StrLen("embedperf=") + 1);
+		ElsIf StrStartsWith(Part, "batch=") Then
+			Try
+				Cfg.batch = Number(Mid(Part, StrLen("batch=") + 1));
+			Except
+				Cfg.batch = 500;
+			EndTry;
+		ElsIf StrStartsWith(Part, "workers=") Then
+			// workers=N → number of concurrent bulk-embedding sessions in the core
+			// (0 = auto ≈ ncpu/2; 1 = single worker; N = exactly N).
+			Try
+				Cfg.workers = Number(Mid(Part, StrLen("workers=") + 1));
+			Except
+				Cfg.workers = 1;
 			EndTry;
 		EndIf;
 	EndDo;
@@ -226,7 +247,7 @@ EndProcedure
 &AtClient
 Function BuildVersion()
 	// Bump on EVERY source change so the log proves a fresh .epf is running.
-	Return "selftest-build-19-perf-bench";
+	Return "selftest-build-22-multiworker";
 EndFunction
 
 &AtClient
@@ -273,7 +294,10 @@ Procedure OnOpenAttachEnd(Connected, AdditionalParameters) Export
 		LP = Lower(String(LaunchParameter));
 	Except
 	EndTry;
-	If StrFind(LP, "ragselftest") > 0 Then
+	If ValueIsFilled(SelfTestCfg.embedperf) Then
+		TraceLine("scheduling RunEmbedPerfDeferred");
+		AttachIdleHandler("RunEmbedPerfDeferred", 1, True);
+	ElsIf StrFind(LP, "ragselftest") > 0 Then
 		TraceLine("scheduling RunRagSelfTestDeferred");
 		AttachIdleHandler("RunRagSelfTestDeferred", 1, True);
 	EndIf;
@@ -2766,6 +2790,262 @@ Procedure SelfTest_Finalize(Ctx)
 			+ " passed, " + String(Ctx.Fail) + " failed)");
 	EndIf;
 	SelfTestAppend(Ctx, "DONE");
+
+EndProcedure
+
+// ============================================================================
+// Embedding benchmark over the whole .feature corpus (launch param
+// embedperf=<dir>). Reads every *.feature under <dir>, chunks BY SCENARIO,
+// indexes with REAL embedding in batches, polls until the worker has embedded
+// everything, and reports the total embedding-build time + throughput.
+// ============================================================================
+
+&AtClient
+Procedure RunEmbedPerfDeferred()
+
+	EmbedCtx = New Structure;
+	EmbedCtx.Insert("Log", New Array);
+	SelfTestAppend(EmbedCtx, "STARTED " + String(CurrentDate()) + " build=" + BuildVersion() + " EMBEDPERF");
+	If Component = Undefined Then
+		SelfTestAppend(EmbedCtx, "FAIL: component not attached on open");
+		SelfTestAppend(EmbedCtx, "DONE");
+		Return;
+	EndIf;
+	Try
+		SelfTestAppend(EmbedCtx, "component version = " + Component.Version);
+	Except
+	EndTry;
+
+	Cfg = New Structure;
+	Cfg.Insert("model_path", SelfTestCfg.model);
+	Cfg.Insert("device", "auto");
+	Cfg.Insert("embed_workers", SelfTestCfg.workers);
+	SelfTestAppend(EmbedCtx, "embed_workers requested = " + String(SelfTestCfg.workers)
+		+ " (0=auto~ncpu/2, 1=single, N=exact)");
+	EmbedCtx.Insert("TCfg", Ms());
+	Try
+		Component.BeginCallingRagDispatch(
+			New NotifyDescription("EmbedPerf_ConfigureEnd", ThisObject),
+			"configure", SerializeToJson(Cfg));
+	Except
+		SelfTestAppend(EmbedCtx, "FAIL: configure dispatch -> " + ErrorDescription());
+		SelfTestAppend(EmbedCtx, "DONE");
+	EndTry;
+
+EndProcedure
+
+&AtClient
+Procedure EmbedPerf_ConfigureEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+
+	SelfTestAppend(EmbedCtx, "configure (" + String(Ms() - EmbedCtx.TCfg) + " ms) -> " + Left(ResultJson, 240));
+	If StrFind(ResultJson, """ok"":true") = 0 Then
+		SelfTestAppend(EmbedCtx, "FAIL: configure -> " + Left(ResultJson, 240));
+		SelfTestAppend(EmbedCtx, "DONE");
+		Return;
+	EndIf;
+
+	TRead = Ms();
+	Segments = ReadFeatureScenarios(SelfTestCfg.embedperf);
+	EmbedCtx.Insert("Segments", Segments);
+	EmbedCtx.Insert("Total", Segments.Count());
+	EmbedCtx.Insert("Pos", 0);
+	EmbedCtx.Insert("Batch", ?(SelfTestCfg.batch > 0, SelfTestCfg.batch, 500));
+	EmbedCtx.Insert("Collection", "features");
+	EmbedCtx.Insert("Batches", 0);
+	SelfTestAppend(EmbedCtx, "scenarios=" + String(EmbedCtx.Total)
+		+ " read+chunk in " + String(Ms() - TRead) + " ms; batch=" + String(EmbedCtx.Batch));
+
+	If EmbedCtx.Total = 0 Then
+		SelfTestAppend(EmbedCtx, "FAIL: no scenarios found under " + SelfTestCfg.embedperf);
+		SelfTestAppend(EmbedCtx, "DONE");
+		Return;
+	EndIf;
+
+	EmbedCtx.Insert("T0", Ms());
+	EmbedPerf_SubmitNextBatch();
+
+EndProcedure
+
+&AtClient
+Procedure EmbedPerf_SubmitNextBatch()
+
+	If EmbedCtx.Pos >= EmbedCtx.Total Then
+		SelfTestAppend(EmbedCtx, "submitted all " + String(EmbedCtx.Total) + " segments in "
+			+ String(EmbedCtx.Batches) + " batches, accept took " + String(Ms() - EmbedCtx.T0)
+			+ " ms; embedding in background...");
+		SelfTestWaitTicks = 0;
+		AttachIdleHandler("EmbedPerf_Tick", 1, True);
+		Return;
+	EndIf;
+
+	Upper = EmbedCtx.Pos + EmbedCtx.Batch - 1;
+	If Upper > EmbedCtx.Total - 1 Then
+		Upper = EmbedCtx.Total - 1;
+	EndIf;
+	Slice = New Array;
+	For i = EmbedCtx.Pos To Upper Do
+		Slice.Add(EmbedCtx.Segments[i]);
+	EndDo;
+	EmbedCtx.Pos = Upper + 1;
+	EmbedCtx.Batches = EmbedCtx.Batches + 1;
+
+	Payload = SegmentsPayload(EmbedCtx.Collection, "features-batch-" + String(EmbedCtx.Batches),
+		"features batch " + String(EmbedCtx.Batches), Slice);
+	Try
+		Component.BeginCallingRagDispatch(
+			New NotifyDescription("EmbedPerf_BatchEnd", ThisObject),
+			"index_segments", Payload);
+	Except
+		SelfTestAppend(EmbedCtx, "FAIL: index_segments dispatch -> " + ErrorDescription());
+		SelfTestAppend(EmbedCtx, "DONE");
+	EndTry;
+
+EndProcedure
+
+&AtClient
+Procedure EmbedPerf_BatchEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+
+	If StrFind(ResultJson, """ok"":true") = 0 Then
+		SelfTestAppend(EmbedCtx, "batch " + String(EmbedCtx.Batches) + " -> " + Left(ResultJson, 200));
+	EndIf;
+	EmbedPerf_SubmitNextBatch();
+
+EndProcedure
+
+&AtClient
+Procedure EmbedPerf_Tick() Export
+
+	Component.BeginCallingRagDispatch(
+		New NotifyDescription("EmbedPerf_StatsEnd", ThisObject), "stats", "{}");
+
+EndProcedure
+
+&AtClient
+Procedure EmbedPerf_StatsEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+
+	SelfTestWaitTicks = SelfTestWaitTicks + 1;
+	Emb = 0;
+	Failed = 0;
+	Skipped = 0;
+	NSeg = 0;
+	VecStatus = "";
+	Try
+		R = New JSONReader;
+		R.SetString(ResultJson);
+		Obj = ReadJSON(R, True);
+		Coll = Obj["result"]["collections"][EmbedCtx.Collection];
+		If Coll <> Undefined Then
+			Emb = Coll["embedded"];
+			Failed = Coll["failed"];
+			Skipped = Coll["skipped"];
+			NSeg = Coll["n_segments"];
+			VecStatus = Coll["vector_status"];
+		EndIf;
+	Except
+	EndTry;
+
+	ShowEmbedProgress("Embedding features corpus", Emb, EmbedCtx.Total);
+
+	Done = (Emb + Failed + Skipped >= EmbedCtx.Total) Or (VecStatus = "ready");
+	If Not Done And SelfTestWaitTicks < 6000 Then
+		// Periodic progress line (~every 10s) so a long run is observable in the file.
+		If (SelfTestWaitTicks % 10) = 0 Then
+			SelfTestAppend(EmbedCtx, "  progress: " + String(Emb) + "/" + String(EmbedCtx.Total)
+				+ " embedded, " + String(Ms() - EmbedCtx.T0) + " ms elapsed");
+		EndIf;
+		AttachIdleHandler("EmbedPerf_Tick", 1, True);
+		Return;
+	EndIf;
+
+	Elapsed = Ms() - EmbedCtx.T0;
+	MsPerSeg = ?(Emb > 0, Elapsed / Emb, 0);
+	Rate = ?(Elapsed > 0, Int(Emb * 1000 / Elapsed), 0);
+	SelfTestAppend(EmbedCtx, "");
+	SelfTestAppend(EmbedCtx, "EMBEDDED " + String(Emb) + "/" + String(EmbedCtx.Total)
+		+ " (failed " + String(Failed) + ", skipped " + String(Skipped) + ", n_segments " + String(NSeg)
+		+ ") in " + String(Elapsed) + " ms");
+	SelfTestAppend(EmbedCtx, "throughput = " + String(Rate) + " seg/s, "
+		+ String(Int(MsPerSeg * 100) / 100) + " ms/seg; vector_status=" + VecStatus);
+	If Not Done Then
+		SelfTestAppend(EmbedCtx, "WARN: stopped on tick cap (still building)");
+	EndIf;
+	SelfTestAppend(EmbedCtx, "RESULT: EMBEDPERF DONE");
+	SelfTestAppend(EmbedCtx, "DONE");
+
+EndProcedure
+
+// Read every *.feature under Dir (recursive), chunk each BY SCENARIO, and return
+// an array of segment structures {text, embed_text, meta}. embed_text = the
+// scenario text so it is REALLY embedded (this is the whole point of the bench).
+&AtClient
+Function ReadFeatureScenarios(Dir)
+
+	Segments = New Array;
+	Files = New Array;
+	Try
+		Files = FindFiles(Dir, "*.feature", True);
+	Except
+	EndTry;
+	For Each F In Files Do
+		If F.IsDirectory() Then
+			Continue;
+		EndIf;
+		Text = "";
+		Try
+			TR = New TextReader(F.FullName, TextEncoding.UTF8);
+			Text = TR.Read();
+			TR.Close();
+		Except
+			Continue;
+		EndTry;
+		SplitFeatureIntoScenarios(Text, F.Name, Segments);
+	EndDo;
+	Return Segments;
+
+EndFunction
+
+&AtClient
+Function IsScenarioHeader(TrimmedLine)
+	Return StrStartsWith(TrimmedLine, "Сценарий:")
+		Or StrStartsWith(TrimmedLine, "Scenario:")
+		Or StrStartsWith(TrimmedLine, "Scenario Outline:")
+		Or StrStartsWith(TrimmedLine, "Структура сценария:");
+EndFunction
+
+&AtClient
+Procedure SplitFeatureIntoScenarios(Text, FileName, Segments)
+
+	Lines = StrSplit(Text, Chars.LF, True);
+	Current = New Array;
+	InScenario = False;
+	For Each Line In Lines Do
+		Clean = StrReplace(Line, Chars.CR, "");
+		If IsScenarioHeader(TrimL(Clean)) Then
+			If InScenario And Current.Count() > 0 Then
+				AddScenarioSegment(Segments, Current, FileName);
+			EndIf;
+			Current = New Array;
+			Current.Add(Clean);
+			InScenario = True;
+		ElsIf InScenario Then
+			Current.Add(Clean);
+		EndIf;
+	EndDo;
+	If InScenario And Current.Count() > 0 Then
+		AddScenarioSegment(Segments, Current, FileName);
+	EndIf;
+
+EndProcedure
+
+&AtClient
+Procedure AddScenarioSegment(Segments, CurrentLines, FileName)
+
+	Body = StrConcat(CurrentLines, Chars.LF);
+	Seg = New Structure;
+	Seg.Insert("text", Body);
+	Seg.Insert("embed_text", Body);
+	Seg.Insert("meta", New Structure("type, feature", "scenario", FileName));
+	Segments.Add(Seg);
 
 EndProcedure
 

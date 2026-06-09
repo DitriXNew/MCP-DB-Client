@@ -177,6 +177,12 @@ pub struct Config {
     pub max_seq_len: Option<u64>,
     pub device: String,
     pub intra_threads: Option<u64>,
+    /// Number of concurrent bulk-embedding worker threads / model sessions.
+    /// `None` ⇒ 1 (single worker, the default). `Some(0)` ⇒ auto (≈ ncpu/2).
+    /// `Some(n)` ⇒ exactly `n`. More workers embed jobs concurrently (each on its
+    /// own model session with a smaller intra-op pool) at the cost of one model
+    /// copy in RAM per worker. Only meaningful for the real (fastembed) embedder.
+    pub embed_workers: Option<u64>,
 }
 
 // ===========================================================================
@@ -211,10 +217,12 @@ enum WorkerMsg {
     Stop,
 }
 
-/// Owns the worker thread + its job sender. Lives inside [`Core`].
+/// Owns the worker thread(s) + the shared job sender. Lives inside [`Core`].
+/// With more than one handle, several threads drain the queue concurrently, each
+/// embedding on its own model session (see [`spawn_worker`]).
 struct Worker {
     tx: Sender<WorkerMsg>,
-    handle: Option<JoinHandle<()>>,
+    handles: Vec<JoinHandle<()>>,
 }
 
 // ===========================================================================
@@ -357,8 +365,10 @@ fn build_embedder(config: &Config) -> (Arc<dyn Embedder>, bool) {
         // `intra_threads` tunes the ONNX session pools (see `tunings`): query runs
         // on a small CPU pool, bulk gets the configured device + remaining cores.
         let built = match config.model_path.as_deref().filter(|p| !p.trim().is_empty()) {
-            Some(path) => FastEmbedder::new_local(path, device, config.intra_threads),
-            None => FastEmbedder::new_builtin(device, config.intra_threads),
+            Some(path) => {
+                FastEmbedder::new_local(path, device, config.intra_threads, config.embed_workers)
+            }
+            None => FastEmbedder::new_builtin(device, config.intra_threads, config.embed_workers),
         };
         match built {
             Ok(fe) => return (Arc::new(fe), true),
@@ -556,10 +566,18 @@ pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
     }
 }
 
-/// Lazily spawn the worker thread (if needed) and push a job onto its queue.
+/// Lazily spawn the worker (if needed) and push a job onto its queue. The number
+/// of worker threads matches the embedder's bulk concurrency (one thread per
+/// model session), so a multi-session embedder embeds jobs in parallel.
 fn enqueue_job(core: &mut Core, job: EmbedJob) {
     if core.worker.is_none() {
-        core.worker = Some(spawn_worker(core.progress_handle()));
+        let workers = core
+            .embedder
+            .as_ref()
+            .map(|e| e.bulk_concurrency())
+            .unwrap_or(1)
+            .max(1);
+        core.worker = Some(spawn_worker(core.progress_handle(), workers));
     }
     if let Some(w) = core.worker.as_ref() {
         // If the receiver is gone (worker stopped), the job is dropped and the
@@ -568,26 +586,44 @@ fn enqueue_job(core: &mut Core, job: EmbedJob) {
     }
 }
 
-/// Spawn the background worker thread. It pulls jobs, embeds OUTSIDE the lock,
-/// then applies finished vectors under a short write lock and updates the state
-/// machine / counters. `progress` is the shared condvar used to wake waiters.
-fn spawn_worker(progress: Arc<(Mutex<()>, Condvar)>) -> Worker {
+/// Spawn `workers` background worker threads sharing one job queue. Each pulls
+/// jobs, embeds OUTSIDE the index lock, then applies finished vectors under a
+/// short write lock. A single mpsc receiver is shared behind a `Mutex`: a thread
+/// holds it only for the brief dequeue (and while blocked on an empty queue —
+/// harmless, there is no work), releasing it before the expensive embed, so up
+/// to `workers` embeds run concurrently. `progress` wakes `wait_until_ready`.
+fn spawn_worker(progress: Arc<(Mutex<()>, Condvar)>, workers: usize) -> Worker {
     let (tx, rx): (Sender<WorkerMsg>, Receiver<WorkerMsg>) = mpsc::channel();
-    let handle = std::thread::Builder::new()
-        .name("rcore-ingest".to_string())
-        .spawn(move || worker_loop(rx, progress))
-        .expect("failed to spawn ingest worker");
-    Worker {
-        tx,
-        handle: Some(handle),
+    let shared_rx = Arc::new(Mutex::new(rx));
+    let mut handles = Vec::with_capacity(workers);
+    for i in 0..workers.max(1) {
+        let rx = Arc::clone(&shared_rx);
+        let progress = Arc::clone(&progress);
+        let handle = std::thread::Builder::new()
+            .name(format!("rcore-ingest-{i}"))
+            .spawn(move || worker_loop(rx, progress))
+            .expect("failed to spawn ingest worker");
+        handles.push(handle);
     }
+    Worker { tx, handles }
 }
 
-/// The worker thread body. Blocks on the queue; for each job it embeds outside
-/// the lock and then applies under a short lock. Exits on `Stop` or when the
+/// The worker thread body. Dequeues under the shared receiver lock (released
+/// before the heavy embed so siblings run concurrently), embeds outside the
+/// index lock, then applies under a short lock. Exits on `Stop` or when the
 /// sender is dropped.
-fn worker_loop(rx: Receiver<WorkerMsg>, progress: Arc<(Mutex<()>, Condvar)>) {
-    while let Ok(msg) = rx.recv() {
+fn worker_loop(rx: Arc<Mutex<Receiver<WorkerMsg>>>, progress: Arc<(Mutex<()>, Condvar)>) {
+    loop {
+        // Hold the receiver lock ONLY for the dequeue; a poisoned lock or a
+        // dropped/closed sender ends this thread.
+        let msg = match rx.lock() {
+            Ok(guard) => guard.recv(),
+            Err(_) => break,
+        };
+        let msg = match msg {
+            Ok(m) => m,
+            Err(_) => break, // sender dropped → drain done
+        };
         match msg {
             WorkerMsg::Stop => break,
             WorkerMsg::Job(job) => {
@@ -1825,9 +1861,12 @@ pub fn shutdown() {
         Ok(mut c) => c.worker.take(),
         Err(_) => return,
     };
-    if let Some(mut w) = worker {
-        let _ = w.tx.send(WorkerMsg::Stop);
-        if let Some(handle) = w.handle.take() {
+    if let Some(w) = worker {
+        // One Stop per thread so every worker dequeues exactly one and exits.
+        for _ in 0..w.handles.len() {
+            let _ = w.tx.send(WorkerMsg::Stop);
+        }
+        for handle in w.handles {
             let _ = handle.join();
         }
     }

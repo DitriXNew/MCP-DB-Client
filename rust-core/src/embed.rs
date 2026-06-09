@@ -30,6 +30,13 @@ pub trait Embedder: Send + Sync {
     /// Embed a single query string. Same scheme as [`Embedder::embed_passages`]
     /// so cosine similarity between a query and a passage is meaningful.
     fn embed_query(&self, text: &str) -> Vec<f32>;
+
+    /// How many bulk embeds this embedder can run concurrently — i.e. how many
+    /// independent model sessions it holds. The ingest worker spawns this many
+    /// threads. Defaults to 1 (the mock and any single-session embedder).
+    fn bulk_concurrency(&self) -> usize {
+        1
+    }
 }
 
 /// L2-normalize a vector in place. A zero (or non-finite) vector is left as an

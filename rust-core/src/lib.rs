@@ -209,6 +209,7 @@ fn dispatch(method: &str, payload_json: &str) -> String {
                     "max_seq_len": core.config.max_seq_len,
                     "device": core.config.device,
                     "intra_threads": core.config.intra_threads,
+                    "embed_workers": core.config.embed_workers,
                 }))
             }
             Err(e) => Envelope::err(codes::BAD_PAYLOAD, e),
@@ -459,6 +460,9 @@ fn parse_config(payload: &Value) -> Result<Config, String> {
         // meaningful under the `fastembed` feature; ignored by the mock build.
         device: opt_str(payload, "device").unwrap_or_else(|| "auto".to_string()),
         intra_threads: opt_u64(payload, "intra_threads"),
+        // Concurrent bulk-embedding workers/sessions. Absent ⇒ single worker
+        // (back-compat); 0 ⇒ auto (≈ ncpu/2); n ⇒ exactly n. (fastembed only.)
+        embed_workers: opt_u64(payload, "embed_workers"),
     })
 }
 

@@ -38,6 +38,7 @@
 //! contract passages ~0.86–0.90 and an unrelated sentence ~0.78). Omitting the
 //! prefixes measurably degrades ranking, so they are not optional.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use fastembed::{
@@ -96,22 +97,48 @@ impl Device {
 /// Thread budgets are sized so `bulk + query ≤ ncpu` (no oversubscription, which
 /// is what let reindex and queries fight over cores under the old all-cores-each
 /// default).
+#[derive(Clone, Copy)]
 struct SessionTuning {
     device: Device,
     threads: usize,
 }
 
-/// Derive (bulk, query) tunings from the configured device + optional intra-op
-/// override. Query gets `min(2, ncpu)` CPU threads; bulk gets the explicit
-/// override if given, else the remaining cores (`ncpu - query`, ≥1).
-fn tunings(device: Device, intra_threads: Option<u64>) -> (SessionTuning, SessionTuning) {
+/// Resolve the bulk worker/session count from the `embed_workers` config knob:
+/// `None` ⇒ 1 (single worker, the default); `Some(0)` ⇒ auto (≈ ncpu/2, ≥1);
+/// `Some(n)` ⇒ exactly `n` (≥1).
+fn worker_count(embed_workers: Option<u64>) -> usize {
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    match embed_workers {
+        None => 1,
+        Some(0) => (ncpu / 2).max(1),
+        Some(n) => (n as usize).max(1),
+    }
+}
+
+/// Derive (per-bulk-session, query) tunings for `m_workers` bulk sessions. Query
+/// gets `min(2, ncpu)` CPU threads. Each bulk session gets the explicit intra-op
+/// override if given, else the remaining cores split across the `m_workers`
+/// sessions (`(ncpu - query) / m`, ≥1) — so `m × per_session + query ≈ ncpu`,
+/// no oversubscription whether you run one big session or several small ones.
+fn tunings(
+    device: Device,
+    intra_threads: Option<u64>,
+    m_workers: usize,
+) -> (SessionTuning, SessionTuning) {
     let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
     let query_threads = ncpu.min(2).max(1);
+    let m = m_workers.max(1);
     let bulk_threads = match intra_threads {
         Some(t) if t >= 1 => (t as usize).min(ncpu),
-        _ => ncpu.saturating_sub(query_threads).max(1),
+        // Single worker: one big session, leave the query threads free. Multiple
+        // workers: spread ALL cores across the `m` sessions (≈ ncpu/m each) so the
+        // task-parallel pool actually saturates the CPU.
+        _ if m <= 1 => ncpu.saturating_sub(query_threads).max(1),
+        _ => (ncpu / m).max(1),
     };
     (
         SessionTuning {
@@ -128,13 +155,24 @@ fn tunings(device: Device, intra_threads: Option<u64>) -> (SessionTuning, Sessio
 /// Production embedder: two separately-loaded fastembed models behind their own
 /// mutexes (see the module docs for the two-instance rationale).
 pub struct FastEmbedder {
-    /// Model used for bulk passage embedding (the background-worker path). A long
-    /// reindex locks only this, leaving `query` free.
-    bulk: Mutex<TextEmbedding>,
+    /// One or more model sessions for bulk passage embedding (the background-
+    /// worker path). A long reindex locks only these, leaving `query` free. With
+    /// >1 session the ingest worker runs that many threads, each round-robined
+    /// onto its own session, so jobs embed concurrently (cost: one model copy in
+    /// RAM per session).
+    bulk_pool: Vec<Mutex<TextEmbedding>>,
+    /// Round-robin cursor selecting which bulk session a passage batch uses.
+    bulk_cursor: AtomicUsize,
     /// Model used for low-latency query embedding (the search path).
     query: Mutex<TextEmbedding>,
     /// Output dimensionality, probed once at construction. Bound to the index.
     dim: usize,
+    /// ONNX inference sub-batch size handed to fastembed. With `m` concurrent
+    /// bulk sessions, peak memory is `m × sub_batch × seq` — so we shrink it to
+    /// `≈256/m` (the fastembed default is 256) to keep total concurrent memory at
+    /// roughly the single-session level. Otherwise N sessions each padding a
+    /// 256-row tensor of long passages exhausts RAM and ort errors out.
+    embed_batch: usize,
 }
 
 impl FastEmbedder {
@@ -152,22 +190,38 @@ impl FastEmbedder {
     /// Returns a descriptive error string (never panics) so the FFI boundary can
     /// surface a clean structural error if model load fails (e.g. offline with a
     /// cold cache, or onnxruntime not loadable).
-    pub fn new_builtin(device: Device, intra_threads: Option<u64>) -> Result<Self, String> {
-        // Two independent loads of the SAME model (see module docs: this is what
-        // decouples bulk-reindex latency from query latency). The two sessions get
-        // DIFFERENT tunings (bulk: configured device + most cores; query: CPU +
-        // few threads) — see `tunings`.
-        let (bulk_t, query_t) = tunings(device, intra_threads);
-        let bulk = Self::load_builtin(bulk_t).map_err(|e| format!("load bulk model: {e}"))?;
+    pub fn new_builtin(
+        device: Device,
+        intra_threads: Option<u64>,
+        embed_workers: Option<u64>,
+    ) -> Result<Self, String> {
+        // `m` independent bulk sessions + one query session (see module docs).
+        // The bulk sessions get the configured device + a per-session intra-op
+        // pool; query gets CPU + a few threads — see `tunings`.
+        let m = worker_count(embed_workers);
+        // Multi-worker is a CPU task-parallel strategy: DirectML is a single
+        // device and N concurrent sessions on it error out (and a GPU already
+        // parallelizes within ONE session). So force CPU for the bulk pool when
+        // running more than one worker; a single worker keeps the requested device.
+        let bulk_device = if m > 1 { Device::Cpu } else { device };
+        let (bulk_t, query_t) = tunings(bulk_device, intra_threads, m);
+        let mut bulk_pool = Vec::with_capacity(m);
+        for _ in 0..m {
+            bulk_pool.push(Mutex::new(
+                Self::load_builtin(bulk_t).map_err(|e| format!("load bulk model: {e}"))?,
+            ));
+        }
         let query = Self::load_builtin(query_t).map_err(|e| format!("load query model: {e}"))?;
 
         let mut me = FastEmbedder {
-            bulk: Mutex::new(bulk),
+            bulk_pool,
+            bulk_cursor: AtomicUsize::new(0),
             query: Mutex::new(query),
             // Provisional; replaced by the probe below. The built-in e5-small is
             // 384-dim, but we probe rather than hard-code so the value is always
             // truthful even if the model file changes.
             dim: 0,
+            embed_batch: (256 / m).max(8),
         };
         me.dim = me.probe_dim()?;
         Ok(me)
@@ -190,17 +244,32 @@ impl FastEmbedder {
     /// (see [`Device`]). NOTE: this path is implemented but, unlike
     /// `new_builtin`, is **not exercised by the integration test** (it needs a
     /// pre-staged model directory). It is here so production can run offline.
-    pub fn new_local(model_path: &str, device: Device, intra_threads: Option<u64>) -> Result<Self, String> {
-        let (bulk_t, query_t) = tunings(device, intra_threads);
-        let bulk =
-            Self::load_local(model_path, bulk_t).map_err(|e| format!("load bulk model: {e}"))?;
+    pub fn new_local(
+        model_path: &str,
+        device: Device,
+        intra_threads: Option<u64>,
+        embed_workers: Option<u64>,
+    ) -> Result<Self, String> {
+        let m = worker_count(embed_workers);
+        // Multi-worker = CPU task-parallel strategy (see `new_builtin`): N
+        // concurrent DirectML sessions error out, so force CPU when m > 1.
+        let bulk_device = if m > 1 { Device::Cpu } else { device };
+        let (bulk_t, query_t) = tunings(bulk_device, intra_threads, m);
+        let mut bulk_pool = Vec::with_capacity(m);
+        for _ in 0..m {
+            bulk_pool.push(Mutex::new(
+                Self::load_local(model_path, bulk_t).map_err(|e| format!("load bulk model: {e}"))?,
+            ));
+        }
         let query =
             Self::load_local(model_path, query_t).map_err(|e| format!("load query model: {e}"))?;
 
         let mut me = FastEmbedder {
-            bulk: Mutex::new(bulk),
+            bulk_pool,
+            bulk_cursor: AtomicUsize::new(0),
             query: Mutex::new(query),
             dim: 0,
+            embed_batch: (256 / m).max(8),
         };
         me.dim = me.probe_dim()?;
         Ok(me)
@@ -260,8 +329,7 @@ impl FastEmbedder {
     /// passage and measuring the vector length. Done once at construction so
     /// `dim()` is O(1) and always truthful for whatever model was loaded.
     fn probe_dim(&self) -> Result<usize, String> {
-        let mut m = self
-            .bulk
+        let mut m = self.bulk_pool[0]
             .lock()
             .map_err(|_| "embedder mutex poisoned".to_string())?;
         let out = m
@@ -278,16 +346,30 @@ impl FastEmbedder {
     /// treats all-zero vectors as "no signal" (skipped, never indexed, never a
     /// hit), so a transient embed failure degrades gracefully instead of
     /// panicking across the FFI boundary.
-    fn run(model: &Mutex<TextEmbedding>, prefix: &str, texts: &[String], dim: usize) -> Vec<Vec<f32>> {
+    fn run(
+        model: &Mutex<TextEmbedding>,
+        prefix: &str,
+        texts: &[String],
+        dim: usize,
+        batch: usize,
+    ) -> Vec<Vec<f32>> {
         let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
         let mut guard = match model.lock() {
             Ok(g) => g,
-            Err(_) => return vec![vec![0.0; dim]; texts.len()],
+            Err(_) => {
+                eprintln!("rcore: embed skipped — model mutex poisoned");
+                return vec![vec![0.0; dim]; texts.len()];
+            }
         };
-        // `None` batch_size lets fastembed use its default (256).
-        match guard.embed(prefixed, None) {
+        // Explicit sub-batch keeps concurrent-session peak memory bounded.
+        match guard.embed(prefixed, Some(batch)) {
             Ok(vecs) => vecs,
-            Err(_) => vec![vec![0.0; dim]; texts.len()],
+            Err(e) => {
+                // Surface the underlying ort/tokenizer error (was silently
+                // swallowed). All-zero vectors still signal "no signal" downstream.
+                eprintln!("rcore: embed failed for {} texts: {e}", texts.len());
+                vec![vec![0.0; dim]; texts.len()]
+            }
         }
     }
 }
@@ -298,16 +380,76 @@ impl Embedder for FastEmbedder {
     }
 
     fn embed_passages(&self, texts: &[String]) -> Vec<Vec<f32>> {
-        // Worker path: lock `bulk` only — never contends with queries.
-        Self::run(&self.bulk, PASSAGE_PREFIX, texts, self.dim)
+        // Worker path: never contends with queries. Round-robin across the bulk
+        // session pool so the N ingest-worker threads each land on a distinct
+        // session (N consecutive cursor values ⇒ N distinct sessions), giving
+        // true concurrent embedding without ever touching the `query` session.
+        let n = self.bulk_pool.len();
+        let idx = if n <= 1 {
+            0
+        } else {
+            self.bulk_cursor.fetch_add(1, Ordering::Relaxed) % n
+        };
+        Self::run(&self.bulk_pool[idx], PASSAGE_PREFIX, texts, self.dim, self.embed_batch)
+    }
+
+    fn bulk_concurrency(&self) -> usize {
+        self.bulk_pool.len()
     }
 
     fn embed_query(&self, text: &str) -> Vec<f32> {
         // Query path: lock `query` only — never blocked by a bulk reindex.
         let one = [text.to_string()];
-        Self::run(&self.query, QUERY_PREFIX, &one, self.dim)
+        Self::run(&self.query, QUERY_PREFIX, &one, self.dim, self.embed_batch)
             .into_iter()
             .next()
             .unwrap_or_else(|| vec![0.0; self.dim])
+    }
+}
+
+#[cfg(test)]
+mod conc_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Reproduce concurrent multi-session embedding to surface any error (the 1C
+    /// run failed 7500/7561 under 6 workers). Forces CPU to isolate from DirectML.
+    /// Needs the offline model staged at target/offline-model-mini (skips if
+    /// absent). Run:
+    ///   cargo test --release --features fastembed concurrent_multi_session -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn concurrent_multi_session_embed() {
+        let path = "target/offline-model-mini";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("model not staged at {path}; skipping");
+            return;
+        }
+        let workers = 6usize;
+        let emb = Arc::new(
+            FastEmbedder::new_local(path, Device::Cpu, None, Some(workers as u64))
+                .expect("load model pool"),
+        );
+        eprintln!("bulk_concurrency = {}", emb.bulk_concurrency());
+        let mut handles = vec![];
+        for t in 0..workers {
+            let e = Arc::clone(&emb);
+            handles.push(std::thread::spawn(move || {
+                // Long passages (~like real Gherkin scenarios) so this exercises
+                // the concurrent-session PEAK-MEMORY path, not just short strings.
+                let long = "Когда я открываю список документов и проверяю фильтр по компании \
+                    Тогда в списке только документы выбранной компании и колонки заполнены "
+                    .repeat(8);
+                let texts: Vec<String> = (0..500)
+                    .map(|i| format!("scenario {t} segment {i} unique{i} {long}"))
+                    .collect();
+                let v = e.embed_passages(&texts);
+                let zeros = v.iter().filter(|x| x.iter().all(|&f| f == 0.0)).count();
+                eprintln!("thread {t}: {} vecs, {} all-zero (failed)", v.len(), zeros);
+                zeros
+            }));
+        }
+        let total_zeros: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        eprintln!("TOTAL all-zero (failed) = {total_zeros} / {}", workers * 500);
     }
 }
