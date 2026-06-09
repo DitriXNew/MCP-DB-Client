@@ -143,7 +143,7 @@ EndProcedure
 // processor — the launcher (dev tooling) supplies them.
 &AtClient
 Function ParseLaunchConfig()
-	Cfg = New Structure("selftest, model, out, extcompt", False, "", "", "");
+	Cfg = New Structure("selftest, model, out, extcompt, perf", False, "", "", "", 0);
 	LP = "";
 	Try
 		LP = String(LaunchParameter);
@@ -159,6 +159,14 @@ Function ParseLaunchConfig()
 			Cfg.out = Mid(Part, StrLen("out=") + 1);
 		ElsIf StrStartsWith(Part, "extcompt=") Then
 			Cfg.extcompt = Mid(Part, StrLen("extcompt=") + 1);
+		ElsIf StrStartsWith(Part, "perf=") Then
+			// perf=N → run the keyword-latency benchmark over an N-segment synthetic
+			// corpus instead of the normal assert contour.
+			Try
+				Cfg.perf = Number(Mid(Part, StrLen("perf=") + 1));
+			Except
+				Cfg.perf = 0;
+			EndTry;
 		EndIf;
 	EndDo;
 	Return Cfg;
@@ -218,7 +226,7 @@ EndProcedure
 &AtClient
 Function BuildVersion()
 	// Bump on EVERY source change so the log proves a fresh .epf is running.
-	Return "selftest-build-18-perf-appendlog";
+	Return "selftest-build-19-perf-bench";
 EndFunction
 
 &AtClient
@@ -2769,6 +2777,23 @@ EndProcedure
 Function SelfTestCases()
 	Cases = New Array;
 
+	// Perf mode (launch param perf=N): benchmark keyword-search latency over an
+	// N-segment synthetic corpus. The first case indexes the corpus then queries;
+	// the rest re-query the SAME collection (indexMethod="") so each reports a clean
+	// per-query latency (the "search (X ms)" line) without re-indexing. embed_text
+	// is blank → segments are skipped by the embedder, isolating the keyword path.
+	If SelfTestCfg.perf > 0 Then
+		N = SelfTestCfg.perf;
+		Cases.Add(SelfTestCase("PERF index+query N=" + String(N), "perf", "index_segments",
+			PerfSegmentsPayload("perf", "perf-corpus", N), "search",
+			SearchJson("alpha", "perf", "keyword", 10), "alpha", 0));
+		For i = 1 To 5 Do
+			Cases.Add(SelfTestCase("PERF query #" + String(i + 1) + " N=" + String(N), "perf", "", "", "search",
+				SearchJson("alpha", "perf", "keyword", 10), "alpha", 0));
+		EndDo;
+		Return Cases;
+	EndIf;
+
 	// 1. QA step catalog (anti-hallucination source): canonical phrases + descriptions.
 	Cases.Add(SelfTestCase("QA step catalog", "qa_steps", "index_segments",
 		StepCatalogPayload(), "search",
@@ -2827,6 +2852,22 @@ Function SearchJson(Query, Collection, Mode, K)
 	Sp.Insert("k", K);
 	Sp.Insert("include_text", True);
 	Return SerializeToJson(Sp);
+EndFunction
+
+&AtClient
+Function PerfSegmentsPayload(Collection, DocId, Count)
+	// N synthetic segments. Every segment contains the common token "alpha" (so a
+	// keyword query for it matches ALL N — the worst case for the old build-a-full-
+	// Hit-per-match-then-full-sort path) plus a unique token so segments differ.
+	// embed_text="" marks each skip → no embedding, isolating the keyword channel.
+	Segments = New Array;
+	For i = 1 To Count Do
+		Seg = New Structure;
+		Seg.Insert("text", "alpha beta gamma segment number " + String(i) + " unique" + String(i));
+		Seg.Insert("embed_text", "");
+		Segments.Add(Seg);
+	EndDo;
+	Return SegmentsPayload(Collection, DocId, "perf corpus", Segments);
 EndFunction
 
 &AtClient

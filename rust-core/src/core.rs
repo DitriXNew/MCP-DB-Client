@@ -1889,6 +1889,79 @@ mod tests {
         accept_index(&mut c, req);
     }
 
+    /// Keyword-search latency vs corpus size. `#[ignore]`d (not a correctness
+    /// test) — run explicitly:
+    ///   cargo test --release perf_keyword_scaling -- --ignored --nocapture
+    ///
+    /// Uses only `accept_index`/`search` (signatures common to the pre-perf code)
+    /// so the SAME test runs in a worktree at the old commit for a true
+    /// before/after. `embed_text=""` marks every segment skip → no embedding, so
+    /// this isolates the keyword path (token-multiset cache + top-k selection +
+    /// deferred Hit materialization). The common term `"alpha"` matches ALL N
+    /// segments — the worst case for the old "build a full Hit per match, then
+    /// full-sort" path.
+    #[test]
+    #[ignore]
+    fn perf_keyword_scaling() {
+        use std::time::Instant;
+        let _g = test_lock();
+        for &n in &[2_000usize, 10_000, 50_000] {
+            {
+                let mut c = CORE.write().unwrap();
+                c.reset();
+                c.embedder = Some(Arc::new(MockEmbedder::new()));
+                let segments: Vec<SegmentInput> = (0..n)
+                    .map(|i| SegmentInput {
+                        text: format!("alpha beta gamma segment number {i} unique{i}"),
+                        embed_text: Some(String::new()),
+                        line_start: None,
+                        line_end: None,
+                        meta: json!({}),
+                    })
+                    .collect();
+                accept_index(
+                    &mut c,
+                    IndexRequest {
+                        collection: "perf".to_string(),
+                        doc_id: "d".to_string(),
+                        name: "d".to_string(),
+                        meta: json!({}),
+                        segments,
+                    },
+                );
+            }
+            let c = CORE.read().unwrap();
+            let q = 50u32;
+            let t0 = Instant::now();
+            let mut hits = 0usize;
+            for _ in 0..q {
+                let res = search(
+                    &c,
+                    SearchRequest {
+                        query: "alpha".to_string(),
+                        collection: Some("perf".to_string()),
+                        mode: SearchMode::Keyword,
+                        k: 10,
+                        min_score: None,
+                        max_per_doc: None,
+                        include_text: true,
+                        filter: MetaFilter::default(),
+                    },
+                );
+                hits += res.hits.len();
+            }
+            let el = t0.elapsed();
+            println!(
+                "PERF keyword N={:>6} q={} total={:>11.3?} avg={:>9.3?}/q hits/q={}",
+                n,
+                q,
+                el,
+                el / q,
+                hits / q as usize
+            );
+        }
+    }
+
     #[test]
     fn configure_sets_dim() {
         let _g = test_lock();

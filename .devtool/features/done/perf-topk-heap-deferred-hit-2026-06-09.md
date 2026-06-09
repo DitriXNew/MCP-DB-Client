@@ -26,7 +26,15 @@ order: "a0"
 - [x] `Hit` строится только для `k` выживших — `finalize` → `make_hit`
 - [x] `include_text == false` → клонируется только `PREVIEW_CHARS`-префикс, не весь текст
 - [x] Учтён `max_per_doc` — ранжируем лёгкие refs и применяем per-doc cap
-- [~] Микробенч — отдельный bench не добавлял; поведение покрыто тестами (`top_k_selection_is_descending_and_bounded`, `include_text_false_caps_hit_text_to_preview`); 85/85 `cargo test` зелёные
+- [x] Бенч до/после измерен (keyword, all-matching корпус — худший случай для старого full-Hit+full-sort пути):
+
+| Корпус | Rust before | Rust after | 1С before (e2e) | 1С after (e2e) |
+|---|---|---|---|---|
+| 2 000  | 4.40 мс/q  | 0.17 мс/q | — | — |
+| 10 000 | 21.6 мс/q  | 0.86 мс/q | ~27 мс/q | ~2 мс/q |
+| 50 000 | 104.5 мс/q | 11.2 мс/q | — | — |
+
+Rust-микробенч: `cargo test --release perf_keyword_scaling -- --ignored --nocapture` (тест `perf_keyword_scaling`; before — тот же тест в worktree на пред-perf коммите `afd6216`). End-to-end через 1С: launch `ragselftest;perf=10000;...` против старого ядра в ExtCompT vs нового `rcore.dll`. ~25× на чистом ядре, ~13× e2e (FFI/JSON/1С round-trip даёт общий ~1–2 мс пол, сжимающий отношение).
 
 ## Done 2026-06-09
 Весь ранкинг-путь `search` переписан на лёгкий `Scored<'a>`: каналы возвращают refs без сорта, `rrf_fuse` сортирует только refs, единственная материализация `Hit` — в `finalize` для ≤k выживших. Убраны `make_hit`-на-каждый-сегмент, полный `sort_desc` набора и безусловный clone текста. Заодно (бакет из perf-ann) `dot` переписан на 8-lane chunked-аккумулятор (авто-векторизация LLVM). `apply_job` **перемещает** вектор из job'а (`mem::take`) вместо clone под write-локом.
