@@ -63,6 +63,21 @@ Var SelfTestCtx;
 &AtClient
 Var SelfTestWaitTicks;
 
+&AtClient
+Var RawFileList;
+
+&AtClient
+Var RawFileIndex;
+
+&AtClient
+Var ScenAll;
+
+&AtClient
+Var ScenSkip;
+
+&AtClient
+Var ScenBatchNo;
+
 #EndRegion
 
 
@@ -169,7 +184,12 @@ EndProcedure
 &AtClient
 Function BuildVersion()
 	// Bump on EVERY source change so the log proves a fresh .epf is running.
-	Return "selftest-build-4-lite-bundle";
+	Return "selftest-build-12-cap100-filters";
+EndFunction
+
+&AtClient
+Function Ms()
+	Return CurrentUniversalDateInMilliseconds();
 EndFunction
 
 &AtClient
@@ -2194,7 +2214,10 @@ Procedure EnsureRagDefaults()
 		Port = 8888;
 	EndIf;
 	If Not ValueIsFilled(RagModel) Then
-		RagModel = "multilingual-e5-small";
+		// Offline MiniLM-L6 dir for fast tests (has a ":" so treated as model_path).
+		// e5-small int8 stays available at ...\offline-model if multilingual quality
+		// is needed.
+		RagModel = "D:\GitHub\MCP-DB-Client\rust-core\target\offline-model-mini";
 	EndIf;
 	If Not ValueIsFilled(RagDevice) Then
 		RagDevice = "auto";
@@ -2248,6 +2271,46 @@ EndProcedure
 Procedure RagIndexDemoEnd(ResultJson, ParametersCall, AdditionalParameters) Export
 
 	ShowRagResult("index_segments", ResultJson);
+	// Poll embedding progress and show a progress indicator in the form until the
+	// background worker has embedded every segment (vector_status = ready).
+	AttachIdleHandler("RagIndexPollTick", 1, True);
+
+EndProcedure
+
+&AtClient
+Procedure RagIndexPollTick() Export
+
+	RagCall("stats", "{}", "RagIndexPollEnd");
+
+EndProcedure
+
+&AtClient
+Procedure RagIndexPollEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+
+	Emb = 0;
+	Total = 0;
+	VecStatus = "";
+	Try
+		R = New JSONReader;
+		R.SetString(ResultJson);
+		Obj = ReadJSON(R, True);
+		Coll = Obj["result"]["collections"][RagCollection];
+		If Coll <> Undefined Then
+			Emb = Coll["embedded"];
+			Total = Coll["n_segments"];
+			VecStatus = Coll["vector_status"];
+		EndIf;
+	Except
+	EndTry;
+
+	ShowEmbedProgress("Эмбеддинг векторов: " + RagCollection, Emb, Total);
+
+	If VecStatus <> "ready" Then
+		AttachIdleHandler("RagIndexPollTick", 1, True);
+	Else
+		Status(); // clear the progress indicator
+		RagOutput = "Готово: эмбеддинг " + String(Emb) + " из " + String(Total) + " (100%)";
+	EndIf;
 
 EndProcedure
 
@@ -2334,6 +2397,18 @@ Procedure RagCall(Method, PayloadJson, CallbackName)
 	Except
 		ShowMessageBox(, "RagDispatch('" + Method + "') failed: " + ErrorDescription());
 	EndTry;
+
+EndProcedure
+
+&AtClient
+Procedure ShowEmbedProgress(Stage, Emb, Total)
+
+	Pct = ?(Total > 0, Int(Emb * 100 / Total), 0);
+	Descr = String(Emb) + " из " + String(Total) + " (" + String(Pct) + "%)";
+	// Native 1C progress indicator: message + 0..100 bar + explanatory text.
+	Status(Stage, Pct, Descr);
+	// Also mirror into the visible output field on the form.
+	RagOutput = Stage + ": " + Descr;
 
 EndProcedure
 
@@ -2477,8 +2552,11 @@ Procedure RunRagSelfTestDeferred()
 	// new_local with no network fetch. On the lite component this returns
 	// rag_not_installed and the chain stops at SelfTest_ConfigureEnd.
 	Cfg = New Structure;
-	Cfg.Insert("model_path", "D:\GitHub\MCP-DB-Client\rust-core\target\offline-model");
-	Cfg.Insert("device", "cpu");
+	Cfg.Insert("model_path", "D:\GitHub\MCP-DB-Client\rust-core\target\offline-model-mini");
+	// GPU (DirectML) with automatic CPU fallback (per user: will be tested on a
+	// GPU box). On a CPU-only machine ort silently falls back to CPU.
+	Cfg.Insert("device", "auto");
+	Ctx.Insert("TCfg", Ms());
 	Component.BeginCallingRagDispatch(
 		New NotifyDescription("SelfTest_ConfigureEnd", ThisObject, Ctx),
 		"configure", SerializeToJson(Cfg));
@@ -2488,6 +2566,7 @@ EndProcedure
 &AtClient
 Procedure SelfTest_ConfigureEnd(ResultJson, ParametersCall, Ctx) Export
 
+	SelfTestAppend(Ctx, "configure (model load) took " + String(Ms() - Ctx.TCfg) + " ms");
 	SelfTestAppend(Ctx, "configure -> " + Left(ResultJson, 300));
 	If StrFind(ResultJson, """ok"":true") = 0 Then
 		SelfTestAppend(Ctx, "DONE");
@@ -2509,6 +2588,7 @@ Procedure SelfTest_IndexEnd(ResultJson, ParametersCall, Ctx) Export
 	// Poll stats until the background embedder finishes (vector_status "ready"),
 	// then search — so the demo shows true semantic (cosine) ranking, not the
 	// lexical fallback that "partial":true returns while vectors are still building.
+	Ctx.Insert("TEmbed", Ms());
 	SelfTestCtx = Ctx;
 	SelfTestWaitTicks = 0;
 	AttachIdleHandler("SelfTest_SearchTick", 5, True);
@@ -2537,7 +2617,8 @@ Procedure SelfTest_StatsEnd(ResultJson, ParametersCall, Ctx) Export
 		Return;
 	EndIf;
 
-	SelfTestAppend(Ctx, "vectors " + ?(Ready, "ready", "wait-timeout") + " after "
+	SelfTestAppend(Ctx, "steps embed (300 segments) took " + String(Ms() - Ctx.TEmbed)
+		+ " ms; vectors " + ?(Ready, "ready", "wait-timeout") + " after "
 		+ String(SelfTestWaitTicks) + " ticks; searching");
 	Sp = New Structure;
 	Sp.Insert("query", "удаление пользователя");
@@ -2545,6 +2626,7 @@ Procedure SelfTest_StatsEnd(ResultJson, ParametersCall, Ctx) Export
 	Sp.Insert("mode", "hybrid");
 	Sp.Insert("k", 5);
 	Sp.Insert("include_text", True);
+	Ctx.Insert("TSearch", Ms());
 	Component.BeginCallingRagDispatch(
 		New NotifyDescription("SelfTest_SearchEnd", ThisObject, Ctx),
 		"search", SerializeToJson(Sp));
@@ -2554,6 +2636,7 @@ EndProcedure
 &AtClient
 Procedure SelfTest_SearchEnd(ResultJson, ParametersCall, Ctx) Export
 
+	SelfTestAppend(Ctx, "steps search latency = " + String(Ms() - Ctx.TSearch) + " ms");
 	SelfTestAppend(Ctx, "steps search -> " + ResultJson);
 
 	// Phase 2: index the real IRP Gherkin features (scenario titles) as a second
@@ -2570,6 +2653,7 @@ EndProcedure
 Procedure SelfTest_FeatIndexEnd(ResultJson, ParametersCall, Ctx) Export
 
 	SelfTestAppend(Ctx, "features index_segments -> " + Left(ResultJson, 200));
+	Ctx.Insert("TEmbedF", Ms());
 	SelfTestCtx = Ctx;
 	SelfTestWaitTicks = 0;
 	AttachIdleHandler("SelfTest_FeatTick", 5, True);
@@ -2597,7 +2681,8 @@ Procedure SelfTest_FeatStatsEnd(ResultJson, ParametersCall, Ctx) Export
 		Return;
 	EndIf;
 
-	SelfTestAppend(Ctx, "feature vectors " + ?(Building, "wait-timeout", "ready")
+	SelfTestAppend(Ctx, "features embed (400 titles) took " + String(Ms() - Ctx.TEmbedF)
+		+ " ms; vectors " + ?(Building, "wait-timeout", "ready")
 		+ " after " + String(SelfTestWaitTicks) + " ticks; searching");
 	Sp = New Structure;
 	Sp.Insert("query", "filter documents by company");
@@ -2605,6 +2690,7 @@ Procedure SelfTest_FeatStatsEnd(ResultJson, ParametersCall, Ctx) Export
 	Sp.Insert("mode", "hybrid");
 	Sp.Insert("k", 5);
 	Sp.Insert("include_text", True);
+	Ctx.Insert("TSearchF", Ms());
 	Component.BeginCallingRagDispatch(
 		New NotifyDescription("SelfTest_FeatSearchEnd", ThisObject, Ctx),
 		"search", SerializeToJson(Sp));
@@ -2614,7 +2700,151 @@ EndProcedure
 &AtClient
 Procedure SelfTest_FeatSearchEnd(ResultJson, ParametersCall, Ctx) Export
 
+	SelfTestAppend(Ctx, "features (titles) search latency = " + String(Ms() - Ctx.TSearchF) + " ms");
 	SelfTestAppend(Ctx, "features search -> " + ResultJson);
+
+	// Phase 3: segment the WHOLE features folder BY SCENARIO (one scenario = one
+	// segment, verbatim text + meta) and semantic-search it. Sent as a SINGLE
+	// index_segments batch so fastembed embeds it with internal rayon + ONNX
+	// parallelism — far faster than 340 tiny per-file index_raw jobs.
+	SelfTest_ScenStart(Ctx);
+
+EndProcedure
+
+&AtClient
+Function ScenBatchJson(Collection, DocId, Slice)
+	Payload = New Structure;
+	Payload.Insert("collection", Collection);
+	Payload.Insert("doc_id", DocId);
+	Payload.Insert("name", "IRP scenarios");
+	Payload.Insert("segments", Slice);
+	W = New JSONWriter;
+	W.SetString();
+	WriteJSON(W, Payload);
+	Return W.Close();
+EndFunction
+
+&AtClient
+Procedure SelfTest_ScenStart(Ctx)
+
+	// Whole folder, NO cap. Submit in batches of 500 so (a) the worker reports
+	// incremental progress (embedded climbs per batch -> percent), and (b) peak
+	// memory stays bounded (one giant batch padded ONNX tensors to ~10 GB).
+	ScenAll = BuildAllScenarioSegments(100);
+	ScenSkip = 0;
+	ScenBatchNo = 0;
+	Ctx.Insert("ScenTotal", ScenAll.Count());
+	Ctx.Insert("TScenIndex", Ms());
+	SelfTestAppend(Ctx, "PHASE 3: " + String(ScenAll.Count())
+		+ " scenarios (test subfolder, cap 100), batches of 500");
+	SelfTest_ScenSubmitNext(Ctx);
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_ScenSubmitNext(Ctx)
+
+	Total = ScenAll.Count();
+	If ScenSkip >= Total Then
+		SelfTestAppend(Ctx, "all " + String(Total) + " scenarios submitted in "
+			+ String(Ms() - Ctx.TScenIndex) + " ms (accept); embedding...");
+		Ctx.Insert("TScenEmbed", Ms());
+		SelfTestCtx = Ctx;
+		SelfTestWaitTicks = 0;
+		AttachIdleHandler("SelfTest_ScenTick", 5, True);
+		Return;
+	EndIf;
+
+	BatchSize = 500;
+	Upper = ScenSkip + BatchSize;
+	If Upper > Total Then
+		Upper = Total;
+	EndIf;
+	Slice = New Array;
+	For Idx = ScenSkip To Upper - 1 Do
+		Slice.Add(ScenAll[Idx]);
+	EndDo;
+	ScenBatchNo = ScenBatchNo + 1;
+	ScenSkip = Upper;
+	Json = ScenBatchJson("features_scenarios", "irp-scen-" + Format(ScenBatchNo, "NG=0"), Slice);
+	Component.BeginCallingRagDispatch(
+		New NotifyDescription("SelfTest_ScenSubmitEnd", ThisObject, Ctx),
+		"index_segments", Json);
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_ScenSubmitEnd(ResultJson, ParametersCall, Ctx) Export
+
+	If ScenBatchNo % 4 = 0 Then
+		SelfTestAppend(Ctx, "  submitted " + String(ScenSkip) + "/" + String(Ctx.ScenTotal) + " scenarios");
+	EndIf;
+	SelfTest_ScenSubmitNext(Ctx);
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_ScenTick() Export
+
+	Component.BeginCallingRagDispatch(
+		New NotifyDescription("SelfTest_ScenStatsEnd", ThisObject, SelfTestCtx), "stats", "{}");
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_ScenStatsEnd(ResultJson, ParametersCall, Ctx) Export
+
+	SelfTestWaitTicks = SelfTestWaitTicks + 1;
+
+	Emb = 0;
+	Total = 0;
+	VecStatus = "";
+	Try
+		R = New JSONReader;
+		R.SetString(ResultJson);
+		Obj = ReadJSON(R, True);
+		Coll = Obj["result"]["collections"]["features_scenarios"];
+		If Coll <> Undefined Then
+			Emb = Coll["embedded"];
+			Total = Coll["n_segments"];
+			VecStatus = Coll["vector_status"];
+		EndIf;
+	Except
+	EndTry;
+
+	Pct = ?(Total > 0, Int(Emb * 100 / Total), 0);
+	Elapsed = Ms() - Ctx.TScenEmbed;
+	Rate = ?(Elapsed > 0, Int(Emb * 1000 / Elapsed), 0);
+	SelfTestAppend(Ctx, "scenarios embedding " + String(Emb) + "/" + String(Total)
+		+ " (" + String(Pct) + "%) ~" + String(Rate) + " seg/s, "
+		+ String(Int(Elapsed / 1000)) + "s");
+	ShowEmbedProgress("Эмбеддинг сценариев", Emb, Total);
+
+	If VecStatus <> "ready" And SelfTestWaitTicks < 170 Then
+		AttachIdleHandler("SelfTest_ScenTick", 5, True);
+		Return;
+	EndIf;
+
+	SelfTestAppend(Ctx, "scenarios embed DONE: " + String(Emb) + " segments in "
+		+ String(Elapsed) + " ms (~" + String(Rate) + " seg/s); searching");
+	Sp = New Structure;
+	Sp.Insert("query", "filter payment documents by company");
+	Sp.Insert("collection", "features_scenarios");
+	Sp.Insert("mode", "hybrid");
+	Sp.Insert("k", 5);
+	Sp.Insert("include_text", True);
+	Ctx.Insert("TScenSearch", Ms());
+	Component.BeginCallingRagDispatch(
+		New NotifyDescription("SelfTest_ScenSearchEnd", ThisObject, Ctx),
+		"search", SerializeToJson(Sp));
+
+EndProcedure
+
+&AtClient
+Procedure SelfTest_ScenSearchEnd(ResultJson, ParametersCall, Ctx) Export
+
+	SelfTestAppend(Ctx, "scenarios search latency = " + String(Ms() - Ctx.TScenSearch) + " ms");
+	SelfTestAppend(Ctx, "scenarios search -> " + ResultJson);
 	SelfTestAppend(Ctx, "DONE");
 
 EndProcedure
@@ -2726,6 +2956,106 @@ Function BuildFeaturesSegmentsJSON(Collection, MaxSegments)
 	JsonWriter.SetString();
 	WriteJSON(JsonWriter, Payload);
 	Return JsonWriter.Close();
+
+EndFunction
+
+&AtServer
+Function IsScenarioLine(Trimmed)
+	Return StrStartsWith(Trimmed, "Scenario:") Or StrStartsWith(Trimmed, "Scenario Outline:")
+		Or StrStartsWith(Trimmed, "Сценарий:") Or StrStartsWith(Trimmed, "Структура сценария:");
+EndFunction
+
+&AtServer
+Function IsFeatureLine(Trimmed)
+	Return StrStartsWith(Trimmed, "Feature:") Or StrStartsWith(Trimmed, "Функционал:")
+		Or StrStartsWith(Trimmed, "Функциональность:");
+EndFunction
+
+&AtServer
+Function HeaderTitle(Trimmed)
+	Pos = StrFind(Trimmed, ":");
+	If Pos > 0 Then
+		Return TrimAll(Mid(Trimmed, Pos + 1));
+	EndIf;
+	Return Trimmed;
+EndFunction
+
+&AtServer
+Procedure FlushScenario(Segments, BlockLines, FeatureName, RelPath, MaxSegments)
+	If Segments.Count() >= MaxSegments Then
+		Return;
+	EndIf;
+	Text = TrimAll(StrConcat(BlockLines, Chars.LF));
+	If Not ValueIsFilled(Text) Then
+		Return;
+	EndIf;
+	If StrLen(Text) > 2000 Then
+		Text = Left(Text, 2000);
+	EndIf;
+	Meta = New Structure;
+	Meta.Insert("type", "scenario");
+	Meta.Insert("feature", FeatureName);
+	Meta.Insert("file", RelPath);
+	Seg = New Structure;
+	Seg.Insert("text", Text);
+	Seg.Insert("meta", Meta);
+	Segments.Add(Seg);
+EndProcedure
+
+&AtServer
+Function BuildAllScenarioSegments(MaxSegments)
+
+	// A small, coherent test subfolder (filter scenarios) for fast iteration.
+	Dir = "C:\Users\DitriX\Downloads\IRP-develop\features\Internal\_0915 Filters";
+	Root = Dir + "\";
+	Segments = New Array;
+	Try
+		Files = FindFiles(Dir, "*.feature", True);
+		For Each F In Files Do
+			If Segments.Count() >= MaxSegments Then
+				Break;
+			EndIf;
+			If Not F.IsFile() Then
+				Continue;
+			EndIf;
+			RelPath = F.FullName;
+			If StrStartsWith(RelPath, Root) Then
+				RelPath = Mid(RelPath, StrLen(Root) + 1);
+			EndIf;
+			FeatureName = RelPath;
+			BlockLines = Undefined;
+			Reader = New TextReader(F.FullName, TextEncoding.UTF8);
+			Line = Reader.ReadLine();
+			While Line <> Undefined Do
+				Trimmed = TrimAll(Line);
+				If IsFeatureLine(Trimmed) Then
+					FeatureName = HeaderTitle(Trimmed);
+				ElsIf IsScenarioLine(Trimmed) Then
+					If BlockLines <> Undefined Then
+						FlushScenario(Segments, BlockLines, FeatureName, RelPath, MaxSegments);
+					EndIf;
+					BlockLines = New Array;
+					BlockLines.Add(Line);
+				Else
+					If BlockLines <> Undefined Then
+						BlockLines.Add(Line);
+					EndIf;
+				EndIf;
+				If Segments.Count() >= MaxSegments Then
+					Break;
+				EndIf;
+				Line = Reader.ReadLine();
+			EndDo;
+			Reader.Close();
+			If BlockLines <> Undefined Then
+				FlushScenario(Segments, BlockLines, FeatureName, RelPath, MaxSegments);
+			EndIf;
+		EndDo;
+	Except
+		// best-effort: index whatever parsed
+	EndTry;
+
+	Return Segments;
 
 EndFunction
 
