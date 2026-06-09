@@ -24,6 +24,8 @@
 //! counts what we produced up to the cap, see below). `max_per_doc` caps hits
 //! per document. Scanning stops early once the global cap is reached.
 
+use std::borrow::Cow;
+
 use regex::RegexBuilder;
 use serde_json::Value;
 
@@ -195,10 +197,19 @@ pub fn grep(core: &Core, req: &GrepRequest) -> Result<GrepResult, GrepError> {
 
 /// Normalize line endings to `\n`: turn CRLF and bare CR into LF so line numbers
 /// (counted by `\n`) are stable regardless of the source's newline convention.
-fn normalize_newlines(s: &str) -> String {
+///
+/// Fast path: a single pass first checks for any `\r`. The common case — text
+/// that is already LF-only (every `index_raw` segment, plus any LF source) — has
+/// no CR, so we **borrow** the input with zero allocation instead of running two
+/// `replace` passes that would each allocate a fresh `String`. Only CR-bearing
+/// text takes the owned, two-replace path.
+fn normalize_newlines(s: &str) -> Cow<'_, str> {
+    if !s.as_bytes().contains(&b'\r') {
+        return Cow::Borrowed(s);
+    }
     // Replace CRLF first, then any remaining lone CR, so "\r\n" doesn't become
     // two line breaks.
-    s.replace("\r\n", "\n").replace('\r', "\n")
+    Cow::Owned(s.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
 /// Serialize one grep hit to JSON. `context_before` / `context_after` are only
@@ -229,7 +240,11 @@ mod tests {
 
     #[test]
     fn normalize_handles_crlf_and_cr() {
-        assert_eq!(normalize_newlines("a\r\nb\rc\nd"), "a\nb\nc\nd");
+        // CR-bearing input → owned, fully normalized.
+        assert_eq!(normalize_newlines("a\r\nb\rc\nd").as_ref(), "a\nb\nc\nd");
+        assert!(matches!(normalize_newlines("a\r\nb"), Cow::Owned(_)));
+        // LF-only input → borrowed with zero allocation.
+        assert!(matches!(normalize_newlines("a\nb\nc"), Cow::Borrowed(_)));
     }
 
     /// Build a default `GrepRequest` for `pattern`, scoped to `collection`.

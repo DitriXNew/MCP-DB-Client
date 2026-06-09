@@ -61,6 +61,13 @@ pub struct Segment {
     /// The normalized embedding. `None` until the worker fills it; stays `None`
     /// for skipped (blank/non-finite) segments, which search simply ignores.
     pub vector: Option<Vec<f32>>,
+    /// Lowercased token multiset of `text`, computed once at index time (by
+    /// [`token_multiset`], with the same tokenizer the query uses) so the keyword
+    /// channel scores a segment in O(query_terms) hash lookups instead of
+    /// re-tokenizing + allocating a `Vec<String>` per segment on every query. Not
+    /// part of the wire model (never serialized); rebuilt on every (re)ingest of
+    /// the segment's text, so it can never drift from `text`.
+    pub kw_counts: HashMap<String, u32>,
 }
 
 /// One document: a `doc_id`-keyed bundle of segments with doc-level metadata.
@@ -494,6 +501,7 @@ pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
         }
         segment_ids.push(segment_id);
         embed_texts.push(if is_blank { String::new() } else { chosen });
+        let kw_counts = token_multiset(&s.text);
         doc.segments.push(Segment {
             segment_id,
             text: s.text,
@@ -502,6 +510,7 @@ pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
             line_end: s.line_end,
             meta: s.meta,
             vector: None,
+            kw_counts,
         });
     }
 
@@ -962,6 +971,7 @@ pub fn accept_index_raw(core: &mut Core, req: RawIndexRequest) -> RawAcceptResul
         }
         segment_ids.push(segment_id);
         embed_texts.push(if is_blank { String::new() } else { embed_full });
+        let kw_counts = token_multiset(&chunk.text);
         segments.push(Segment {
             segment_id,
             text: chunk.text,
@@ -970,6 +980,7 @@ pub fn accept_index_raw(core: &mut Core, req: RawIndexRequest) -> RawAcceptResul
             line_end: Some(chunk.line_end),
             meta: serde_json::json!({}),
             vector: None,
+            kw_counts,
         });
     }
 
@@ -1234,6 +1245,19 @@ fn keyword_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Token *multiset* of a segment's text — `token -> occurrence count` — built
+/// once at index time and cached on the [`Segment`]. Uses the exact same
+/// tokenizer as [`keyword_tokens`] so cached segment tokens and live query terms
+/// match symmetrically. Lets [`keyword_score`] avoid re-tokenizing the segment
+/// (and allocating a `Vec<String>`) on every query.
+fn token_multiset(text: &str) -> HashMap<String, u32> {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for tok in keyword_tokens(text) {
+        *counts.entry(tok).or_insert(0) += 1;
+    }
+    counts
+}
+
 /// Lexical match score of one segment against the (already tokenized) distinct
 /// query terms. Returns `0.0` when nothing matches (the segment is then not a
 /// keyword hit).
@@ -1255,19 +1279,14 @@ fn keyword_tokens(text: &str) -> Vec<String> {
 /// Tokens are compared for *equality* (whole-token match), so `"db"` does not
 /// match inside `"database"`; this is the precise-identifier behavior we want
 /// (use `grep` for substring/regex search).
-fn keyword_score(seg_text: &str, query_terms: &[String]) -> f32 {
-    if query_terms.is_empty() {
-        return 0.0;
-    }
-    let seg_tokens = keyword_tokens(seg_text);
-    if seg_tokens.is_empty() {
+fn keyword_score(seg_counts: &HashMap<String, u32>, query_terms: &[String]) -> f32 {
+    if query_terms.is_empty() || seg_counts.is_empty() {
         return 0.0;
     }
     let mut distinct_present = 0u32;
     let mut total_occurrences = 0u32;
     for term in query_terms {
-        let occ = seg_tokens.iter().filter(|t| *t == term).count() as u32;
-        if occ > 0 {
+        if let Some(&occ) = seg_counts.get(term) {
             distinct_present += 1;
             total_occurrences += occ;
         }
@@ -1437,7 +1456,7 @@ fn keyword_channel<'a>(core: &'a Core, req: &SearchRequest, apply_min: bool) -> 
                 if !req.filter.matches_doc_seg(&doc.meta, &seg.meta) {
                     continue;
                 }
-                let score = keyword_score(&seg.text, &query_terms);
+                let score = keyword_score(&seg.kw_counts, &query_terms);
                 if score <= 0.0 {
                     continue; // no query term present → not a hit
                 }
@@ -2519,17 +2538,29 @@ mod tests {
     fn keyword_score_ranks_by_distinct_coverage_then_density() {
         let q = distinct(keyword_tokens("alpha beta"));
         // Both distinct terms present → coverage 2 (+ density).
-        let both = keyword_score("alpha beta gamma", &q);
+        let both = keyword_score(&token_multiset("alpha beta gamma"), &q);
         // One distinct term, repeated → coverage 1 (+ a little density).
-        let one_rep = keyword_score("alpha alpha alpha", &q);
+        let one_rep = keyword_score(&token_multiset("alpha alpha alpha"), &q);
         // No query term → not a hit.
-        let none = keyword_score("gamma delta", &q);
+        let none = keyword_score(&token_multiset("gamma delta"), &q);
         assert!(both > one_rep, "more distinct terms must outrank repetition");
         assert!(one_rep > 0.0, "a present term is a hit");
         assert_eq!(none, 0.0, "no shared term → zero (non-hit)");
         // Whole-token match only: "alph" must not match inside "alpha".
         let q2 = distinct(keyword_tokens("alph"));
-        assert_eq!(keyword_score("alpha beta", &q2), 0.0, "no substring matching");
+        assert_eq!(
+            keyword_score(&token_multiset("alpha beta"), &q2),
+            0.0,
+            "no substring matching"
+        );
+    }
+
+    #[test]
+    fn token_multiset_counts_occurrences() {
+        let m = token_multiset("Alpha alpha BETA, beta! beta");
+        assert_eq!(m.get("alpha"), Some(&2));
+        assert_eq!(m.get("beta"), Some(&3));
+        assert_eq!(m.get("gamma"), None);
     }
 
     /// Build a `SearchRequest` with the given mode/min_score, scoped to a
