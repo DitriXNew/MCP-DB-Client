@@ -177,6 +177,10 @@ fn dispatch(method: &str, payload_json: &str) -> String {
                 "n_segments": total_segments,
                 "collections": collections,
                 "callsHandled": CALLS_HANDLED.load(std::sync::atomic::Ordering::Relaxed),
+                // Most recent bulk/query embed failure, surfaced because
+                // eprintln! is invisible inside the 1C host process. Null when
+                // none has occurred (or for the infallible mock embedder).
+                "last_embed_error": core.embedder.as_ref().and_then(|e| e.last_error()),
             }))
         }
 
@@ -253,10 +257,14 @@ fn dispatch(method: &str, payload_json: &str) -> String {
             Err(e) => Envelope::err(codes::BAD_PAYLOAD, e),
         },
 
-        // Asynchronous ingest: synchronous accept under a short lock, then the
-        // background worker embeds off-thread. Returns immediately.
+        // Asynchronous ingest: the CPU-heavy prepare (token multisets over all
+        // segment text) runs BEFORE the write lock so concurrent searches are
+        // never blocked behind it; only the short commit (id allocation, doc
+        // install, job enqueue) holds the lock. The background worker embeds
+        // off-thread. Returns immediately.
         "index_segments" => match parse_index_request(&payload) {
             Ok(req) => {
+                let prepared = store::prepare_index(req);
                 let mut core = match CORE.write() {
                     Ok(c) => c,
                     Err(_) => {
@@ -264,7 +272,7 @@ fn dispatch(method: &str, payload_json: &str) -> String {
                             .to_json_string()
                     }
                 };
-                let res = store::accept_index(&mut core, req);
+                let res = store::commit_index(&mut core, prepared);
                 Envelope::ok(json!({
                     "accepted": true,
                     "collection": res.collection,
@@ -274,13 +282,25 @@ fn dispatch(method: &str, payload_json: &str) -> String {
             Err(e) => Envelope::err(codes::BAD_PAYLOAD, e),
         },
 
-        // Asynchronous raw-document ingest: under a short lock we normalize the
-        // text, build a line offset table, store the full text + table, chunk it
-        // (line-snapped, by token budget, with overlap) and install the chunks
-        // (vector=None); the worker embeds off-thread. Returns immediately, with
-        // the (possibly auto-assigned) doc_id so the caller can upsert/delete.
+        // Asynchronous raw-document ingest: normalization, the line offset
+        // table, and chunking — the O(text) work — run in prepare BEFORE the
+        // write lock; only the short commit (id allocation, full-text + chunk
+        // install, job enqueue) holds it. The worker embeds off-thread. Returns
+        // immediately, with the (possibly auto-assigned) doc_id so the caller
+        // can upsert/delete.
         "index_raw" => match parse_raw_index_request(&payload) {
             Ok(req) => {
+                // Read max_seq_len under a brief read lock, then drop it for the
+                // heavy prepare. The TOCTOU vs a concurrent reconfigure is
+                // accepted (worst case: chunk sizing off for this one doc).
+                let max_seq_len = match CORE.read() {
+                    Ok(c) => c.config.max_seq_len,
+                    Err(_) => {
+                        return Envelope::err(codes::INTERNAL, "core lock poisoned")
+                            .to_json_string()
+                    }
+                };
+                let prepared = store::prepare_index_raw(req, max_seq_len);
                 let mut core = match CORE.write() {
                     Ok(c) => c,
                     Err(_) => {
@@ -288,7 +308,7 @@ fn dispatch(method: &str, payload_json: &str) -> String {
                             .to_json_string()
                     }
                 };
-                let res = store::accept_index_raw(&mut core, req);
+                let res = store::commit_index_raw(&mut core, prepared);
                 Envelope::ok(json!({
                     "accepted": true,
                     "collection": res.collection,

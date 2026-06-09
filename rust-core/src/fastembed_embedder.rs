@@ -21,7 +21,11 @@
 //! the async architecture exists to avoid. So we deliberately load **two
 //! separate model instances**:
 //!
-//!   * `bulk`  — locked by [`FastEmbedder::embed_passages`] (the worker's path);
+//!   * `bulk`  — a pool of one or more sessions used by the ingest workers:
+//!     each worker thread is *pinned* to one session via
+//!     [`Embedder::embed_passages_at`] (slot → session), with
+//!     [`FastEmbedder::embed_passages`] round-robining as the fallback for
+//!     callers that have no stable worker slot;
 //!   * `query` — locked by [`FastEmbedder::embed_query`] (the latency path).
 //!
 //! Passage embedding and query embedding therefore never contend on the same
@@ -104,15 +108,21 @@ struct SessionTuning {
 }
 
 /// Resolve the bulk worker/session count from the `embed_workers` config knob:
-/// `None` ⇒ 1 (single worker, the default); `Some(0)` ⇒ auto (≈ ncpu/2, ≥1);
-/// `Some(n)` ⇒ exactly `n` (≥1).
+/// `None` ⇒ 1 (single worker, the default); `Some(0)` ⇒ auto — `ncpu/2` clamped
+/// to `1..=4`; `Some(n)` ⇒ exactly `n` (≥1).
+///
+/// Why the auto cap at 4: measured scaling of multi-session CPU embedding
+/// saturates around ~1.4× (the workload is memory-bandwidth bound, not
+/// compute bound), so on a big machine an uncapped `ncpu/2` would load extra
+/// model copies (one per session, RAM cost) for no additional throughput. An
+/// explicit `Some(n)` still gets exactly what it asked for.
 fn worker_count(embed_workers: Option<u64>) -> usize {
     let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
     match embed_workers {
         None => 1,
-        Some(0) => (ncpu / 2).max(1),
+        Some(0) => (ncpu / 2).clamp(1, 4),
         Some(n) => (n as usize).max(1),
     }
 }
@@ -122,6 +132,12 @@ fn worker_count(embed_workers: Option<u64>) -> usize {
 /// override if given, else the remaining cores split across the `m_workers`
 /// sessions (`(ncpu - query) / m`, ≥1) — so `m × per_session + query ≈ ncpu`,
 /// no oversubscription whether you run one big session or several small ones.
+///
+/// An explicit `intra_threads` is a *per-session* knob: with `m` sessions the
+/// total thread demand is `m × t`, so an innocent-looking `intra_threads: 8`
+/// under 4 workers would ask for 32 threads. To keep the no-oversubscription
+/// invariant we clamp the explicit value to `(ncpu / m).max(1)` whenever
+/// `m > 1`; a single session keeps the historical `min(t, ncpu)` behavior.
 fn tunings(
     device: Device,
     intra_threads: Option<u64>,
@@ -133,7 +149,10 @@ fn tunings(
     let query_threads = ncpu.min(2).max(1);
     let m = m_workers.max(1);
     let bulk_threads = match intra_threads {
-        Some(t) if t >= 1 => (t as usize).min(ncpu),
+        // Explicit override: single session caps at ncpu; multi-session clamps
+        // to the per-session fair share so m sessions never oversubscribe.
+        Some(t) if t >= 1 && m <= 1 => (t as usize).min(ncpu),
+        Some(t) if t >= 1 => (t as usize).min((ncpu / m).max(1)),
         // Single worker: one big session, leave the query threads free. Multiple
         // workers: spread ALL cores across the `m` sessions (≈ ncpu/m each) so the
         // task-parallel pool actually saturates the CPU.
@@ -157,14 +176,21 @@ fn tunings(
 pub struct FastEmbedder {
     /// One or more model sessions for bulk passage embedding (the background-
     /// worker path). A long reindex locks only these, leaving `query` free. With
-    /// >1 session the ingest worker runs that many threads, each round-robined
-    /// onto its own session, so jobs embed concurrently (cost: one model copy in
-    /// RAM per session).
+    /// >1 session the ingest worker runs that many threads, each **pinned** to
+    /// its own session via [`Embedder::embed_passages_at`] (worker slot →
+    /// session index), so jobs embed concurrently with no cross-session lock
+    /// contention (cost: one model copy in RAM per session).
     bulk_pool: Vec<Mutex<TextEmbedding>>,
-    /// Round-robin cursor selecting which bulk session a passage batch uses.
+    /// Round-robin cursor selecting a bulk session for the *fallback* path —
+    /// [`Embedder::embed_passages`] callers that have no stable worker slot
+    /// (e.g. ad-hoc/test callers). The pinned worker path never touches it.
     bulk_cursor: AtomicUsize,
     /// Model used for low-latency query embedding (the search path).
     query: Mutex<TextEmbedding>,
+    /// Most recent embed failure (poisoned session mutex or an ort inference
+    /// error), kept for diagnostics. `eprintln!` goes nowhere inside the 1C
+    /// host process, so `stats` surfaces this via [`Embedder::last_error`].
+    last_error: Mutex<Option<String>>,
     /// Output dimensionality, probed once at construction. Bound to the index.
     dim: usize,
     /// ONNX inference sub-batch size handed to fastembed. With `m` concurrent
@@ -217,6 +243,7 @@ impl FastEmbedder {
             bulk_pool,
             bulk_cursor: AtomicUsize::new(0),
             query: Mutex::new(query),
+            last_error: Mutex::new(None),
             // Provisional; replaced by the probe below. The built-in e5-small is
             // 384-dim, but we probe rather than hard-code so the value is always
             // truthful even if the model file changes.
@@ -268,6 +295,7 @@ impl FastEmbedder {
             bulk_pool,
             bulk_cursor: AtomicUsize::new(0),
             query: Mutex::new(query),
+            last_error: Mutex::new(None),
             dim: 0,
             embed_batch: (256 / m).max(8),
         };
@@ -340,14 +368,25 @@ impl FastEmbedder {
             .ok_or_else(|| "dim probe returned no vector".to_string())
     }
 
+    /// Record an embed failure so [`Embedder::last_error`] (and therefore the
+    /// `stats` payload) can surface it — `eprintln!` is invisible inside the 1C
+    /// host process. Last writer wins: we only keep the most recent failure.
+    fn note_error(last_error: &Mutex<Option<String>>, msg: String) {
+        if let Ok(mut g) = last_error.lock() {
+            *g = Some(msg);
+        }
+    }
+
     /// Run a batch through one of the model instances, prepending `prefix` to
     /// each input. On any error (poisoned lock or an ort inference failure) we
     /// return one all-zero vector per input: the ingest/search pipeline already
     /// treats all-zero vectors as "no signal" (skipped, never indexed, never a
     /// hit), so a transient embed failure degrades gracefully instead of
-    /// panicking across the FFI boundary.
+    /// panicking across the FFI boundary. Failures are additionally recorded in
+    /// `last_error` (see [`Self::note_error`]) so they are visible via `stats`.
     fn run(
         model: &Mutex<TextEmbedding>,
+        last_error: &Mutex<Option<String>>,
         prefix: &str,
         texts: &[String],
         dim: usize,
@@ -358,6 +397,10 @@ impl FastEmbedder {
             Ok(g) => g,
             Err(_) => {
                 eprintln!("rcore: embed skipped — model mutex poisoned");
+                Self::note_error(
+                    last_error,
+                    "embed skipped — model mutex poisoned".to_string(),
+                );
                 return vec![vec![0.0; dim]; texts.len()];
             }
         };
@@ -367,7 +410,9 @@ impl FastEmbedder {
             Err(e) => {
                 // Surface the underlying ort/tokenizer error (was silently
                 // swallowed). All-zero vectors still signal "no signal" downstream.
-                eprintln!("rcore: embed failed for {} texts: {e}", texts.len());
+                let msg = format!("embed failed for {} texts: {e}", texts.len());
+                eprintln!("rcore: {msg}");
+                Self::note_error(last_error, msg);
                 vec![vec![0.0; dim]; texts.len()]
             }
         }
@@ -380,17 +425,43 @@ impl Embedder for FastEmbedder {
     }
 
     fn embed_passages(&self, texts: &[String]) -> Vec<Vec<f32>> {
-        // Worker path: never contends with queries. Round-robin across the bulk
-        // session pool so the N ingest-worker threads each land on a distinct
-        // session (N consecutive cursor values ⇒ N distinct sessions), giving
-        // true concurrent embedding without ever touching the `query` session.
+        // Fallback bulk path for callers WITHOUT a stable worker slot (the
+        // pinned worker threads use `embed_passages_at` instead). Round-robin
+        // across the bulk session pool so even ad-hoc concurrent callers spread
+        // over distinct sessions, never touching the `query` session.
         let n = self.bulk_pool.len();
         let idx = if n <= 1 {
             0
         } else {
             self.bulk_cursor.fetch_add(1, Ordering::Relaxed) % n
         };
-        Self::run(&self.bulk_pool[idx], PASSAGE_PREFIX, texts, self.dim, self.embed_batch)
+        Self::run(
+            &self.bulk_pool[idx],
+            &self.last_error,
+            PASSAGE_PREFIX,
+            texts,
+            self.dim,
+            self.embed_batch,
+        )
+    }
+
+    fn embed_passages_at(&self, slot: usize, texts: &[String]) -> Vec<Vec<f32>> {
+        // Pinned worker path: worker thread `slot` always uses session
+        // `slot % n`, so a slow job on one session never blocks a sibling
+        // worker whose own session is idle (the head-of-line blocking the old
+        // shared round-robin cursor allowed). The `% n` guard matters: after a
+        // pool resize a *retired* worker thread with a high slot index may
+        // briefly run one last drained job against a smaller new pool — the
+        // modulo keeps that in bounds instead of panicking.
+        let n = self.bulk_pool.len().max(1);
+        Self::run(
+            &self.bulk_pool[slot % n],
+            &self.last_error,
+            PASSAGE_PREFIX,
+            texts,
+            self.dim,
+            self.embed_batch,
+        )
     }
 
     fn bulk_concurrency(&self) -> usize {
@@ -400,10 +471,26 @@ impl Embedder for FastEmbedder {
     fn embed_query(&self, text: &str) -> Vec<f32> {
         // Query path: lock `query` only — never blocked by a bulk reindex.
         let one = [text.to_string()];
-        Self::run(&self.query, QUERY_PREFIX, &one, self.dim, self.embed_batch)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| vec![0.0; self.dim])
+        Self::run(
+            &self.query,
+            &self.last_error,
+            QUERY_PREFIX,
+            &one,
+            self.dim,
+            self.embed_batch,
+        )
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| vec![0.0; self.dim])
+    }
+
+    fn last_error(&self) -> Option<String> {
+        // A poisoned slot only means a panicking writer; the stored string (if
+        // any) is still the best diagnostic we have, so recover it.
+        match self.last_error.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
     }
 }
 

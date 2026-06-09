@@ -27,6 +27,20 @@ pub trait Embedder: Send + Sync {
     /// L2-normalized vector per input, in the same order.
     fn embed_passages(&self, texts: &[String]) -> Vec<Vec<f32>>;
 
+    /// Embed a batch of passages on behalf of a *pinned* worker thread.
+    ///
+    /// `slot` is the stable worker-thread index (0-based, assigned at spawn and
+    /// fixed for the thread's lifetime). A multi-session implementation maps the
+    /// slot onto one of its model sessions so each worker thread always uses the
+    /// *same* session — eliminating the head-of-line blocking a shared/rotating
+    /// cursor can cause (a worker being assigned a session currently locked by a
+    /// slow sibling while other sessions sit idle). The default simply forwards
+    /// to [`Embedder::embed_passages`] (correct for any single-session embedder,
+    /// including the mock).
+    fn embed_passages_at(&self, _slot: usize, texts: &[String]) -> Vec<Vec<f32>> {
+        self.embed_passages(texts)
+    }
+
     /// Embed a single query string. Same scheme as [`Embedder::embed_passages`]
     /// so cosine similarity between a query and a passage is meaningful.
     fn embed_query(&self, text: &str) -> Vec<f32>;
@@ -36,6 +50,17 @@ pub trait Embedder: Send + Sync {
     /// threads. Defaults to 1 (the mock and any single-session embedder).
     fn bulk_concurrency(&self) -> usize {
         1
+    }
+
+    /// The most recent bulk/query embed failure, for diagnostics via `stats`.
+    ///
+    /// Inside the 1C host process there is no console, so an `eprintln!` on the
+    /// embed path goes nowhere; implementations that can fail (the real ONNX
+    /// embedder) record the last error string here instead so the operator can
+    /// see it in the `stats` payload. `None` means no failure has been observed
+    /// (the default, and always the answer for the infallible mock).
+    fn last_error(&self) -> Option<String> {
+        None
     }
 }
 

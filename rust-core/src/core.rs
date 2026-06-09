@@ -14,15 +14,25 @@
 //!   * writers = ingest-*apply* / `reset` / `configure`.
 //!
 //! The expensive part — embedding (15–60 s with a real model) — happens
-//! **outside** the index lock, on a background worker thread. The write lock is
-//! held only for the short synchronous accept (store text, mark Building) and
-//! for the short apply (swap in finished vectors). This is the architectural
-//! heart of the slice: a `index_segments` call from BSL returns immediately and
-//! never freezes the 1C UI thread.
+//! **outside** the index lock, on background worker threads. CPU-heavy accept
+//! work (token multisets, raw-doc normalization/offsets/chunking) is likewise
+//! done in a lock-free *prepare* step; the write lock is held only for the
+//! short *commit* (allocate ids, store text, mark Building) and for the short
+//! apply (swap in finished vectors). This is the architectural heart of the
+//! slice: an `index_segments` call from BSL returns immediately and never
+//! freezes the 1C UI thread, and searches are never blocked behind a large
+//! accept's text processing.
 //!
-//! The worker is a `std::thread` fed by an `mpsc` job queue. It is spawned
-//! lazily on the first ingest and lives until [`shutdown`] signals it to stop
-//! and joins it.
+//! The worker is a *pool* of `std::thread`s (one per embedder bulk session, so
+//! a multi-session embedder embeds jobs in parallel; each thread is pinned to
+//! its session by its spawn index) sharing one `mpsc` job queue. Large ingests
+//! are split into [`EMBED_JOB_CHUNK`]-sized jobs so a single huge document
+//! spreads across the pool instead of serializing on one thread. The pool is
+//! spawned lazily on the first ingest and **resized** when a reconfigure
+//! changes the embedder's bulk concurrency: the old threads get a `Stop` each
+//! (after their FIFO queue drains) and are stashed in `retired_workers`; they
+//! are joined — never under the index lock, which a worker may itself need to
+//! apply a job — by [`shutdown`], alongside the current pool.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -184,7 +194,9 @@ pub struct Config {
     pub device: String,
     pub intra_threads: Option<u64>,
     /// Number of concurrent bulk-embedding worker threads / model sessions.
-    /// `None` ⇒ 1 (single worker, the default). `Some(0)` ⇒ auto (≈ ncpu/2).
+    /// `None` ⇒ 1 (single worker, the default). `Some(0)` ⇒ auto (ncpu/2,
+    /// clamped to 1..=4 — multi-session scaling is memory-bandwidth bound and
+    /// saturates early, so more sessions would only waste RAM).
     /// `Some(n)` ⇒ exactly `n`. More workers embed jobs concurrently (each on its
     /// own model session with a smaller intra-op pool) at the cost of one model
     /// copy in RAM per worker. Only meaningful for the real (fastembed) embedder.
@@ -248,8 +260,16 @@ pub struct Core {
     pub collections: HashMap<String, Collection>,
     /// Source of stable, unique segment ids.
     next_segment_id: u64,
-    /// The background worker, spawned lazily on first ingest.
+    /// The background worker pool, spawned lazily on first ingest and resized
+    /// (see [`enqueue_job`]) when the embedder's bulk concurrency changes.
     worker: Option<Worker>,
+    /// Join handles of worker threads retired by a pool resize. Retiring only
+    /// sends each old thread a `Stop` (their FIFO queue drains first) and
+    /// stashes the handle here; the actual `join()` happens in [`shutdown`],
+    /// OUTSIDE the index lock — joining under the write lock could deadlock,
+    /// because a retired thread may itself be blocked in `apply_job` waiting
+    /// for that very lock.
+    retired_workers: Vec<JoinHandle<()>>,
     /// Condvar signalled whenever a collection's `vector_status`/counters change,
     /// so tests (and callers) can `wait_until_ready` without polling/sleeping.
     progress: Arc<(Mutex<()>, Condvar)>,
@@ -264,6 +284,7 @@ impl Default for Core {
             collections: HashMap::new(),
             next_segment_id: 1,
             worker: None,
+            retired_workers: Vec::new(),
             progress: Arc::new((Mutex::new(()), Condvar::new())),
         }
     }
@@ -477,27 +498,31 @@ pub struct AcceptResult {
     pub segment_count: usize,
 }
 
-/// Synchronous accept for `index_segments`. Does the cheap work under a short
-/// write lock — allocate ids, **install the doc's text segments into the store
-/// with `vector: None`** (atomic upsert by `doc_id`), mark the collection
-/// `text_ready=true` / `vector_status=Building`, bump `pending_jobs` — then
-/// enqueues one [`EmbedJob`] for the background worker. Returns immediately;
-/// embedding happens off-thread.
-///
-/// This is the carried-forward fix from Stage 1 (§4.4 / Правка-2): text-only
-/// operations (`grep` / `get_segment` / keyword) can see a doc's text the moment
-/// accept returns, because the segments are present in the store *before* the
-/// worker runs. The worker fills ONLY the vectors afterwards (matched by
-/// `segment_id`), so dense search is the only operation that waits for vectors.
-///
-/// Blank-text segments are counted as `skipped` right here at accept time (they
-/// never get embedded) so they don't keep the collection in Building forever.
-pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
-    let embedder = ensure_embedder(core);
-    let dim = embedder.dim();
+/// The lock-free *prepare* half of an `index_segments` accept: everything that
+/// is O(total text) — choosing embed texts, building the per-segment keyword
+/// multisets — done WITHOUT `&mut Core`, so the dispatcher can run it before
+/// taking the global write lock and searches are never blocked behind a large
+/// accept's text processing. Segment ids are placeholders (`0`) here; the
+/// commit step allocates the real ids under the lock.
+pub struct PreparedIndex {
+    collection: String,
+    description: Option<String>,
+    /// The fully-built doc (kw_counts computed, `vector: None`) with
+    /// placeholder `segment_id: 0` on every segment.
+    doc: Document,
+    /// Per-segment text to embed, parallel to `doc.segments`. Empty strings
+    /// mark blank segments (already counted in `skipped_now`).
+    embed_texts: Vec<String>,
+    /// Blank segments counted during prepare; added to the collection's
+    /// `skipped` counter at commit.
+    skipped_now: u64,
+}
 
-    // Build the doc + the parallel list of (segment_id, text-to-embed). A blank
-    // text is skipped immediately (counter bumped after we have the collection).
+/// Build a [`PreparedIndex`] from an `index_segments` request — the CPU-heavy
+/// part of accept (token multisets over every segment), pure of `&mut Core`.
+/// Call this OUTSIDE the global write lock, then hand the result to
+/// [`commit_index`] under the lock.
+pub fn prepare_index(req: IndexRequest) -> PreparedIndex {
     let mut doc = Document {
         doc_id: req.doc_id.clone(),
         name: req.name,
@@ -508,23 +533,20 @@ pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
         full_text: None,
         line_offsets: None,
     };
-    let mut segment_ids: Vec<u64> = Vec::with_capacity(req.segments.len());
     let mut embed_texts: Vec<String> = Vec::with_capacity(req.segments.len());
     let mut skipped_now: u64 = 0;
 
     for s in req.segments {
-        let segment_id = core.alloc_segment_id();
         // Choose embed_text-or-text; blank → mark skip (empty embed string).
         let chosen = s.embed_text.clone().unwrap_or_else(|| s.text.clone());
         let is_blank = chosen.trim().is_empty();
         if is_blank {
             skipped_now += 1;
         }
-        segment_ids.push(segment_id);
         embed_texts.push(if is_blank { String::new() } else { chosen });
         let kw_counts = token_multiset(&s.text);
         doc.segments.push(Segment {
-            segment_id,
+            segment_id: 0, // placeholder; the real id is allocated at commit
             text: s.text,
             embed_text: s.embed_text,
             line_start: s.line_start,
@@ -535,20 +557,65 @@ pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
         });
     }
 
+    PreparedIndex {
+        collection: req.collection,
+        description: req.description,
+        doc,
+        embed_texts,
+        skipped_now,
+    }
+}
+
+/// The locked *commit* half of an `index_segments` accept. Does only the cheap
+/// work under the write lock — allocate real segment ids, **install the doc's
+/// text segments into the store with `vector: None`** (atomic upsert by
+/// `doc_id`), mark the collection `text_ready=true` / `vector_status=Building`,
+/// bump `pending_jobs` — then enqueues the [`EmbedJob`] chunks for the worker
+/// pool. Returns immediately; embedding happens off-thread.
+///
+/// This preserves the carried-forward fix from Stage 1 (§4.4 / Правка-2):
+/// text-only operations (`grep` / `get_segment` / keyword) can see a doc's text
+/// the moment commit returns, because the segments are present in the store
+/// *before* the worker runs. The worker fills ONLY the vectors afterwards
+/// (matched by `segment_id`), so dense search is the only operation that waits
+/// for vectors.
+///
+/// Blank-text segments were counted as `skipped` during prepare (they never get
+/// embedded) so they don't keep the collection in Building forever.
+pub fn commit_index(core: &mut Core, prepared: PreparedIndex) -> AcceptResult {
+    let _embedder = ensure_embedder(core);
+
+    let PreparedIndex {
+        collection,
+        description,
+        mut doc,
+        embed_texts,
+        skipped_now,
+    } = prepared;
+
+    // Allocate the real, store-unique segment ids (the only per-segment work
+    // that genuinely needs `&mut Core`), keeping the parallel id vec for the
+    // embed jobs.
+    let mut segment_ids: Vec<u64> = Vec::with_capacity(doc.segments.len());
+    for seg in doc.segments.iter_mut() {
+        seg.segment_id = core.alloc_segment_id();
+        segment_ids.push(seg.segment_id);
+    }
+
     let segment_count = doc.segments.len();
+    let doc_id = doc.doc_id.clone();
 
     // --- short write-locked accept: install text, mark Building ---
     let coll = core
         .collections
-        .entry(req.collection.clone())
+        .entry(collection.clone())
         .or_insert_with(Collection::new);
     coll.text_ready = true;
     coll.vector_status = VectorStatus::Building;
     coll.error = None;
-    coll.pending_jobs = coll.pending_jobs.saturating_add(1);
     coll.skipped = coll.skipped.saturating_add(skipped_now);
     // Label the collection (last non-empty description wins).
-    if let Some(desc) = req.description {
+    if let Some(desc) = description {
         if !desc.trim().is_empty() {
             coll.description = Some(desc);
         }
@@ -559,40 +626,126 @@ pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
     // one map insert — so text-readers never see a torn doc, and any embed job
     // still in flight for the *previous* generation of this doc has stale
     // `segment_id`s that simply won't match (see `apply_job`).
-    coll.docs.insert(req.doc_id.clone(), doc);
+    coll.docs.insert(doc_id.clone(), doc);
 
-    let _ = dim; // dim is fixed by the embedder; kept for clarity/future use.
-
-    // Enqueue the embed job for the worker (spawns it lazily). It carries only
-    // the ids + texts needed to fill vectors in place after embedding.
-    enqueue_job(
-        core,
-        EmbedJob {
-            collection: req.collection.clone(),
-            doc_id: req.doc_id,
-            segment_ids,
-            embed_texts,
-        },
-    );
+    // Enqueue the embed work, chunked across the worker pool (bumps
+    // `pending_jobs` by the chunk count — see `enqueue_embed_chunks`).
+    enqueue_embed_chunks(core, collection.clone(), doc_id, segment_ids, embed_texts);
 
     AcceptResult {
-        collection: req.collection,
+        collection,
         segment_count,
     }
 }
 
-/// Lazily spawn the worker (if needed) and push a job onto its queue. The number
-/// of worker threads matches the embedder's bulk concurrency (one thread per
-/// model session), so a multi-session embedder embeds jobs in parallel.
+/// Synchronous accept for `index_segments`: thin prepare+commit wrapper, kept
+/// so existing callers/tests that already hold the write lock keep working.
+/// The dispatcher (`lib.rs`) instead runs [`prepare_index`] BEFORE taking the
+/// lock and [`commit_index`] under it, so the O(total text) work never blocks
+/// concurrent searches. (Test-only in non-test builds, hence the allow.)
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
+    commit_index(core, prepare_index(req))
+}
+
+/// Job quantum: the maximum number of segments carried by one [`EmbedJob`].
+/// A large ingest (one `index_segments`/`index_raw` call) is split into jobs of
+/// at most this many segments so a single huge document spreads across the
+/// whole worker pool instead of keeping one worker busy while the rest idle.
+/// 256 matches the ONNX sub-batch scale (`FastEmbedder::embed_batch` defaults
+/// to 256/m), so a chunk is a few sub-batches of real work — big enough to
+/// amortize per-job overhead, small enough to parallelize.
+const EMBED_JOB_CHUNK: usize = 256;
+
+/// Split one ingest's parallel `(segment_ids, embed_texts)` arrays into
+/// [`EMBED_JOB_CHUNK`]-sized [`EmbedJob`]s, bump the collection's
+/// `pending_jobs` by the chunk count, and enqueue them. The bump and the
+/// enqueue live in this ONE helper (used by both accept paths) so they can
+/// never drift apart — `pending_jobs` reaching zero is what flips a collection
+/// to `Ready`, so an off-by-one here would strand it `Building` forever.
+///
+/// EDGE CASE: an empty segment list still enqueues exactly ONE (empty) job —
+/// that empty job's apply is what decrements `pending_jobs` and flips the
+/// collection to `Ready`; zero jobs would leave it `Building` forever. Hence
+/// chunk count = `max(1, ceil(len / EMBED_JOB_CHUNK))`.
+fn enqueue_embed_chunks(
+    core: &mut Core,
+    collection: String,
+    doc_id: String,
+    segment_ids: Vec<u64>,
+    embed_texts: Vec<String>,
+) {
+    debug_assert_eq!(segment_ids.len(), embed_texts.len());
+    let n = segment_ids.len();
+    let n_chunks = ((n + EMBED_JOB_CHUNK - 1) / EMBED_JOB_CHUNK).max(1);
+
+    // Bump pending_jobs by the number of chunks BEFORE enqueueing, so a fast
+    // worker applying the first chunk can never observe a zero counter and flip
+    // the collection Ready prematurely. (We hold the write lock here, but the
+    // ordering keeps the invariant obvious and robust.)
+    if let Some(coll) = core.collections.get_mut(&collection) {
+        coll.pending_jobs = coll.pending_jobs.saturating_add(n_chunks as u32);
+    }
+
+    // Walk the parallel arrays front-to-back, splitting off ≤CHUNK-sized heads.
+    // The first iteration of the loop also covers the empty-list case (one
+    // empty job), keeping the max(1, …) contract without a special branch.
+    let mut rest_ids = segment_ids;
+    let mut rest_texts = embed_texts;
+    loop {
+        let take = rest_ids.len().min(EMBED_JOB_CHUNK);
+        let tail_ids = rest_ids.split_off(take);
+        let tail_texts = rest_texts.split_off(take);
+        enqueue_job(
+            core,
+            EmbedJob {
+                collection: collection.clone(),
+                doc_id: doc_id.clone(),
+                segment_ids: rest_ids,
+                embed_texts: rest_texts,
+            },
+        );
+        if tail_ids.is_empty() {
+            break;
+        }
+        rest_ids = tail_ids;
+        rest_texts = tail_texts;
+    }
+}
+
+/// Push a job onto the worker pool's queue, lazily spawning — or **resizing** —
+/// the pool first. The number of worker threads matches the embedder's bulk
+/// concurrency (one thread per model session), so a multi-session embedder
+/// embeds jobs in parallel.
+///
+/// Resizing: a reconfigure can swap in an embedder with a different
+/// `bulk_concurrency` (e.g. `embed_workers: 2` → `6`). The old pool would then
+/// silently mismatch the new session count — no parallelism gain, wasted RAM —
+/// so when the live pool size differs from what the current embedder wants we
+/// retire it: send one `Stop` per old thread on the OLD queue (it is FIFO, so
+/// any jobs still pending there drain before the Stops are seen) and stash the
+/// handles in `retired_workers`, then spawn a fresh pool of the right size.
+/// CRITICAL: we never `join()` here — we hold the CORE write lock, and an old
+/// worker may be blocked in `apply_job` waiting for that very lock (deadlock).
+/// The retired handles are joined by [`shutdown`], outside the lock.
 fn enqueue_job(core: &mut Core, job: EmbedJob) {
-    if core.worker.is_none() {
-        let workers = core
-            .embedder
-            .as_ref()
-            .map(|e| e.bulk_concurrency())
-            .unwrap_or(1)
-            .max(1);
-        core.worker = Some(spawn_worker(core.progress_handle(), workers));
+    let want = core
+        .embedder
+        .as_ref()
+        .map(|e| e.bulk_concurrency())
+        .unwrap_or(1)
+        .max(1);
+
+    if core.worker.as_ref().map(|w| w.handles.len()) != Some(want) {
+        // Retire a wrong-sized pool (Stops queue behind its pending jobs).
+        if let Some(old) = core.worker.take() {
+            for _ in 0..old.handles.len() {
+                let _ = old.tx.send(WorkerMsg::Stop);
+            }
+            core.retired_workers.extend(old.handles);
+        }
+        // Spawn the fresh pool sized to the current embedder.
+        core.worker = Some(spawn_worker(core.progress_handle(), want));
     }
     if let Some(w) = core.worker.as_ref() {
         // If the receiver is gone (worker stopped), the job is dropped and the
@@ -607,6 +760,12 @@ fn enqueue_job(core: &mut Core, job: EmbedJob) {
 /// holds it only for the brief dequeue (and while blocked on an empty queue —
 /// harmless, there is no work), releasing it before the expensive embed, so up
 /// to `workers` embeds run concurrently. `progress` wakes `wait_until_ready`.
+///
+/// Each thread carries its stable spawn index `i` as its embedding *slot*: the
+/// worker embeds via `embed_passages_at(i, …)`, which pins thread `i` to model
+/// session `i` for the thread's whole life. Pinning (vs the old shared
+/// round-robin cursor) means a slow job on one session can never get a sibling
+/// worker queued up behind that same session's lock while other sessions idle.
 fn spawn_worker(progress: Arc<(Mutex<()>, Condvar)>, workers: usize) -> Worker {
     let (tx, rx): (Sender<WorkerMsg>, Receiver<WorkerMsg>) = mpsc::channel();
     let shared_rx = Arc::new(Mutex::new(rx));
@@ -616,7 +775,7 @@ fn spawn_worker(progress: Arc<(Mutex<()>, Condvar)>, workers: usize) -> Worker {
         let progress = Arc::clone(&progress);
         let handle = std::thread::Builder::new()
             .name(format!("rcore-ingest-{i}"))
-            .spawn(move || worker_loop(rx, progress))
+            .spawn(move || worker_loop(i, rx, progress))
             .expect("failed to spawn ingest worker");
         handles.push(handle);
     }
@@ -626,8 +785,9 @@ fn spawn_worker(progress: Arc<(Mutex<()>, Condvar)>, workers: usize) -> Worker {
 /// The worker thread body. Dequeues under the shared receiver lock (released
 /// before the heavy embed so siblings run concurrently), embeds outside the
 /// index lock, then applies under a short lock. Exits on `Stop` or when the
-/// sender is dropped.
-fn worker_loop(rx: Arc<Mutex<Receiver<WorkerMsg>>>, progress: Arc<(Mutex<()>, Condvar)>) {
+/// sender is dropped. `slot` is this thread's stable spawn index, used to pin
+/// it to one embedder session (see [`spawn_worker`]).
+fn worker_loop(slot: usize, rx: Arc<Mutex<Receiver<WorkerMsg>>>, progress: Arc<(Mutex<()>, Condvar)>) {
     loop {
         // Hold the receiver lock ONLY for the dequeue; a poisoned lock or a
         // dropped/closed sender ends this thread.
@@ -661,8 +821,10 @@ fn worker_loop(rx: Arc<Mutex<Receiver<WorkerMsg>>>, progress: Arc<(Mutex<()>, Co
                 };
 
                 // Only embed the non-blank texts; blanks already counted as
-                // skipped at accept. We embed all in one batch call.
-                let vectors = embedder.embed_passages(&job.embed_texts);
+                // skipped at accept. We embed all in one batch call, pinned to
+                // this thread's model session via `slot` (a retired thread's
+                // high slot is taken modulo the pool size by the embedder).
+                let vectors = embedder.embed_passages_at(slot, &job.embed_texts);
 
                 // --- apply finished vectors under a SHORT write lock ---
                 apply_job(job, Some(vectors));
@@ -964,21 +1126,36 @@ fn auto_doc_id(core: &mut Core) -> String {
     format!("raw:{}", core.alloc_segment_id())
 }
 
-/// Synchronous accept for `index_raw`. Under the short write lock it:
-///   1. normalizes the text CRLF→LF;
-///   2. builds the line offset table for the full document;
-///   3. stores the full normalized text + offset table on the doc (so
-///      `get_segment` works the instant this returns — before any embedding);
-///   4. chunks the text (line-snapped, by token budget, with overlap) and
-///      installs each chunk as a text segment with `vector: None`;
-///   5. marks the collection `text_ready` / `Building` and enqueues ONE embed
-///      job for the worker (which later fills only the vectors).
-///
-/// Returns immediately; embedding happens off-thread, exactly like
-/// `index_segments`. The doc is greppable and `get_segment`-able right away.
-pub fn accept_index_raw(core: &mut Core, req: RawIndexRequest) -> RawAcceptResult {
-    let _embedder = ensure_embedder(core);
+/// The lock-free *prepare* half of an `index_raw` accept: CRLF normalization,
+/// the line offset table, chunking, kw multisets — all the O(total text) work,
+/// done WITHOUT `&mut Core` so the dispatcher can run it before taking the
+/// global write lock. `max_seq_len` is passed in as a plain value (the
+/// dispatcher reads it under a brief read lock first); segment ids are
+/// placeholders (`0`) until [`commit_index_raw`] allocates the real ones.
+pub struct PreparedRawIndex {
+    collection: String,
+    /// Caller-supplied id, or `None` ⇒ auto-assigned at commit (needs the
+    /// store's id source).
+    doc_id: Option<String>,
+    name: String,
+    meta: serde_json::Value,
+    /// The fully-normalized document text (CRLF→LF), stored on the doc.
+    full_text: String,
+    /// Offset table over `full_text` (see [`build_line_offsets`]).
+    line_offsets: Vec<usize>,
+    /// Chunked segments (kw_counts computed, `vector: None`, placeholder ids).
+    segments: Vec<Segment>,
+    /// Per-segment embed text, parallel to `segments` (empty string = blank).
+    embed_texts: Vec<String>,
+    /// Blank chunks counted during prepare; added to `skipped` at commit.
+    skipped_now: u64,
+}
 
+/// Build a [`PreparedRawIndex`] from an `index_raw` request — steps (1), (2)
+/// and (4) of the raw accept (normalize, offsets, chunk + kw multisets), pure
+/// of `&mut Core`. Call this OUTSIDE the global write lock, then hand the
+/// result to [`commit_index_raw`] under the lock.
+pub fn prepare_index_raw(req: RawIndexRequest, max_seq_len: Option<u64>) -> PreparedRawIndex {
     // (1) Normalize newlines once, up front. Everything downstream — offsets,
     // chunk line numbers, stored text — is in terms of this LF-only text.
     let full_text = normalize_newlines(&req.text);
@@ -986,31 +1163,24 @@ pub fn accept_index_raw(core: &mut Core, req: RawIndexRequest) -> RawAcceptResul
     // (2) Offset table over the full normalized document.
     let line_offsets = build_line_offsets(&full_text);
 
-    // Resolve chunk config against the configured max_seq_len (the hard cap).
+    // Resolve chunk config against the configured max_seq_len (the hard cap),
+    // received here as a plain parameter so prepare needs no `Core` at all.
     let cfg = ChunkConfig::resolve(
         req.target_tokens,
         req.max_tokens,
         req.overlap_lines,
-        core.config.max_seq_len,
+        max_seq_len,
     );
 
     // (4) Chunk the normalized text into line-snapped segments.
     let chunks = chunk_text(&full_text, &cfg);
 
-    // doc_id: caller-supplied or auto-assigned (returned in the ack).
-    let doc_id = match req.doc_id {
-        Some(id) => id,
-        None => auto_doc_id(core),
-    };
-
-    // Build the doc's segments + the parallel (segment_id, embed_text) lists.
+    // Build the doc's segments + the parallel embed-text list.
     let mut segments: Vec<Segment> = Vec::with_capacity(chunks.len());
-    let mut segment_ids: Vec<u64> = Vec::with_capacity(chunks.len());
     let mut embed_texts: Vec<String> = Vec::with_capacity(chunks.len());
     let mut skipped_now: u64 = 0;
 
     for chunk in chunks {
-        let segment_id = core.alloc_segment_id();
         // Oversized single line → truncate ONLY the embed text to the hard cap.
         // The stored segment text stays whole (get_segment returns it intact).
         let embed_full = if chunk.oversized {
@@ -1022,11 +1192,10 @@ pub fn accept_index_raw(core: &mut Core, req: RawIndexRequest) -> RawAcceptResul
         if is_blank {
             skipped_now += 1;
         }
-        segment_ids.push(segment_id);
         embed_texts.push(if is_blank { String::new() } else { embed_full });
         let kw_counts = token_multiset(&chunk.text);
         segments.push(Segment {
-            segment_id,
+            segment_id: 0, // placeholder; the real id is allocated at commit
             text: chunk.text,
             embed_text: None,
             line_start: Some(chunk.line_start),
@@ -1037,13 +1206,63 @@ pub fn accept_index_raw(core: &mut Core, req: RawIndexRequest) -> RawAcceptResul
         });
     }
 
+    PreparedRawIndex {
+        collection: req.collection,
+        doc_id: req.doc_id,
+        name: req.name,
+        meta: req.meta,
+        full_text,
+        line_offsets,
+        segments,
+        embed_texts,
+        skipped_now,
+    }
+}
+
+/// The locked *commit* half of an `index_raw` accept — steps (3) and (5):
+/// allocate real segment ids, store the full normalized text + offset table on
+/// the doc (so `get_segment` works the instant this returns — before any
+/// embedding), mark the collection `text_ready` / `Building`, upsert the doc,
+/// and enqueue the chunked embed jobs (which later fill only the vectors).
+///
+/// Returns immediately; embedding happens off-thread, exactly like
+/// `index_segments`. The doc is greppable and `get_segment`-able right away.
+pub fn commit_index_raw(core: &mut Core, prepared: PreparedRawIndex) -> RawAcceptResult {
+    let _embedder = ensure_embedder(core);
+
+    let PreparedRawIndex {
+        collection,
+        doc_id,
+        name,
+        meta,
+        full_text,
+        line_offsets,
+        mut segments,
+        embed_texts,
+        skipped_now,
+    } = prepared;
+
+    // doc_id: caller-supplied or auto-assigned (returned in the ack).
+    let doc_id = match doc_id {
+        Some(id) => id,
+        None => auto_doc_id(core),
+    };
+
+    // Allocate the real, store-unique segment ids, keeping the parallel id vec
+    // for the embed jobs.
+    let mut segment_ids: Vec<u64> = Vec::with_capacity(segments.len());
+    for seg in segments.iter_mut() {
+        seg.segment_id = core.alloc_segment_id();
+        segment_ids.push(seg.segment_id);
+    }
+
     let segment_count = segments.len();
 
     // (3) Build the doc carrying the full text + offset table.
     let doc = Document {
         doc_id: doc_id.clone(),
-        name: req.name,
-        meta: req.meta,
+        name,
+        meta,
         segments,
         full_text: Some(full_text),
         line_offsets: Some(line_offsets),
@@ -1052,32 +1271,42 @@ pub fn accept_index_raw(core: &mut Core, req: RawIndexRequest) -> RawAcceptResul
     // (5) Short write-locked accept: install text+offsets, mark Building, upsert.
     let coll = core
         .collections
-        .entry(req.collection.clone())
+        .entry(collection.clone())
         .or_insert_with(Collection::new);
     coll.text_ready = true;
     coll.vector_status = VectorStatus::Building;
     coll.error = None;
-    coll.pending_jobs = coll.pending_jobs.saturating_add(1);
     coll.skipped = coll.skipped.saturating_add(skipped_now);
     // Atomic upsert by doc_id (same semantics as index_segments).
     coll.docs.insert(doc_id.clone(), doc);
 
-    // Enqueue the embed job for the worker (fills vectors off-thread).
-    enqueue_job(
+    // Enqueue the embed work, chunked across the worker pool (bumps
+    // `pending_jobs` by the chunk count — see `enqueue_embed_chunks`).
+    enqueue_embed_chunks(
         core,
-        EmbedJob {
-            collection: req.collection.clone(),
-            doc_id: doc_id.clone(),
-            segment_ids,
-            embed_texts,
-        },
+        collection.clone(),
+        doc_id.clone(),
+        segment_ids,
+        embed_texts,
     );
 
     RawAcceptResult {
-        collection: req.collection,
+        collection,
         doc_id,
         segment_count,
     }
+}
+
+/// Synchronous accept for `index_raw`: thin prepare+commit wrapper (reading
+/// `max_seq_len` from the core it already holds), kept so existing
+/// callers/tests keep working. The dispatcher (`lib.rs`) instead runs
+/// [`prepare_index_raw`] BEFORE taking the write lock and [`commit_index_raw`]
+/// under it, so normalization/offsets/chunking never block concurrent searches.
+/// (Test-only in non-test builds, hence the allow.)
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn accept_index_raw(core: &mut Core, req: RawIndexRequest) -> RawAcceptResult {
+    let max_seq_len = core.config.max_seq_len;
+    commit_index_raw(core, prepare_index_raw(req, max_seq_len))
 }
 
 /// Truncate `text` to roughly `max_tokens` for *embedding only*. Uses the same
@@ -1874,15 +2103,17 @@ pub fn wait_until_ready(collection: &str, timeout: std::time::Duration) -> bool 
 // shutdown
 // ===========================================================================
 
-/// Stop and join the background worker. Idempotent and safe to call from a C++
-/// teardown path. After this the worker is gone; a later ingest spawns a fresh
-/// one lazily.
+/// Stop and join the background worker pool — including any threads retired by
+/// a pool resize (see [`enqueue_job`]), which already received their Stops and
+/// only await the join. Idempotent and safe to call from a C++ teardown path.
+/// After this the worker is gone; a later ingest spawns a fresh one lazily.
 pub fn shutdown() {
-    // Take the worker out of the singleton under the write lock, then join it
-    // OUTSIDE the lock (joining holds no index lock, so a job applying mid-join
-    // can still acquire the write lock and finish cleanly).
-    let worker = match CORE.write() {
-        Ok(mut c) => c.worker.take(),
+    // Take the worker AND the retired handles out of the singleton under the
+    // write lock, then join them OUTSIDE the lock (joining holds no index lock,
+    // so a job applying mid-join can still acquire the write lock and finish
+    // cleanly — joining under the lock would deadlock on exactly that).
+    let (worker, retired) = match CORE.write() {
+        Ok(mut c) => (c.worker.take(), std::mem::take(&mut c.retired_workers)),
         Err(_) => return,
     };
     if let Some(w) = worker {
@@ -1893,6 +2124,11 @@ pub fn shutdown() {
         for handle in w.handles {
             let _ = handle.join();
         }
+    }
+    // Retired threads were sent their Stops at retirement time; their queue has
+    // long since drained, so these joins are (at worst) waiting out one job.
+    for handle in retired {
+        let _ = handle.join();
     }
 }
 
@@ -2409,6 +2645,128 @@ mod tests {
         assert!(
             wait_until_ready("docs", Duration::from_secs(5)),
             "ingest after shutdown should respawn worker and complete"
+        );
+    }
+
+    #[test]
+    fn large_ingest_is_chunked_into_multiple_jobs_and_completes() {
+        // One ingest of 600 tiny segments must split into ceil(600/256) = 3
+        // embed jobs (so a huge doc spreads across the worker pool) and still
+        // converge: every segment embedded, collection Ready.
+        let _g = test_lock();
+        let n = 600usize;
+        {
+            let mut c = CORE.write().unwrap();
+            let segments: Vec<SegmentInput> =
+                (0..n).map(|i| seg(&format!("tiny segment {i}"))).collect();
+            accept_index(
+                &mut c,
+                IndexRequest {
+                    collection: "big".to_string(),
+                    doc_id: "d".to_string(),
+                    name: "d".to_string(),
+                    meta: json!({}),
+                    segments,
+                    description: None,
+                },
+            );
+            // Still holding the write lock, so no job can have applied yet:
+            // pending_jobs must equal the chunk count, not 1.
+            let coll = c.collections.get("big").unwrap();
+            let want_chunks = ((n + EMBED_JOB_CHUNK - 1) / EMBED_JOB_CHUNK).max(1) as u32;
+            assert_eq!(
+                coll.pending_jobs, want_chunks,
+                "a {n}-segment ingest must enqueue {want_chunks} chunked jobs"
+            );
+        }
+        assert!(
+            wait_until_ready("big", Duration::from_secs(10)),
+            "all chunked jobs must apply and flip the collection Ready"
+        );
+        let c = CORE.read().unwrap();
+        let coll = c.collections.get("big").unwrap();
+        assert_eq!(coll.vector_status, VectorStatus::Ready);
+        assert_eq!(coll.embedded, n as u64, "every segment must be embedded");
+        let doc = coll.docs.get("d").unwrap();
+        assert!(
+            doc.segments.iter().all(|s| s.vector.is_some()),
+            "all segments across all chunks must carry vectors"
+        );
+    }
+
+    /// Minimal multi-session stand-in for the resize test: `bulk_concurrency`
+    /// is the tunable knob; vectors are valid (finite, non-zero) unit vectors
+    /// so `apply_job` counts them as embedded.
+    struct StubEmbedder(usize);
+
+    impl Embedder for StubEmbedder {
+        fn dim(&self) -> usize {
+            4
+        }
+        fn embed_passages(&self, texts: &[String]) -> Vec<Vec<f32>> {
+            texts.iter().map(|_| vec![1.0, 0.0, 0.0, 0.0]).collect()
+        }
+        fn embed_query(&self, _text: &str) -> Vec<f32> {
+            vec![1.0, 0.0, 0.0, 0.0]
+        }
+        fn bulk_concurrency(&self) -> usize {
+            self.0
+        }
+    }
+
+    #[test]
+    fn worker_pool_resizes_when_bulk_concurrency_changes() {
+        let _g = test_lock();
+        // Concurrency 2 → the first ingest lazily spawns a 2-thread pool.
+        {
+            let mut c = CORE.write().unwrap();
+            c.embedder = Some(Arc::new(StubEmbedder(2)));
+        }
+        index("rz1", "d1", &["first doc body"]);
+        {
+            let c = CORE.read().unwrap();
+            assert_eq!(
+                c.worker.as_ref().map(|w| w.handles.len()),
+                Some(2),
+                "pool must match the embedder's bulk concurrency"
+            );
+            assert!(c.retired_workers.is_empty(), "nothing retired yet");
+        }
+        // Swap in a concurrency-4 embedder (what a reconfigure does); the next
+        // ingest must retire the 2-thread pool and spawn a 4-thread one.
+        {
+            let mut c = CORE.write().unwrap();
+            c.embedder = Some(Arc::new(StubEmbedder(4)));
+        }
+        index("rz2", "d2", &["second doc body"]);
+        {
+            let c = CORE.read().unwrap();
+            assert_eq!(
+                c.worker.as_ref().map(|w| w.handles.len()),
+                Some(4),
+                "pool must be resized to the new bulk concurrency"
+            );
+            assert_eq!(
+                c.retired_workers.len(),
+                2,
+                "old threads must be stashed for shutdown to join"
+            );
+        }
+        // shutdown must join current + retired threads without deadlocking and
+        // only after every queued job applied → both collections Ready.
+        shutdown();
+        let c = CORE.read().unwrap();
+        assert!(c.worker.is_none(), "shutdown takes the live pool");
+        assert!(c.retired_workers.is_empty(), "shutdown joins retired threads");
+        assert_eq!(
+            c.collections.get("rz1").unwrap().vector_status,
+            VectorStatus::Ready,
+            "pre-resize collection must finish"
+        );
+        assert_eq!(
+            c.collections.get("rz2").unwrap().vector_status,
+            VectorStatus::Ready,
+            "post-resize collection must finish"
         );
     }
 
