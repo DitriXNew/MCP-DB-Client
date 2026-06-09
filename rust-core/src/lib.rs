@@ -162,6 +162,10 @@ fn dispatch(method: &str, payload_json: &str) -> String {
                 if let Some(err) = &coll.error {
                     obj["error"] = json!(err);
                 }
+                // `description` only present when the collection was labelled.
+                if let Some(desc) = &coll.description {
+                    obj["description"] = json!(desc);
+                }
                 collections.insert(name.clone(), obj);
             }
 
@@ -174,6 +178,40 @@ fn dispatch(method: &str, payload_json: &str) -> String {
                 "collections": collections,
                 "callsHandled": CALLS_HANDLED.load(std::sync::atomic::Ordering::Relaxed),
             }))
+        }
+
+        // AI-facing discovery: a flat array of the collections that exist, each
+        // with its description + counts + state, so a client can choose which
+        // collection(s) to search (then pass them as `collections` to `search`).
+        "list_collections" => {
+            let core = match CORE.read() {
+                Ok(c) => c,
+                Err(_) => {
+                    return Envelope::err(codes::INTERNAL, "core lock poisoned").to_json_string()
+                }
+            };
+            let mut list: Vec<Value> = core
+                .collections
+                .iter()
+                .map(|(name, coll)| {
+                    json!({
+                        "name": name,
+                        "description": coll.description,
+                        "n_docs": coll.docs.len(),
+                        "n_segments": coll.n_segments(),
+                        "vector_status": coll.vector_status.as_str(),
+                        "text_ready": coll.text_ready,
+                    })
+                })
+                .collect();
+            // Stable order (HashMap iteration is otherwise nondeterministic).
+            list.sort_by(|a, b| {
+                a["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["name"].as_str().unwrap_or(""))
+            });
+            Envelope::ok(json!({ "collections": list }))
         }
 
         // Clear mutable state back to defaults. Idempotent.
@@ -501,6 +539,7 @@ fn parse_index_request(payload: &Value) -> Result<IndexRequest, String> {
         name,
         meta,
         segments,
+        description: opt_str(payload, "collection_description"),
     })
 }
 
@@ -594,7 +633,10 @@ fn parse_search_request(payload: &Value) -> Result<SearchRequest, String> {
     let mode = SearchMode::parse(payload.get("mode").and_then(|x| x.as_str()));
     Ok(SearchRequest {
         query,
-        collection: opt_str(payload, "collection"),
+        // Scope: a `collections` array (search a subset) takes precedence over a
+        // single `collection` string; absent ⇒ all collections. The array is
+        // joined into the comma-separated form `in_scope` matches against.
+        collection: parse_collection_scope(payload),
         mode,
         k,
         min_score,
@@ -602,6 +644,25 @@ fn parse_search_request(payload: &Value) -> Result<SearchRequest, String> {
         include_text: bool_or(payload, "include_text", true),
         filter: MetaFilter::parse(payload),
     })
+}
+
+/// Resolve the collection scope from a `collections` array (preferred) or a
+/// single `collection` string, into the comma-joined form the store matches on.
+/// Returns `None` (= all collections) when neither is present/non-empty.
+fn parse_collection_scope(payload: &Value) -> Option<String> {
+    if let Some(arr) = payload.get("collections").and_then(|x| x.as_array()) {
+        let names: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if !names.is_empty() {
+            return Some(names.join(","));
+        }
+    }
+    opt_str(payload, "collection").filter(|s| !s.trim().is_empty())
 }
 
 /// Parse a `grep` payload. `pattern` is required and non-empty. `max_matches`
@@ -877,6 +938,56 @@ mod tests {
         let out = unsafe { rcore_dispatch(m.as_ptr(), p.as_ptr()) };
         let s = unsafe { take_and_free(out) };
         serde_json::from_str(&s).unwrap()
+    }
+
+    #[test]
+    fn collections_carry_descriptions_and_scope_search() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // Two labelled collections (keyword path needs no embedding wait).
+        call(
+            "index_segments",
+            r#"{"collection":"alpha","doc_id":"a","collection_description":"Alpha corpus","segments":[{"text":"shared token alpha-only"}]}"#,
+        );
+        call(
+            "index_segments",
+            r#"{"collection":"beta","doc_id":"b","collection_description":"Beta corpus","segments":[{"text":"shared token beta-only"}]}"#,
+        );
+
+        // list_collections exposes name + description for AI discovery.
+        let lc = call("list_collections", "");
+        let arr = lc["result"]["collections"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let by_name: std::collections::HashMap<&str, &Value> =
+            arr.iter().map(|c| (c["name"].as_str().unwrap(), c)).collect();
+        assert_eq!(by_name["alpha"]["description"], json!("Alpha corpus"));
+        assert_eq!(by_name["beta"]["description"], json!("Beta corpus"));
+
+        // stats also carries the description.
+        let st = call("stats", "");
+        assert_eq!(
+            st["result"]["collections"]["alpha"]["description"],
+            json!("Alpha corpus")
+        );
+
+        // Multi-collection scope: searching "shared" restricted to ["alpha"]
+        // returns only alpha hits; omitting the filter searches every collection.
+        let scoped = call(
+            "search",
+            r#"{"query":"shared","mode":"keyword","k":10,"collections":["alpha"]}"#,
+        );
+        let hits = scoped["result"]["hits"].as_array().unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|h| h["collection"] == json!("alpha")));
+
+        let all = call("search", r#"{"query":"shared","mode":"keyword","k":10}"#);
+        let colls: std::collections::HashSet<&str> = all["result"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["collection"].as_str().unwrap())
+            .collect();
+        assert!(colls.contains("alpha") && colls.contains("beta"));
     }
 
     #[test]

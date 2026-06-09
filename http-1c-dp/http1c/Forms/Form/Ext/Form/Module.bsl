@@ -261,7 +261,7 @@ EndProcedure
 &AtClient
 Function BuildVersion()
 	// Bump on EVERY source change so the log proves a fresh .epf is running.
-	Return "selftest-build-23-sync-ui";
+	Return "selftest-build-24-coll-registry";
 EndFunction
 
 &AtClient
@@ -2496,7 +2496,7 @@ Procedure Sync_SubmitNext()
 	// The collection's description rides on the doc "name" (and is what a later
 	// list-collections surfaces to an AI client).
 	DocId = G.collection + "-batch-" + String(SyncCtx.Pos);
-	Payload = SegmentsPayload(G.collection, DocId, G.description, Slice);
+	Payload = SegmentsPayload(G.collection, DocId, G.collection, Slice, G.description);
 	Try
 		Component.BeginCallingRagDispatch(
 			New NotifyDescription("Sync_BatchEnd", ThisObject), "index_segments", Payload);
@@ -2689,15 +2689,38 @@ Procedure Sync_TestDump() Export
 		W = New TextWriter(SelfTestOutFile("ragselftest-result.txt"), TextEncoding.UTF8, Chars.LF, False);
 		W.WriteLine("build=" + BuildVersion() + " SYNCTEST");
 		W.WriteLine(RagOutput);
-		If StrFind(RagOutput, "ГОТОВО") > 0 Or StrFind(RagOutput, "FAIL") > 0 Then
-			W.WriteLine("DONE");
-			W.Close();
-			Return;
-		EndIf;
 		W.Close();
 	Except
 	EndTry;
+	If StrFind(RagOutput, "FAIL") > 0 Then
+		Try
+			W = New TextWriter(SelfTestOutFile("ragselftest-result.txt"), TextEncoding.UTF8, Chars.LF, True);
+			W.WriteLine("DONE");
+			W.Close();
+		Except
+		EndTry;
+		Return;
+	EndIf;
+	If StrFind(RagOutput, "ГОТОВО") > 0 Then
+		// End-to-end proof: read back the collection registry (name + description).
+		Component.BeginCallingRagDispatch(
+			New NotifyDescription("Sync_TestListEnd", ThisObject), "list_collections", "{}");
+		Return;
+	EndIf;
 	AttachIdleHandler("Sync_TestDump", 2, True);
+
+EndProcedure
+
+&AtClient
+Procedure Sync_TestListEnd(ResultJson, ParametersCall, AdditionalParameters) Export
+
+	Try
+		W = New TextWriter(SelfTestOutFile("ragselftest-result.txt"), TextEncoding.UTF8, Chars.LF, True);
+		W.WriteLine("list_collections -> " + Left(ResultJson, 800));
+		W.WriteLine("DONE");
+		W.Close();
+	Except
+	EndTry;
 
 EndProcedure
 
@@ -3468,12 +3491,17 @@ Function PerfSegmentsPayload(Collection, DocId, Count)
 EndFunction
 
 &AtClient
-Function SegmentsPayload(Collection, DocId, Name, Segments)
+Function SegmentsPayload(Collection, DocId, Name, Segments, Description = "")
 	Payload = New Structure;
 	Payload.Insert("collection", Collection);
 	Payload.Insert("doc_id", DocId);
 	Payload.Insert("name", Name);
 	Payload.Insert("segments", Segments);
+	// Labels the collection in the core (surfaced by list_collections / stats),
+	// so an AI client can discover collections by description.
+	If ValueIsFilled(Description) Then
+		Payload.Insert("collection_description", Description);
+	EndIf;
 	W = New JSONWriter;
 	W.SetString();
 	WriteJSON(W, Payload);

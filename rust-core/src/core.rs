@@ -132,6 +132,11 @@ pub struct Collection {
     pub failed: u64,
     /// Segments skipped because their text was blank.
     pub skipped: u64,
+    /// Human/AI-facing description of what this collection holds. Set via the
+    /// `collection_description` field on `index_segments` (last non-empty wins).
+    /// Surfaced by `stats` / `list_collections` so an MCP client can discover
+    /// which collections exist and pick a subset to search.
+    pub description: Option<String>,
 }
 
 impl Collection {
@@ -145,6 +150,7 @@ impl Collection {
             embedded: 0,
             failed: 0,
             skipped: 0,
+            description: None,
         }
     }
 
@@ -460,6 +466,9 @@ pub struct IndexRequest {
     pub name: String,
     pub meta: serde_json::Value,
     pub segments: Vec<SegmentInput>,
+    /// Optional description of the *collection* (not the doc). Sets/updates
+    /// `Collection::description` so callers can label what a collection holds.
+    pub description: Option<String>,
 }
 
 /// Outcome of the synchronous accept.
@@ -538,6 +547,12 @@ pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
     coll.error = None;
     coll.pending_jobs = coll.pending_jobs.saturating_add(1);
     coll.skipped = coll.skipped.saturating_add(skipped_now);
+    // Label the collection (last non-empty description wins).
+    if let Some(desc) = req.description {
+        if !desc.trim().is_empty() {
+            coll.description = Some(desc);
+        }
+    }
 
     // Atomic upsert by doc_id: install the doc's text segments NOW (vectors are
     // `None`). Re-ingesting the same doc_id replaces all of its segments here, in
@@ -1382,11 +1397,20 @@ fn make_hit(s: &Scored, include_text: bool) -> Hit {
     }
 }
 
-/// Does this collection fall within the request's `collection` scope?
+/// Does this collection fall within the request's scope? The scope is a
+/// comma-separated list of collection names (the wire side accepts either a
+/// single `collection` string or a `collections` array and joins it here): an
+/// exact match against any listed name passes. `None` (no filter) ⇒ all
+/// collections. Empty names in the list are ignored. Collection names therefore
+/// must not contain commas (they don't — they're caller-chosen identifiers).
 fn in_scope(want: &Option<String>, cname: &str) -> bool {
     match want {
-        Some(w) => w == cname,
         None => true,
+        Some(list) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .any(|name| name == cname),
     }
 }
 
@@ -1923,6 +1947,7 @@ mod tests {
             name: format!("doc {doc_id}"),
             meta: json!({}),
             segments: texts.iter().map(|t| seg(t)).collect(),
+            description: None,
         };
         let mut c = CORE.write().unwrap();
         accept_index(&mut c, req);
@@ -1966,6 +1991,7 @@ mod tests {
                         name: "d".to_string(),
                         meta: json!({}),
                         segments,
+                        description: None,
                     },
                 );
             }
@@ -2078,6 +2104,7 @@ mod tests {
                 name: "doc d1".to_string(),
                 meta: json!({}),
                 segments: vec![seg("alpha text here"), seg("beta text here")],
+                description: None,
             };
             accept_index(&mut c, req);
 
@@ -2343,6 +2370,7 @@ mod tests {
             name: "n".to_string(),
             meta: json!({}),
             segments: vec![seg("real content here"), seg("   "), seg("")],
+            description: None,
         };
         {
             let mut c = CORE.write().unwrap();
@@ -2707,6 +2735,7 @@ mod tests {
                     name: "n".to_string(),
                     meta: json!({}),
                     segments: vec![seg("the exact sku ABC-123 lives here"), seg("unrelated prose")],
+                    description: None,
                 },
             );
             let coll = c.collections.get("docs").unwrap();

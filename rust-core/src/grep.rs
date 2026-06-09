@@ -288,6 +288,7 @@ mod tests {
                         line_end: None,
                         meta: json!({}),
                     }],
+                    description: None,
                 },
             );
             let coll = c.collections.get("docs").unwrap();
