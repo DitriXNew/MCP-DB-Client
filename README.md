@@ -265,7 +265,9 @@ The component also enforces:
 
 ## Native Component API
 
-Methods exposed to 1C (English / Russian names):
+Methods exposed to 1C (English / Russian names). All of these are callable
+asynchronously from BSL via the platform-generated `BeginCalling<Name>` wrappers
+(`BeginCallingStartListen`, …):
 
 | Method | Description |
 |--------|-------------|
@@ -273,20 +275,45 @@ Methods exposed to 1C (English / Russian names):
 | `StopListen()` / `ОстановитьПрослушивание` | Stop the server and unblock all pending requests |
 | `SendResponse(json)` / `ОтправитьОтвет` | Send the final response for a pending request |
 | `SendProgress(id, progress, total, message)` / `ОтправитьПрогресс` | Send a progress notification for a pending request |
+| `ApplyConfig(json)` / `ПрименитьНастройки` | **Async-safe config sink** (see below). Applies any subset of `logging_enabled`, `log_path`, `timeout`, `tools_json`, `resources_json`, `prompts_json`, `auth_token` in one call |
+| `GetStatus()` / `ПолучитьСтатус` | **Async-safe** read of the status JSON (same payload as the `Status` property) |
+| `RagDispatch(method, payload)` / `RagВыполнить` | Drive the Rust search core (`rcore`) — see [Search Subsystem](#search-subsystem-rag) |
+| `TakeScreenshot(pid, format, quality, grayscale)` / `СделатьСкриншот` | Capture windows of a process as base64 images |
+| `GetProcessId()` / `ПолучитьИдентификаторПроцесса` | Return the current 1C process id |
 
-Properties exposed to 1C:
+### Configuration: async methods vs. synchronous properties
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `Status` / `Статус` | Read-only | Returns JSON with server status |
-| `Timeout` / `Таймаут` | Read/Write | Response timeout in seconds (default: 30) |
-| `AuthToken` / `ТокенАвторизации` | Write-only | Bearer token for authentication (empty = no auth) |
-| `LoggingEnabled` / `ЛогированиеВключено` | Read/Write | Whether runtime logging is active |
-| `LogPath` / `ПутьЛога` | Read/Write | Path to the log file |
-| `Tools` / `Инструменты` | Write-only | Register/update the tool list (JSON array) |
-| `Resources` / `Ресурсы` | Write-only | Register/update the resource list (JSON array) |
-| `Prompts` / `Промпты` | Write-only | Register/update the prompt list (JSON array) |
-| `Version` / `Версия` | Read-only | Component version string |
+The component also exposes its configuration as **properties** (`LoggingEnabled`,
+`LogPath`, `Timeout`, `Tools`, `Resources`, `Prompts`, `AuthToken`, `Status`,
+`Version`). These still exist, but reading or writing an AddIn property is a
+**synchronous** platform call.
+
+> In an **async-only infobase** — i.e. one where *"synchronous extension and
+> add-in calls"* are disabled (the modern 1C default) — every `Component.Prop = …`
+> assignment and every `… = Component.Prop` read throws
+> **`Cannot call synchronous methods on the client!`**. 1C provides **no async
+> property accessors** (there is no `BeginSetProperty`), so configuration cannot
+> go through properties at all in that mode.
+
+That is why all configuration is funneled through the **async `ApplyConfig`
+method** and all status reads through the **async `GetStatus` function**. The
+reference form (`Module.bsl`) uses only these — it never touches a property on
+the client. The properties are retained for backward compatibility and for
+infobases that still allow synchronous calls.
+
+| Config field (in `ApplyConfig` JSON) | Equivalent property | Notes |
+|--------------------------------------|---------------------|-------|
+| `logging_enabled` (bool) | `LoggingEnabled` | runtime logging on/off |
+| `log_path` (string) | `LogPath` | log file path (empty → default) |
+| `timeout` (int) | `Timeout` | response timeout, seconds |
+| `tools_json` (string) | `Tools` | pre-serialized tool-list JSON array |
+| `resources_json` (string) | `Resources` | pre-serialized resource-list JSON array |
+| `prompts_json` (string) | `Prompts` | pre-serialized prompt-list JSON array |
+| `auth_token` (string) | `AuthToken` | Bearer token (empty = no auth) |
+| *(read via `GetStatus`)* | `Status` / `Version` | status JSON includes `version` |
+
+Every field is optional — `ApplyConfig` only touches the keys you send, so it
+doubles as a "set just the logging flag" call or a full one-shot configuration.
 
 ## ExternalEvent Types
 
@@ -309,7 +336,7 @@ Events sent from the native component to 1C:
 | `notifications/initialized` | Native — accepted silently |
 | `ping` | Native — returns empty result |
 | `tools/list` | Native — paginated, from cache |
-| `tools/call` | Delegated to 1C via ExternalEvent |
+| `tools/call` | `search` / `grep` / `get_segment` handled natively by the search core; all other tools delegated to 1C via ExternalEvent |
 | `resources/list` | Native — paginated, from cache |
 | `resources/read` | Delegated to 1C via ExternalEvent |
 | `prompts/list` | Native — paginated, from cache |
@@ -361,7 +388,27 @@ Events sent from the native component to 1C:
 
 ## Search Subsystem (RAG)
 
-The component ships with an optional semantic-search subsystem so a 1C MCP server can index its own content (documentation, code, catalog descriptions, logs) and let AI clients search it. The retrieval engine is a small Rust core, crate `rcore`, that runs entirely in-process.
+The component ships with an optional semantic-search subsystem so a 1C MCP server can index its own content (documentation, code, catalog descriptions, logs, QA scenarios, master data) and let AI clients search it **by meaning**. The retrieval engine is a small Rust core, crate `rcore`, that runs entirely in-process inside the 1C session.
+
+### Why this exists
+
+An MCP server already lets an AI client *act* inside a specific 1C installation (run a query, call a method, execute a test). What it lacked was the ability to *find by meaning* the thing to act on. That is retrieval — the **"R" in RAG** — and it is what this subsystem adds. Generation stays with the client model; we only retrieve and ground.
+
+Concretely, it closes gaps like: an AI writing a Vanessa BDD test needs the **catalog of available steps** and the **existing scenarios** so it reuses real, runnable phrases instead of hallucinating step text; or finding a product/client **by intent** ("that construction contractor from Kyiv", "red winter jacket") rather than by exact code.
+
+### Design decisions (and why)
+
+The shape of the subsystem follows directly from its constraints — they are part of the problem, not incidental:
+
+| Decision | Rationale |
+|----------|-----------|
+| **Content-agnostic core; domain logic lives in outside adapters** | The core never knows about Gherkin, SKUs, or INNs. Adapters (in 1C/BSL) parse the domain and feed the core generic records. One engine serves QA, products, clients, docs — instead of N bespoke searches. |
+| **In-process, in-memory, no disk persistence** | Data is corporate and session-bound (Vanessa runs in the client session); the index lives inside the 1C process and dies with it. A stale cache is worse than none for grounding, so the index is rebuilt from the live source on load. |
+| **Flat brute-force vector index (no ANN/Qdrant)** | Target scale is ~5–10k records per session. Search is microseconds and RAM is tens of MB — an ANN index would be pure complexity. |
+| **Hybrid retrieval (dense + keyword), not pure semantic** | Half the queries are exact identifiers (SKU, INN, step syntax) where embeddings fail; half are intent where exact match fails. Both channels are needed; keyword is a full scan (cheap at this scale). |
+| **Asynchronous ingest (push from 1C)** | Embedding 5–10k records takes 15–60 s and must never freeze the thin-client UI. Ingest calls return immediately; a background worker embeds off-thread. Progress is observed by polling `stats` / `list_collections`. |
+| **Async-only config/status methods** | 1C forbids synchronous AddIn property access in async-only infobases, so configuration and status go through the async `ApplyConfig`/`GetStatus` methods (see [Native Component API](#native-component-api)). |
+| **`text` vs. `embed_text` split** | The single biggest quality lever — the adapter decides what gets embedded (an enriched composite) separately from what is stored/returned verbatim, without polluting the core with domain fields. |
 
 ### MCP tools
 
@@ -388,7 +435,61 @@ Documents are pushed into the core through `rcore`'s JSON ABI. Ingest is **async
 - **`index_segments`** — ingest a document as a list of pre-chunked segments (each with optional `embed_text`, line range, and per-segment `meta`). `doc_id` is required so segments can be upserted/deleted.
 - **`index_raw`** — ingest a raw multi-line document; the core normalizes line endings, builds a line-offset table, stores the full text, and chunks it (line-snapped, by token budget, with overlap). `doc_id` is optional (auto-assigned and returned in the ack).
 
-Supporting methods include `configure`, `stats`, `reset`, `delete_document`, and `delete_collection`.
+Each segment carries two distinct texts:
+
+- **`text`** — stored and returned verbatim (the canonical record).
+- **`embed_text`** — the enriched composite that actually goes into the vector (name + tags + steps for a scenario; name + brand + category for a product). If omitted, `text` is embedded. This is where the adapter spends its quality budget.
+
+### Collections and the collection registry
+
+Every document belongs to a **collection** (a named bucket: `qa_steps`, `products`, `clients`, …). Collections are created implicitly on first ingest and can carry a free-text **description**.
+
+- **`list_collections`** returns the registry: for each collection its `name`, `description`, `n_docs`, `n_segments`, `vector_status` (`empty` / `building` / `ready` / `error`), and `text_ready`. This is how an AI client **discovers what is searchable** before querying.
+- **`search`** scopes by `collection`: omit it to search **all** collections, pass one name, or pass a **comma-separated list** (or a `collections` array) to search a chosen subset. So an agent can read the registry, pick the relevant collections by description, and search just those.
+
+### Embedding worker pool
+
+The embedder runs on a background pool whose size is set by `embed_workers` in `configure` (settable from the 1C form). One worker (default) keeps a single ONNX session and serializes embedding; multiple workers run several sessions concurrently. On CPU this trades memory for throughput (roughly memory-bandwidth bound, not linear in workers); multi-worker forces CPU because concurrent DirectML sessions are not supported. Query embeddings are prioritized so a bulk reindex does not starve live search latency.
+
+### Core method contract (`RagDispatch`)
+
+All of the following are invoked from 1C via the async `RagDispatch(method, payload)` method (the C++ component forwards the JSON envelope to `rcore` verbatim and does not interpret the method name). Each returns `{"ok":true,"result":…}` or `{"ok":false,"error":{"code","message"}}`:
+
+| Method | Purpose |
+|--------|---------|
+| `configure` | Load the model once (`model_path`, `device`, `normalize`, `max_seq_len`, `intra_threads`, `embed_workers`). `dim` is fixed by the model. Idempotent; re-configuring with a different model/dim after indexing implies `reset`. |
+| `index_segments` | Async ingest of pre-chunked segments (with `embed_text`, line ranges, per-segment `meta`, optional collection `description`). |
+| `index_raw` | Async ingest of a raw document; the core chunks it (line-snapped, token-budgeted, overlapping) and builds the offset table. |
+| `search` | Ranked retrieval — `mode` dense/keyword/hybrid, `collection`(s), meta filters, `k`, `min_score`, `max_per_doc`, `include_text`. |
+| `get_segment` | O(1) line-range slice of a raw document by `doc_id`. |
+| `grep` | RE2 regex / substring scan over stored text. |
+| `stats` | Global + per-collection counters, model, dim, memory estimate, collection statuses. |
+| `list_collections` | The collection registry (names + descriptions + counts + status). |
+| `delete_document` / `delete_collection` | Remove a document (by `doc_id`) or a whole collection. |
+| `reset` | Clear the entire index. |
+
+### Working with the subsystem — for the 1C developer
+
+You write **adapters**: thin BSL that turns a domain object into generic records and pushes them in. The core stays domain-free.
+
+1. **Attach + configure once.** Attach the full component, then `configure` via `RagDispatch` with the local model path and `embed_workers`. (Component-level settings — logging/timeout — go through `ApplyConfig`, never through synchronous properties.)
+2. **Index asynchronously.** For each domain object build segments — set `text` (verbatim) and `embed_text` (the enriched composite), attach `meta` (`{sku, inn, type, tags, …}`) and a `doc_id` for upsert — and call `index_segments`. The call returns immediately; embedding happens in the background.
+3. **Watch progress** by polling `list_collections` / `stats` until `vector_status = ready`. Text tools (`grep`, `get_segment`) work the instant a document is accepted; dense `search` lights up when embedding finishes.
+4. **Keep it fresh within the session.** When one object changes, re-`index_segments` just that `doc_id` (atomic upsert) or `delete_document` — never rebuild the whole corpus.
+5. **All file/content reads stay client-side** (`&AtClient`) in the reference form, so source files are read from the operator's machine, not the server.
+
+The reference end-to-end flow is exercised headlessly by the RAG self-test (stub QA/products/clients adapters → index → embed → search, asserting pass/fail). See the `onec-rag-selftest` skill.
+
+### Working with the subsystem — for the AI agent / MCP client
+
+From the client side it is just three MCP tools, but used in a deliberate order:
+
+1. **Discover.** Call `list_collections` first to see what this specific 1C base has indexed and read each collection's description — don't assume; the corpus is per-installation and per-session.
+2. **Search by meaning, scoped.** Call `search` with `mode: hybrid` for anything involving exact identifiers (SKU/INN/article/step syntax) and `dense` for pure intent. Scope to the relevant `collection`(s) from step 1, or omit to search everything. Use meta filters (`all`/`any`) to narrow.
+3. **Ground, don't hallucinate.** Treat hits as the source of truth for *this* base. For QA, prefer canonical step phrases and existing scenarios returned by search over inventing them; a reverse step→scenario lookup (a QA-adapter convenience over the same `search`) surfaces real usages with real parameters.
+4. **Zoom in.** Use `get_segment` to pull the exact line range of a hit verbatim, and `grep` for exact-string / regex confirmation (it works even before vectors are ready). A `building` collection returns partial results flagged as incomplete — retry once it is `ready`.
+
+The contract is: **the client retrieves and grounds on what actually exists in this base right now; it never swallows the whole corpus into context and never relies on exact match alone.**
 
 ### Lite vs full
 
@@ -656,8 +757,12 @@ Without these steps the platform may silently load an outdated DLL or refuse to 
 The native component version defined in the source is:
 
 ```text
-1.3.0
+1.5.0
 ```
+
+Recent changes:
+
+- **1.5.0** — Async-only config/status. Added the async `ApplyConfig` and `GetStatus` methods so the component is fully usable from async-only infobases (where synchronous AddIn property access throws *"Cannot call synchronous methods on the client"*). The reference form no longer touches a property on the client. Search subsystem gained the **collection registry** (`list_collections`, per-collection descriptions, multi-collection `search`) and a configurable **embedding worker pool** (`embed_workers`).
 
 ## License
 
