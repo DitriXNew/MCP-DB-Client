@@ -57,6 +57,57 @@ const QUERY_PREFIX: &str = "query: ";
 /// e5 passage prefix (prepended to every document before embedding).
 const PASSAGE_PREFIX: &str = "passage: ";
 
+/// Whitelist of built-in models this core can load, as
+/// `(canonical wire name, fastembed variant)` pairs — the source of truth for
+/// [`resolve_model`]. The first entry is the default
+/// ([`crate::core::DEFAULT_MODEL`]).
+///
+/// The NAMES are duplicated in [`crate::core::SUPPORTED_MODEL_NAMES`] on
+/// purpose: that list must exist without this feature compiled in (it powers
+/// `list_models` and configure-time validation in the mock/lite build), while
+/// the `EmbeddingModel` type only exists here. The
+/// `supported_models_match_core_whitelist` test pins the two lists together so
+/// they can never drift. All three multilingual-e5 variants share the
+/// `query:`/`passage:` prefix convention and mean pooling, so the rest of this
+/// module needs no per-model branches.
+pub fn supported_models() -> &'static [(&'static str, EmbeddingModel)] {
+    &[
+        ("multilingual-e5-small", EmbeddingModel::MultilingualE5Small),
+        ("multilingual-e5-base", EmbeddingModel::MultilingualE5Base),
+        ("multilingual-e5-large", EmbeddingModel::MultilingualE5Large),
+    ]
+}
+
+/// Resolve a `configure`-time model name to its fastembed variant.
+///
+///   * empty/whitespace → the default ([`crate::core::DEFAULT_MODEL`]);
+///   * otherwise trimmed + ASCII-case-insensitive match against
+///     [`supported_models`];
+///   * unknown → `Err` with the same `unknown model '<name>'; supported: <list>`
+///     message shape as [`crate::core::validate_model_name`] (the dispatcher
+///     normally rejects unknown names with `bad_model` before this is reached).
+pub fn resolve_model(name: &str) -> Result<EmbeddingModel, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return resolve_model(crate::core::DEFAULT_MODEL);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    supported_models()
+        .iter()
+        .find(|(n, _)| *n == lower)
+        .map(|(_, m)| m.clone())
+        .ok_or_else(|| {
+            format!(
+                "unknown model '{trimmed}'; supported: {}",
+                supported_models()
+                    .iter()
+                    .map(|(n, _)| *n)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
 /// Which onnxruntime execution provider to request for inference.
 ///
 /// ort registers EPs **best-effort**: CPU is the always-present default, so
@@ -202,13 +253,16 @@ pub struct FastEmbedder {
 }
 
 impl FastEmbedder {
-    /// Build a `FastEmbedder` for the built-in **MultilingualE5Small** model.
+    /// Build a `FastEmbedder` for a built-in `model` (one of
+    /// [`supported_models`], resolved from its wire name by [`resolve_model`];
+    /// the default is **MultilingualE5Small**).
     ///
-    /// fastembed downloads (first run) and caches the ONNX + tokenizer files from
-    /// HuggingFace; subsequent runs load from the cache. This is the path the
-    /// integration test verifies. Loading happens **twice** (one model per
-    /// instance — see module docs); both share the same on-disk cache, so only
-    /// the first incurs a download.
+    /// fastembed downloads (first run) and caches the ONNX + tokenizer files
+    /// from HuggingFace — into `cache_dir` when given (created on demand), else
+    /// into fastembed's default cache location; subsequent runs load from that
+    /// cache. This is the path the integration test verifies. Loading happens
+    /// once per session (bulk pool + query — see module docs); all share the
+    /// same on-disk cache, so only the first incurs a download.
     ///
     /// `device` selects the execution provider (CPU, or DirectML with automatic
     /// CPU fallback — see [`Device`]).
@@ -217,6 +271,8 @@ impl FastEmbedder {
     /// surface a clean structural error if model load fails (e.g. offline with a
     /// cold cache, or onnxruntime not loadable).
     pub fn new_builtin(
+        model: EmbeddingModel,
+        cache_dir: Option<&str>,
         device: Device,
         intra_threads: Option<u64>,
         embed_workers: Option<u64>,
@@ -234,19 +290,21 @@ impl FastEmbedder {
         let mut bulk_pool = Vec::with_capacity(m);
         for _ in 0..m {
             bulk_pool.push(Mutex::new(
-                Self::load_builtin(bulk_t).map_err(|e| format!("load bulk model: {e}"))?,
+                Self::load_builtin(model.clone(), cache_dir, bulk_t)
+                    .map_err(|e| format!("load bulk model: {e}"))?,
             ));
         }
-        let query = Self::load_builtin(query_t).map_err(|e| format!("load query model: {e}"))?;
+        let query = Self::load_builtin(model, cache_dir, query_t)
+            .map_err(|e| format!("load query model: {e}"))?;
 
         let mut me = FastEmbedder {
             bulk_pool,
             bulk_cursor: AtomicUsize::new(0),
             query: Mutex::new(query),
             last_error: Mutex::new(None),
-            // Provisional; replaced by the probe below. The built-in e5-small is
-            // 384-dim, but we probe rather than hard-code so the value is always
-            // truthful even if the model file changes.
+            // Provisional; replaced by the probe below. The built-in e5 family
+            // is 384/768/1024-dim (small/base/large), but we probe rather than
+            // hard-code so the value is always truthful for whatever loaded.
             dim: 0,
             embed_batch: (256 / m).max(8),
         };
@@ -303,17 +361,26 @@ impl FastEmbedder {
         Ok(me)
     }
 
-    /// Load one built-in MultilingualE5Small instance (download/cache via HF),
-    /// requesting `device`'s execution providers (empty ⇒ CPU; DirectML otherwise,
-    /// with ort's automatic CPU fallback).
-    fn load_builtin(tuning: SessionTuning) -> Result<TextEmbedding, String> {
-        TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::MultilingualE5Small)
-                .with_show_download_progress(true)
-                .with_intra_threads(tuning.threads)
-                .with_execution_providers(tuning.device.execution_providers()),
-        )
-        .map_err(|e| e.to_string())
+    /// Load one built-in `model` instance (download/cache via HF — rooted at
+    /// `cache_dir` when given, else fastembed's default cache), requesting
+    /// `device`'s execution providers (empty ⇒ CPU; DirectML otherwise, with
+    /// ort's automatic CPU fallback).
+    fn load_builtin(
+        model: EmbeddingModel,
+        cache_dir: Option<&str>,
+        tuning: SessionTuning,
+    ) -> Result<TextEmbedding, String> {
+        let mut opts = InitOptions::new(model)
+            .with_show_download_progress(true)
+            .with_intra_threads(tuning.threads)
+            .with_execution_providers(tuning.device.execution_providers());
+        if let Some(dir) = cache_dir {
+            // Caller-chosen download/cache root (e.g. next to the component so
+            // an admin can pre-stage or wipe it). fastembed/hf-hub creates the
+            // directory on demand.
+            opts = opts.with_cache_dir(std::path::PathBuf::from(dir));
+        }
+        TextEmbedding::try_new(opts).map_err(|e| e.to_string())
     }
 
     /// Load one user-defined instance from on-disk ONNX + tokenizer files,
@@ -490,6 +557,62 @@ impl Embedder for FastEmbedder {
         match self.last_error.lock() {
             Ok(g) => g.clone(),
             Err(p) => p.into_inner().clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    /// Empty/whitespace resolves to the default; matching is trimmed and
+    /// case-insensitive. (Fast: name resolution only, no model load.)
+    #[test]
+    fn resolve_model_default_and_case_insensitive() {
+        assert_eq!(
+            resolve_model("").unwrap(),
+            EmbeddingModel::MultilingualE5Small
+        );
+        assert_eq!(
+            resolve_model("   ").unwrap(),
+            EmbeddingModel::MultilingualE5Small
+        );
+        assert_eq!(
+            resolve_model("Multilingual-E5-BASE").unwrap(),
+            EmbeddingModel::MultilingualE5Base
+        );
+        assert_eq!(
+            resolve_model("  multilingual-e5-large  ").unwrap(),
+            EmbeddingModel::MultilingualE5Large
+        );
+    }
+
+    /// Unknown names error with a message that names the offender and lists
+    /// every supported model (what the dispatcher's `bad_model` error carries).
+    #[test]
+    fn resolve_model_unknown_lists_supported() {
+        let err = resolve_model("bge-zzz").unwrap_err();
+        assert!(err.contains("unknown model 'bge-zzz'"), "got: {err}");
+        for (name, _) in supported_models() {
+            assert!(err.contains(name), "error must list '{name}': {err}");
+        }
+    }
+
+    /// Pin this module's name→variant table to the feature-independent name
+    /// list in `core` (which powers `list_models` / mock-build validation):
+    /// same names, same order, and the core default resolves to the default
+    /// variant. This is what lets the two lists exist without drifting.
+    #[test]
+    fn supported_models_match_core_whitelist() {
+        let names: Vec<&str> = supported_models().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, crate::core::SUPPORTED_MODEL_NAMES);
+        assert_eq!(
+            resolve_model(crate::core::DEFAULT_MODEL).unwrap(),
+            EmbeddingModel::MultilingualE5Small
+        );
+        for name in crate::core::SUPPORTED_MODEL_NAMES {
+            assert!(crate::core::validate_model_name(name).is_ok());
+            assert!(resolve_model(name).is_ok(), "core name '{name}' must resolve");
         }
     }
 }

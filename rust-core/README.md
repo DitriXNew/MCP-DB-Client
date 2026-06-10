@@ -53,10 +53,11 @@ Unknown method → `unknown_method`; bad JSON → `bad_payload`; bad regex →
 
 **Methods:** `configure`, `index_segments`, `index_raw`, `search`
 (`mode: dense|keyword|hybrid`, single / comma-list / all collections), `grep`,
-`get_segment`, `stats`, `list_collections`, `reset`, `delete_document`,
-`delete_collection`. Ingest is **async** (returns immediately; a background
-worker pool embeds; collections expose a two-axis `text_ready` /
-`vector_status` state, polled via `stats` / `list_collections`).
+`get_segment`, `stats`, `list_collections`, `list_models`, `reset`,
+`delete_document`, `delete_collection`. Ingest is **async** (returns
+immediately; a background worker pool embeds; collections expose a two-axis
+`text_ready` / `vector_status` state, polled via `stats` /
+`list_collections`).
 
 **Collection registry:** each collection carries an optional `description`;
 `list_collections` returns `{name, description, n_docs, n_segments,
@@ -70,7 +71,7 @@ The `Embedder` trait has two impls:
 - **`MockEmbedder`** (dim 64, deterministic token hash) — used by `cargo test`
   and as a fallback. **Test-only**; not a production search backend.
 - **`FastEmbedder`** (feature `fastembed`) — fastembed 5.16 + ort 2.0.0-rc.12 +
-  multilingual-e5-small (dim 384, L2-normalized, `query:`/`passage:` prefixes).
+  the multilingual-e5 family (L2-normalized, `query:`/`passage:` prefixes).
   A separate `query` model instance plus a **bulk pool** of `embed_workers`
   model sessions, because `fastembed::embed` is `&mut self` — a shared mutex
   would let a bulk reindex block queries. Multiple bulk workers embed jobs
@@ -80,6 +81,31 @@ The `Embedder` trait has two impls:
 `configure` selects the backend: `model` / `model_path` non-empty (with the
 feature compiled in) → `FastEmbedder`, else `MockEmbedder`. `embed_workers`
 sizes the bulk pool (default auto ≈ `ncpu/2`, capped).
+
+**Model whitelist:** `model` must be one of the built-in names (matched
+case-insensitively; empty/absent ⇒ the default):
+
+| name | dim |
+|------|-----|
+| `multilingual-e5-small` (default) | 384 |
+| `multilingual-e5-base` | 768 |
+| `multilingual-e5-large` | 1024 |
+
+`list_models` returns the same list —
+`{"ok":true,"result":{"default":"multilingual-e5-small","models":[...]}}` — and
+works before `configure` and in the lite/mock build, so a client can render a
+model dropdown unconditionally. An unknown `model` name makes `configure` fail
+with a structural `bad_model` error (message lists the supported names) before
+any state is touched; this validation is identical with or without the
+`fastembed` feature. A non-empty `model_path` (offline local files) bypasses
+the whitelist — local files are loaded by path, not by name.
+
+**Model cache:** `configure`'s optional `cache_dir` sets the directory the
+built-in model is downloaded into / loaded from (the fastembed/hf-hub cache
+root, created on demand). Empty/absent ⇒ fastembed's default cache location.
+Only meaningful for the builtin `model` path; `model_path` reads its files
+directly and never touches a cache. `cache_dir` is echoed back by `configure`
+alongside `model` / `model_path`.
 **GPU:** `configure` `device: cpu | dml | auto` (default `auto`) registers the
 DirectML execution provider with **automatic CPU fallback** (ort registers it
 best-effort; no GPU/driver → CPU). The full package therefore ships

@@ -174,6 +174,48 @@ impl Collection {
 // Configuration echoed back by `configure` / `stats`
 // ===========================================================================
 
+/// Canonical wire name of the default built-in model (`configure` with an
+/// empty/absent `model` that still wants the real embedder, e.g. via the
+/// fastembed builtin path, loads this one). Surfaced by `list_models`.
+pub const DEFAULT_MODEL: &str = "multilingual-e5-small";
+
+/// Whitelist of built-in model names `configure` accepts in its `model` field,
+/// in the order `list_models` reports them (default first).
+///
+/// The NAMES live here — outside the `fastembed` feature — deliberately:
+/// `list_models` must answer (so a client can render its model dropdown) and
+/// `configure` must reject unknown names identically whether or not the real
+/// embedder is compiled in. The name → `fastembed::EmbeddingModel` mapping
+/// lives in `fastembed_embedder::supported_models` (feature-gated, since the
+/// variant type only exists there); a feature-gated test pins the two lists
+/// together so they can never drift.
+pub const SUPPORTED_MODEL_NAMES: &[&str] = &[
+    DEFAULT_MODEL,
+    "multilingual-e5-base",
+    "multilingual-e5-large",
+];
+
+/// Validate a `configure`-time built-in model name against
+/// [`SUPPORTED_MODEL_NAMES`]. Matching is trimmed + ASCII-case-insensitive;
+/// empty/whitespace means "the default" and is accepted. Unknown names return
+/// the exact message the dispatcher embeds in its structural `bad_model`
+/// error: `unknown model '<name>'; supported: <list>`.
+pub fn validate_model_name(name: &str) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Ok(()); // absent/blank ⇒ the default model
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if SUPPORTED_MODEL_NAMES.iter().any(|m| *m == lower) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown model '{trimmed}'; supported: {}",
+            SUPPORTED_MODEL_NAMES.join(", ")
+        ))
+    }
+}
+
 /// Echo of the knobs passed to `configure`.
 ///
 /// Embedder selection (see [`configure`]): a real fastembed model is built only
@@ -184,11 +226,18 @@ impl Collection {
 /// without the feature).
 #[derive(Clone, Default)]
 pub struct Config {
-    /// Built-in model name (e.g. `"multilingual-e5-small"`). Selects the real
-    /// embedder when the `fastembed` feature is enabled.
+    /// Built-in model name, one of [`SUPPORTED_MODEL_NAMES`] (case-insensitive;
+    /// empty/absent ⇒ [`DEFAULT_MODEL`]). Selects the real embedder when the
+    /// `fastembed` feature is enabled. Unknown names are rejected by the
+    /// dispatcher with a structural `bad_model` error before `configure` runs.
     pub model: Option<String>,
     /// Path to local ONNX + tokenizer files for the offline real embedder.
     pub model_path: Option<String>,
+    /// Directory the built-in model is downloaded into / loaded from (the
+    /// fastembed/HF cache root). `None`/blank ⇒ fastembed's default cache
+    /// location. Only meaningful for the builtin path (`model`); the offline
+    /// `model_path` route reads its files directly and never touches a cache.
+    pub cache_dir: Option<String>,
     pub normalize: bool,
     pub max_seq_len: Option<u64>,
     pub device: String,
@@ -362,15 +411,19 @@ fn wants_real_embedder(config: &Config) -> bool {
 ///     (dim 64) — keeps the test suite and any no-feature build mock-only;
 ///   * `fastembed` feature on AND a real model requested → [`FastEmbedder`]:
 ///     a non-empty `model_path` loads local files (offline); otherwise the
-///     built-in `model` name loads/caches from HuggingFace (only
-///     `"multilingual-e5-small"` is wired today; an unknown name falls back to
-///     that built-in model rather than erroring).
+///     built-in `model` name (one of [`SUPPORTED_MODEL_NAMES`], resolved by
+///     `fastembed_embedder::resolve_model`; empty ⇒ [`DEFAULT_MODEL`]) is
+///     downloaded/loaded from the HuggingFace cache — rooted at
+///     `config.cache_dir` when given, else fastembed's default location.
 ///
 /// If the real model fails to load (e.g. offline with a cold cache, or
 /// onnxruntime cannot be loaded) we **fall back to the mock** rather than
 /// leaving the core unconfigured — this keeps the FFI boundary well-defined and
-/// non-fatal. Returns `(embedder, real_in_effect)` so the caller can echo
-/// whether the real path is actually active.
+/// non-fatal. An *unknown model name* is normally rejected with a structural
+/// `bad_model` error by the dispatcher BEFORE `configure` runs; a direct core
+/// caller that skips that validation gets the same mock fallback here. Returns
+/// `(embedder, real_in_effect)` so the caller can echo whether the real path is
+/// actually active.
 fn build_embedder(config: &Config) -> (Arc<dyn Embedder>, bool) {
     if !wants_real_embedder(config) {
         return (Arc::new(MockEmbedder::new()), false);
@@ -378,7 +431,7 @@ fn build_embedder(config: &Config) -> (Arc<dyn Embedder>, bool) {
 
     #[cfg(feature = "fastembed")]
     {
-        use crate::fastembed_embedder::{Device, FastEmbedder};
+        use crate::fastembed_embedder::{resolve_model, Device, FastEmbedder};
         // Map the textual `device` knob to the execution-provider selection.
         // Default (`auto`) = DirectML with ort's automatic CPU fallback, per the
         // GPU-acceleration request; `cpu`/`dml` force the respective EP. Unknown
@@ -388,14 +441,24 @@ fn build_embedder(config: &Config) -> (Arc<dyn Embedder>, bool) {
             "dml" | "directml" => Device::DirectML,
             _ => Device::Auto, // "auto" and any unrecognized value.
         };
-        // Prefer local files when a path is given (offline); else the built-in.
-        // `intra_threads` tunes the ONNX session pools (see `tunings`): query runs
-        // on a small CPU pool, bulk gets the configured device + remaining cores.
+        // Prefer local files when a path is given (offline); else the built-in,
+        // resolved from the whitelisted `model` name (empty ⇒ default) and
+        // cached under `cache_dir` when one was given. `intra_threads` tunes the
+        // ONNX session pools (see `tunings`): query runs on a small CPU pool,
+        // bulk gets the configured device + remaining cores.
         let built = match config.model_path.as_deref().filter(|p| !p.trim().is_empty()) {
             Some(path) => {
                 FastEmbedder::new_local(path, device, config.intra_threads, config.embed_workers)
             }
-            None => FastEmbedder::new_builtin(device, config.intra_threads, config.embed_workers),
+            None => resolve_model(config.model.as_deref().unwrap_or("")).and_then(|model| {
+                FastEmbedder::new_builtin(
+                    model,
+                    config.cache_dir.as_deref().filter(|d| !d.trim().is_empty()),
+                    device,
+                    config.intra_threads,
+                    config.embed_workers,
+                )
+            }),
         };
         match built {
             Ok(fe) => return (Arc::new(fe), true),

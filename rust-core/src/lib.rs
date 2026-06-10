@@ -218,6 +218,16 @@ fn dispatch(method: &str, payload_json: &str) -> String {
             Envelope::ok(json!({ "collections": list }))
         }
 
+        // Discovery of the BUILT-IN embedding models `configure` accepts in its
+        // `model` field, so a client can render a dropdown. Static data (no
+        // lock, no state): works before `configure` and identically with or
+        // without the `fastembed` feature — a lite/mock build still knows the
+        // names even though it cannot load the models.
+        "list_models" => Envelope::ok(json!({
+            "default": store::DEFAULT_MODEL,
+            "models": store::SUPPORTED_MODEL_NAMES,
+        })),
+
         // Clear mutable state back to defaults. Idempotent.
         "reset" => {
             match CORE.write() {
@@ -232,28 +242,37 @@ fn dispatch(method: &str, payload_json: &str) -> String {
         // Load/select the embedder and fix `dim`. Idempotent; reconfiguring
         // with a different dim while data is indexed resets the index.
         "configure" => match parse_config(&payload) {
-            Ok(config) => {
-                let mut core = match CORE.write() {
-                    Ok(c) => c,
-                    Err(_) => {
-                        return Envelope::err(codes::INTERNAL, "core lock poisoned")
-                            .to_json_string()
-                    }
-                };
-                let res = store::configure(&mut core, config);
-                Envelope::ok(json!({
-                    "configured": true,
-                    "dim": res.dim,
-                    "reset": res.reset_due_to_dim_change,
-                    "model": core.config.model,
-                    "model_path": core.config.model_path,
-                    "normalize": core.config.normalize,
-                    "max_seq_len": core.config.max_seq_len,
-                    "device": core.config.device,
-                    "intra_threads": core.config.intra_threads,
-                    "embed_workers": core.config.embed_workers,
-                }))
-            }
+            // An unknown built-in `model` name is a structural `bad_model`
+            // error returned BEFORE the store is touched — never a silent
+            // fallback. Only the NAME is checked up front; a known model that
+            // then fails to LOAD keeps the existing degrade-to-mock semantics
+            // inside `build_embedder` (non-fatal, dim reverts to the mock's).
+            Ok(config) => match validate_builtin_model(&config) {
+                Err(msg) => Envelope::err(codes::BAD_MODEL, msg),
+                Ok(()) => {
+                    let mut core = match CORE.write() {
+                        Ok(c) => c,
+                        Err(_) => {
+                            return Envelope::err(codes::INTERNAL, "core lock poisoned")
+                                .to_json_string()
+                        }
+                    };
+                    let res = store::configure(&mut core, config);
+                    Envelope::ok(json!({
+                        "configured": true,
+                        "dim": res.dim,
+                        "reset": res.reset_due_to_dim_change,
+                        "model": core.config.model,
+                        "model_path": core.config.model_path,
+                        "cache_dir": core.config.cache_dir,
+                        "normalize": core.config.normalize,
+                        "max_seq_len": core.config.max_seq_len,
+                        "device": core.config.device,
+                        "intra_threads": core.config.intra_threads,
+                        "embed_workers": core.config.embed_workers,
+                    }))
+                }
+            },
             Err(e) => Envelope::err(codes::BAD_PAYLOAD, e),
         },
 
@@ -499,10 +518,12 @@ fn meta_or_empty(v: &Value, key: &str) -> Value {
 
 /// Parse a `configure` payload. All fields optional; a null payload is fine.
 ///
-/// `model` selects a built-in real model (e.g. `"multilingual-e5-small"`) and
-/// `model_path` points at offline ONNX + tokenizer files; either one (when the
-/// `fastembed` feature is compiled in) selects the real embedder, otherwise the
-/// mock is used — see `core::configure`.
+/// `model` selects a built-in real model by whitelisted name (see
+/// `list_models` / `core::SUPPORTED_MODEL_NAMES`) and `model_path` points at
+/// offline ONNX + tokenizer files; either one (when the `fastembed` feature is
+/// compiled in) selects the real embedder, otherwise the mock is used — see
+/// `core::configure`. `cache_dir` overrides where the built-in model is
+/// downloaded/cached (fastembed's default cache location otherwise).
 ///
 /// `device` is `"cpu" | "dml" | "auto"` (default `"auto"` = DirectML with
 /// automatic CPU fallback). It only affects the real embedder; the mock build
@@ -511,6 +532,7 @@ fn parse_config(payload: &Value) -> Result<Config, String> {
     Ok(Config {
         model: opt_str(payload, "model"),
         model_path: opt_str(payload, "model_path"),
+        cache_dir: opt_str(payload, "cache_dir"),
         normalize: bool_or(payload, "normalize", true),
         max_seq_len: opt_u64(payload, "max_seq_len"),
         // Default `"auto"` = DirectML with ort's automatic CPU fallback (the
@@ -522,6 +544,27 @@ fn parse_config(payload: &Value) -> Result<Config, String> {
         // (back-compat); 0 ⇒ auto (≈ ncpu/2); n ⇒ exactly n. (fastembed only.)
         embed_workers: opt_u64(payload, "embed_workers"),
     })
+}
+
+/// Pre-validate a `configure` request's built-in `model` name against the
+/// whitelist (`core::SUPPORTED_MODEL_NAMES`), BEFORE the store is touched.
+///
+/// The check applies only when the BUILTIN path would be taken — i.e. there is
+/// no non-empty `model_path` (local files are loaded by path; the name
+/// whitelist does not apply to them). Empty/absent `model` is always fine (it
+/// means "the default" / "the mock"). The whitelist lives in `core`, NOT
+/// behind the `fastembed` feature, so a mock/lite build rejects exactly the
+/// same names a full build would.
+fn validate_builtin_model(config: &Config) -> Result<(), String> {
+    let has_path = config
+        .model_path
+        .as_deref()
+        .map(|p| !p.trim().is_empty())
+        .unwrap_or(false);
+    if has_path {
+        return Ok(());
+    }
+    store::validate_model_name(config.model.as_deref().unwrap_or(""))
 }
 
 /// Parse an `index_segments` payload. `doc_id` is required and non-empty.
@@ -1023,6 +1066,89 @@ mod tests {
         assert_eq!(v["result"]["model_path"], json!("/models/bge"));
         assert_eq!(v["result"]["device"], json!("cpu"));
         assert_eq!(v["result"]["max_seq_len"], json!(512));
+    }
+
+    #[test]
+    fn list_models_lists_whitelist_before_configure() {
+        // Static data: needs no `configure`, takes no lock, and returns the
+        // same list with or without the `fastembed` feature (a client renders
+        // its model dropdown from this even in the lite/mock build).
+        let v = call("list_models", "");
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["result"]["default"], json!("multilingual-e5-small"));
+        let models: Vec<&str> = v["result"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            models,
+            vec![
+                "multilingual-e5-small",
+                "multilingual-e5-base",
+                "multilingual-e5-large"
+            ]
+        );
+        // The advertised default is always one of the listed models.
+        assert!(models.contains(&v["result"]["default"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn configure_unknown_model_is_bad_model_error() {
+        let _g = e2e_guard();
+        // Unknown name → structural `bad_model` BEFORE the store is touched
+        // (works in the default mock build: the whitelist is feature-free).
+        let v = call("configure", r#"{"model":"nope-9000"}"#);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["error"]["code"], json!(codes::BAD_MODEL));
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("unknown model 'nope-9000'"), "got: {msg}");
+        for name in store::SUPPORTED_MODEL_NAMES {
+            assert!(msg.contains(name), "message must list '{name}': {msg}");
+        }
+        // The store really was untouched: still unconfigured.
+        let s = call("stats", "");
+        assert_eq!(s["result"]["configured"], json!(false));
+    }
+
+    #[test]
+    fn model_name_validation_default_case_insensitive_and_path_bypass() {
+        // Direct unit checks (no embedder load, fast in every build):
+        // empty/whitespace = "the default" = ok; matching is trimmed +
+        // case-insensitive; unknown errors list the whole whitelist.
+        assert!(store::validate_model_name("").is_ok());
+        assert!(store::validate_model_name("   ").is_ok());
+        assert!(store::validate_model_name("multilingual-e5-small").is_ok());
+        assert!(store::validate_model_name(" Multilingual-E5-LARGE ").is_ok());
+        let err = store::validate_model_name("bge-zzz").unwrap_err();
+        assert!(err.contains("unknown model 'bge-zzz'"), "got: {err}");
+        for name in store::SUPPORTED_MODEL_NAMES {
+            assert!(err.contains(name), "error must list '{name}': {err}");
+        }
+
+        // A non-empty `model_path` takes the LOCAL path, so the builtin-name
+        // whitelist deliberately does not apply (local files have no name).
+        let cfg = parse_config(&json!({"model":"not-a-model","model_path":"/m/x"})).unwrap();
+        assert!(validate_builtin_model(&cfg).is_ok());
+        // …but with a blank path the same unknown name is rejected.
+        let cfg = parse_config(&json!({"model":"not-a-model","model_path":"  "})).unwrap();
+        assert!(validate_builtin_model(&cfg).is_err());
+    }
+
+    #[test]
+    fn configure_parses_and_echoes_cache_dir() {
+        let _g = e2e_guard();
+        // parse_config picks up cache_dir…
+        let cfg = parse_config(&json!({"cache_dir": "D:/hf-cache"})).unwrap();
+        assert_eq!(cfg.cache_dir.as_deref(), Some("D:/hf-cache"));
+        // …and `configure` echoes it back alongside model/model_path. No
+        // `model`/`model_path` here, so this stays on the fast mock path in
+        // every build (cache_dir alone never selects the real embedder).
+        let v = call("configure", r#"{"cache_dir":"D:/hf-cache"}"#);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["result"]["cache_dir"], json!("D:/hf-cache"));
+        assert_eq!(v["result"]["model"], json!(null));
     }
 
     #[test]
@@ -1836,6 +1962,62 @@ mod tests {
         // dim is surfaced as 384 in stats too.
         let s = call("stats", "");
         assert_eq!(s["result"]["dim"].as_u64().unwrap(), 384);
+    }
+
+    // -- Built-in download into a caller-specified cache_dir (gated) ----------
+    //
+    // Mirrors the gating of `fastembed_real_model_ranks_contracts_above_cat`:
+    // compiled and run ONLY under `--features fastembed`, never part of the
+    // fast default suite. Deliberately slow — it downloads e5-small from
+    // HuggingFace into a FRESH temp directory every run, bypassing any warm
+    // default cache, because an empty-then-populated directory is the only
+    // direct proof the `with_cache_dir` plumbing was actually applied.
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn fastembed_builtin_downloads_into_cache_dir() {
+        let _g = e2e_guard();
+
+        let cache =
+            std::env::temp_dir().join(format!("rcore-cache-test-{}", std::process::id()));
+        // Hermetic: start from an empty directory so "files appeared" below is
+        // meaningful even if a previous run with this PID left residue behind.
+        let _ = std::fs::remove_dir_all(&cache);
+        std::fs::create_dir_all(&cache).expect("create temp cache dir");
+        let cache_str = cache.to_string_lossy().to_string();
+
+        let payload = format!(
+            r#"{{"model":"multilingual-e5-small","device":"cpu","cache_dir":{}}}"#,
+            json!(cache_str)
+        );
+        let v = call("configure", &payload);
+        assert_eq!(v["ok"], json!(true), "configure failed: {v}");
+        assert_eq!(v["result"]["cache_dir"], json!(cache_str));
+        assert_eq!(
+            v["result"]["dim"].as_u64().unwrap(),
+            384,
+            "e5-small from the custom cache dir must report dim 384 (got {}); a 64 \
+             means the load failed and we silently fell back to the mock",
+            v["result"]["dim"]
+        );
+
+        // The model files were materialized under OUR directory (hf-hub lays
+        // out a models--intfloat--multilingual-e5-small snapshot inside it),
+        // not under fastembed's default cache.
+        let entries: Vec<_> = std::fs::read_dir(&cache)
+            .expect("cache dir must exist after configure")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            !entries.is_empty(),
+            "cache_dir {} stayed empty — with_cache_dir was not applied to the \
+             builtin download path",
+            cache.display()
+        );
+
+        // Drop the model sessions (they hold no files open after load, but the
+        // embedder is replaced anyway) and reclaim the ~100 MB of model files.
+        call("reset", "");
+        let _ = std::fs::remove_dir_all(&cache);
     }
 
     // -- Offline / air-gapped local-model init (gated; needs a staged model dir) -

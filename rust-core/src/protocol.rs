@@ -20,6 +20,10 @@ pub mod codes {
     pub const INTERNAL: &str = "internal";
     /// A `grep` pattern failed to compile (invalid regex). Structural, not a panic.
     pub const BAD_PATTERN: &str = "bad_pattern";
+    /// `configure` named a built-in `model` that is not on the whitelist
+    /// (see `core::SUPPORTED_MODEL_NAMES` / the `list_models` method). The
+    /// message lists the supported names. Returned BEFORE the store is touched.
+    pub const BAD_MODEL: &str = "bad_model";
     /// `get_segment` could not find the requested `doc_id` in any collection.
     pub const NOT_FOUND: &str = "not_found";
     /// `get_segment` targeted a document that has no full-text/offset table
