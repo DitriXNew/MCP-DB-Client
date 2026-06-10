@@ -639,6 +639,7 @@ fn parse_raw_index_request(payload: &Value) -> Result<RawIndexRequest, String> {
 
     Ok(RawIndexRequest {
         collection,
+        description: opt_str(payload, "collection_description"),
         doc_id,
         name,
         meta,
@@ -1268,6 +1269,29 @@ mod tests {
     }
 
     #[test]
+    fn search_hits_echo_effective_meta() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // Doc-level meta overlaid by segment-level meta (segment wins) — the
+        // hit must echo the same effective view the filters match against.
+        call(
+            "index_segments",
+            r#"{"collection":"em","doc_id":"d1","meta":{"lang":"en","src":"doc"},
+                "segments":[{"text":"unique effmeta token","meta":{"type":"step","lang":"ru"}}]}"#,
+        );
+        let v = call(
+            "search",
+            r#"{"query":"effmeta","collection":"em","mode":"keyword","k":3}"#,
+        );
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        let meta = &hits[0]["meta"];
+        assert_eq!(meta["type"], json!("step"), "segment meta must be visible");
+        assert_eq!(meta["src"], json!("doc"), "doc meta must be preserved");
+        assert_eq!(meta["lang"], json!("ru"), "segment value wins on collision");
+    }
+
+    #[test]
     fn search_meta_filter_any_is_or() {
         let _g = e2e_guard();
         seed_meta_docs();
@@ -1438,6 +1462,31 @@ mod tests {
         let doc_id = v["result"]["doc_id"].as_str().unwrap();
         assert!(!doc_id.is_empty(), "auto doc_id must be returned in the ack");
         assert!(v["result"]["segment_count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn index_raw_sets_collection_description() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // Same `collection_description` semantics as index_segments: last
+        // non-empty wins, blank/absent leaves the label untouched.
+        let v = call(
+            "index_raw",
+            r#"{"collection":"rawdesc","collection_description":"Feature files","text":"line a\nline b"}"#,
+        );
+        assert_eq!(v["ok"], json!(true));
+        let st = call("stats", "");
+        assert_eq!(
+            st["result"]["collections"]["rawdesc"]["description"],
+            json!("Feature files")
+        );
+        // A second doc without a description must not clear the label.
+        call("index_raw", r#"{"collection":"rawdesc","text":"more text"}"#);
+        let st = call("stats", "");
+        assert_eq!(
+            st["result"]["collections"]["rawdesc"]["description"],
+            json!("Feature files")
+        );
     }
 
     #[test]

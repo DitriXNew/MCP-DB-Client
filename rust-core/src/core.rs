@@ -1161,6 +1161,9 @@ pub fn chunk_text(text: &str, cfg: &ChunkConfig) -> Vec<Chunk> {
 /// A parsed `index_raw` request (the raw-document ingest path).
 pub struct RawIndexRequest {
     pub collection: String,
+    /// Optional description of the *collection* (not the doc) — same
+    /// `collection_description` semantics as `index_segments` (last non-empty wins).
+    pub description: Option<String>,
     /// Caller-supplied id; `None` ⇒ auto-assign a stable id and return it.
     pub doc_id: Option<String>,
     pub name: String,
@@ -1197,6 +1200,8 @@ fn auto_doc_id(core: &mut Core) -> String {
 /// placeholders (`0`) until [`commit_index_raw`] allocates the real ones.
 pub struct PreparedRawIndex {
     collection: String,
+    /// Collection description carried to commit (last non-empty wins).
+    description: Option<String>,
     /// Caller-supplied id, or `None` ⇒ auto-assigned at commit (needs the
     /// store's id source).
     doc_id: Option<String>,
@@ -1271,6 +1276,7 @@ pub fn prepare_index_raw(req: RawIndexRequest, max_seq_len: Option<u64>) -> Prep
 
     PreparedRawIndex {
         collection: req.collection,
+        description: req.description,
         doc_id: req.doc_id,
         name: req.name,
         meta: req.meta,
@@ -1295,6 +1301,7 @@ pub fn commit_index_raw(core: &mut Core, prepared: PreparedRawIndex) -> RawAccep
 
     let PreparedRawIndex {
         collection,
+        description,
         doc_id,
         name,
         meta,
@@ -1340,6 +1347,12 @@ pub fn commit_index_raw(core: &mut Core, prepared: PreparedRawIndex) -> RawAccep
     coll.vector_status = VectorStatus::Building;
     coll.error = None;
     coll.skipped = coll.skipped.saturating_add(skipped_now);
+    // Label the collection (last non-empty description wins) — same as index_segments.
+    if let Some(desc) = description {
+        if !desc.trim().is_empty() {
+            coll.description = Some(desc);
+        }
+    }
     // Atomic upsert by doc_id (same semantics as index_segments).
     coll.docs.insert(doc_id.clone(), doc);
 
@@ -1667,9 +1680,13 @@ fn cmp_score_desc(a: f32, b: f32) -> std::cmp::Ordering {
 }
 
 /// Materialize one [`Hit`] from a scored ref. This is the ONLY place that clones
-/// `doc.meta` and segment text, and it now runs only for the final survivors.
+/// meta and segment text, and it now runs only for the final survivors.
 /// When `include_text` is false we clone just the `PREVIEW_CHARS`-char prefix the
 /// wire payload will show, not the whole (possibly large) segment text.
+///
+/// `meta` is the *effective* meta (doc overlaid by segment, segment wins) — the
+/// same view the meta FILTERS match against, so what filtered a hit in is what
+/// the hit echoes back (segment-level labels like a step's `type` stay visible).
 fn make_hit(s: &Scored, include_text: bool) -> Hit {
     let text = if include_text {
         s.seg.text.clone()
@@ -1680,7 +1697,7 @@ fn make_hit(s: &Scored, include_text: bool) -> Hit {
         doc_id: s.doc.doc_id.clone(),
         name: s.doc.name.clone(),
         collection: s.collection.to_string(),
-        meta: s.doc.meta.clone(),
+        meta: crate::filter::effective_meta(&s.doc.meta, &s.seg.meta),
         segment_id: s.seg.segment_id,
         line_start: s.seg.line_start,
         line_end: s.seg.line_end,
@@ -2934,6 +2951,7 @@ mod tests {
             &mut c,
             RawIndexRequest {
                 collection: collection.to_string(),
+                description: None,
                 doc_id: doc_id.map(String::from),
                 name: "raw doc".to_string(),
                 meta: json!({}),
