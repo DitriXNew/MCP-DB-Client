@@ -29,6 +29,7 @@
 		</Properties>
 		<ChildObjects>
 			<Form>Форма</Form>
+			<Template>СкилПоиска</Template>
 		</ChildObjects>
 	</ExternalDataProcessor>
 </MetaDataObject>
