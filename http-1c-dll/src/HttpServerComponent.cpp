@@ -190,7 +190,8 @@ json paginateJsonArray(const json& arr, const json& params) {
 bool isNativeTool(const std::string& toolName) {
     return toolName == "search" ||
            toolName == "get_segment" ||
-           toolName == "grep";
+           toolName == "grep" ||
+           toolName == "list_collections";
 }
 
 // Shared `filter` schema fragment (free key-value, OR via `any` / AND via
@@ -220,7 +221,7 @@ json metaFiltersSchema() {
     };
 }
 
-// The 3 native tool definitions ({name, description, inputSchema}) merged into
+// The native tool definitions ({name, description, inputSchema}) merged into
 // tools/list. Schemas follow the Stage-1/Stage-2 contracts (§4.1, §5.3, §5.4).
 json nativeToolDefinitions() {
     json searchTool = {
@@ -351,7 +352,20 @@ json nativeToolDefinitions() {
         }}
     };
 
-    return json::array({searchTool, getSegmentTool, grepTool});
+    json listCollectionsTool = {
+        {"name", "list_collections"},
+        {"description", "List the searchable collections: name, human description "
+                        "of what each one holds, document/segment counts and state "
+                        "(text_ready; vector_status building/ready). Call this first "
+                        "to choose the `collection` argument for search/grep."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", json::object()},
+            {"additionalProperties", false}
+        }}
+    };
+
+    return json::array({searchTool, getSegmentTool, grepTool, listCollectionsTool});
 }
 
 // Call the Rust core for a native tool and turn its envelope into an MCP
@@ -1031,10 +1045,22 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
     if (!sessionId.empty()) {
         auto session = findSession(sessionId);
         if (!session) {
-            logToFile("MCP: invalid session " + sessionId);
-            res.status = 404;
-            res.set_content(R"({"error":"Session not found"})", "application/json");
-            return;
+            // Unknown id usually means the server restarted and the client kept
+            // its old session. The spec answer is 404 + client re-initialize,
+            // but common IDE clients don't re-init and every call then looks
+            // "hung" to the user. Sessions carry no negotiated state we depend
+            // on, so transparently resurrect the presented id instead.
+            session = std::make_shared<McpSession>();
+            session->sessionId = sessionId;
+            session->protocolVersion = MCP_PROTOCOL_VERSION;
+            session->initialized = true;
+            session->createdAt = std::chrono::steady_clock::now();
+            session->lastActivity = session->createdAt;
+            {
+                std::lock_guard<std::mutex> lock(sessionMutex);
+                sessions[sessionId] = session;
+            }
+            logToFile("MCP: unknown session " + sessionId + " resurrected (server restart?)");
         }
     }
 
