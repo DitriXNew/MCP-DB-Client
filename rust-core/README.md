@@ -52,10 +52,16 @@ Unknown method → `unknown_method`; bad JSON → `bad_payload`; bad regex →
 `internal` — they never unwind across the C ABI.
 
 **Methods:** `configure`, `index_segments`, `index_raw`, `search`
-(`mode: dense|keyword|hybrid`), `grep`, `get_segment`, `stats`, `reset`,
-`delete_document`, `delete_collection`. Ingest is **async** (returns
-immediately; a background worker embeds; collections expose a two-axis
-`text_ready` / `vector_status` state, polled via `stats`).
+(`mode: dense|keyword|hybrid`, single / comma-list / all collections), `grep`,
+`get_segment`, `stats`, `list_collections`, `reset`, `delete_document`,
+`delete_collection`. Ingest is **async** (returns immediately; a background
+worker pool embeds; collections expose a two-axis `text_ready` /
+`vector_status` state, polled via `stats` / `list_collections`).
+
+**Collection registry:** each collection carries an optional `description`;
+`list_collections` returns `{name, description, n_docs, n_segments,
+vector_status, text_ready}` so a caller can discover what is searchable and
+scope `search` to one or several collections.
 
 ## Embedder: mock (tests) vs real (`fastembed` feature)
 
@@ -65,12 +71,15 @@ The `Embedder` trait has two impls:
   and as a fallback. **Test-only**; not a production search backend.
 - **`FastEmbedder`** (feature `fastembed`) — fastembed 5.16 + ort 2.0.0-rc.12 +
   multilingual-e5-small (dim 384, L2-normalized, `query:`/`passage:` prefixes).
-  Two separately-loaded model instances (`bulk` + `query`) because
-  `fastembed::embed` is `&mut self`, so a shared mutex would let a bulk reindex
-  block queries.
+  A separate `query` model instance plus a **bulk pool** of `embed_workers`
+  model sessions, because `fastembed::embed` is `&mut self` — a shared mutex
+  would let a bulk reindex block queries. Multiple bulk workers embed jobs
+  concurrently (CPU is forced when `embed_workers > 1`, since concurrent
+  DirectML sessions are unsupported); query embeddings stay prioritized.
 
 `configure` selects the backend: `model` / `model_path` non-empty (with the
-feature compiled in) → `FastEmbedder`, else `MockEmbedder`.
+feature compiled in) → `FastEmbedder`, else `MockEmbedder`. `embed_workers`
+sizes the bulk pool (default auto ≈ `ncpu/2`, capped).
 **GPU:** `configure` `device: cpu | dml | auto` (default `auto`) registers the
 DirectML execution provider with **automatic CPU fallback** (ort registers it
 best-effort; no GPU/driver → CPU). The full package therefore ships

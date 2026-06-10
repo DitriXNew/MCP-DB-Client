@@ -498,6 +498,122 @@ curl -s -w "\nHTTP:%{http_code}" -X DELETE http://localhost:8888/mcp \
 
 ---
 
+## Search Subsystem Tests (RAG)
+
+These tests cover the `search` / `grep` / `get_segment` tools served natively by
+the component (see the [Search Subsystem](README.md#search-subsystem-rag) docs).
+They are **always advertised in `tools/list`** — so the tool counts in Test 1
+and Test 28 are actually **+3** (the demo tools plus `search`, `grep`,
+`get_segment`).
+
+**Distribution matters:**
+- **lite** (`libhttp1cWin.dll` only) — the three tools are listed but every call
+  returns a structured `rag_not_installed` result. Run Tests 30–31 only.
+- **full** (`+ rcore.dll + DirectML.dll`) — the tools run for real. Run all of
+  Tests 30–36.
+
+**Prerequisite for the "full" tests:** the operator must have **indexed some
+content first**. Indexing, `configure`, `stats`, and `list_collections` are
+**1C-side admin operations** (driven from the form via the component's
+`RagDispatch` method) — they are *not* MCP tools and are not callable by the
+client. Use the form's **Sync** button (or the headless self-test) to populate
+at least one collection before searching. `list_collections` is what the
+operator/AI uses on the 1C side to confirm a collection reached
+`vector_status: ready`.
+
+---
+
+## Test 30: List Tools — Includes search / grep / get_segment
+
+**Action:** Ask Copilot to list the tools available from `1c-mcp-server`.
+
+**Expected:** In addition to the demo + screenshot tools, three search tools are present:
+- `search` — semantic / keyword / hybrid ranked search
+- `grep` — RE2 regex / substring scan over stored text
+- `get_segment` — O(1) line-range slice of a document by `doc_id`
+
+**Verify:**
+- All three tools appear with descriptions and an `inputSchema`.
+- `search` exposes `query`, `collection`, `mode` (dense/keyword/hybrid), `k`, and meta-filter parameters.
+- The schemas are identical whether the lite or full distribution is loaded.
+
+---
+
+## Test 31: search — Lite distribution / backend not installed
+
+**Action:** On a **lite** install (or before `rcore.dll` is present), call `search` with `query`: `"anything"`.
+
+**Expected result:** A structured, non-crashing result with `code: rag_not_installed` and a message telling the caller to install the RAG (full) package.
+
+**Verify:**
+- The server stays up; the error is a normal tool result, not a transport failure.
+- The same applies to `grep` and `get_segment`.
+
+> On a **full** install with a ready collection this call returns real hits instead — skip to Test 32.
+
+---
+
+## Test 32: grep — Works without vectors
+
+**Action:** On a **full** install with at least one indexed document, call `grep` with `pattern`: a literal string you know is in the corpus (e.g. a step phrase or article code), `ignore_case`: `true`.
+
+**Expected result:** Matching lines with `doc_id`, `name`, `line_number`, `line_text`, plus `total_found` and a `truncated` flag.
+
+**Verify:**
+- Matches are returned the instant a document is ingested — `grep` does not wait for embedding.
+- An invalid regex returns a structured tool error (not a crashed session).
+
+---
+
+## Test 33: search — dense (semantic)
+
+**Action:** Call `search` with `mode`: `"dense"`, a natural-language `query` describing intent (not an exact code), and optionally a `collection` from `list_collections`.
+
+**Expected result:** Ranked hits with `doc_id`, `name`, `collection`, `score`, segment `line_start`/`line_end` (when available), and text/preview.
+
+**Verify:**
+- The semantically closest segment ranks at or near the top, even when no exact words match.
+- Omitting `collection` searches all collections; passing a comma-separated list scopes to that subset.
+- If the collection is still `building`, results come back flagged as partial/incomplete.
+
+---
+
+## Test 34: search — hybrid (exact identifier + intent)
+
+**Action:** Call `search` with `mode`: `"hybrid"` and a `query` containing an exact identifier (SKU / article / INN / a precise step token).
+
+**Expected result:** The record carrying that exact identifier ranks at the top — the keyword channel rescues what pure dense similarity would miss.
+
+**Verify:**
+- The exact-identifier hit outranks merely semantically-similar records.
+- `hybrid` is the recommended mode for products/clients/QA-step lookups.
+
+---
+
+## Test 35: get_segment — Verbatim line range
+
+**Action:** Take a `doc_id` + `line_start`/`line_end` from a Test 33 hit and call `get_segment` with them.
+
+**Expected result:** The exact stored text for that line range, returned verbatim (1-based, inclusive line numbering).
+
+**Verify:**
+- The returned text matches the source lines exactly.
+- An out-of-range request is **clamped** and the response reports the actual range returned (no error).
+
+---
+
+## Test 36: search — Metadata filters
+
+**Action:** Call `search` with a meta filter — e.g. `all`: `{ "type": "scenario" }` (AND) or `any`: `{ "category": ["laptops", "phones"] }` (OR).
+
+**Expected result:** Only hits whose `meta` satisfies the filter are returned.
+
+**Verify:**
+- `all` requires every clause to match; `any` requires at least one.
+- Filters compose with `collection` scoping and with all three `mode`s.
+
+---
+
 ## Summary Checklist
 
 After completing all tests, verify:
@@ -529,6 +645,13 @@ After completing all tests, verify:
 - [ ] Invalid JSON returns parse error (-32700)
 - [ ] Unknown methods return method not found (-32601)
 - [ ] DELETE terminates sessions
+- [ ] `search` / `grep` / `get_segment` appear in `tools/list` (both distributions)
+- [ ] Lite distribution returns `rag_not_installed` (not a crash) for all three
+- [ ] `grep` matches work before embedding finishes; bad regex is a structured error
+- [ ] `search mode=dense` ranks the semantically closest segment near the top
+- [ ] `search mode=hybrid` surfaces the exact-identifier record (SKU/INN/article)
+- [ ] `get_segment` returns the exact line range and clamps out-of-range requests
+- [ ] `search` meta filters (`all`/`any`) and `collection` scoping work
 
 ## Troubleshooting
 
@@ -540,3 +663,6 @@ After completing all tests, verify:
 | `isError: true` on execute | BSL syntax error | Check the 1C/BSL code syntax |
 | Empty resource data | Empty infobase | Use an infobase with actual catalogs/documents |
 | Prompt returns no metadata | Server-side error | Call `getStatus` to check the component state |
+| `search`/`grep` return `rag_not_installed` | Lite distribution (no `rcore.dll`) | Install the full RAG package (`rcore.dll` + `DirectML.dll` beside the component) |
+| `search` returns empty on full install | No content indexed yet, or collection still `building` | Index via the form's Sync button; poll `list_collections` until `vector_status: ready` |
+| `search mode=dense` misses exact codes | Embeddings are weak on identifiers | Use `mode: hybrid` for SKU/INN/article/step lookups |
