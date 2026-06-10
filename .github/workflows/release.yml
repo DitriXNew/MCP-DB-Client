@@ -125,3 +125,5 @@ jobs:
           files: |
             build/artifacts/http1c-addin-lite-v${{ steps.version.outputs.VERSION }}.zip
             build/artifacts/http1c-addin-full-v${{ steps.version.outputs.VERSION }}.zip
+            build/artifacts/http1c-addin.zip
+            build/artifacts/http1c-addin-full.zip
