@@ -531,11 +531,12 @@ bool HttpServerComponent::validateOrigin(const httplib::Request& req, httplib::R
 }
 
 bool HttpServerComponent::validateAuth(const httplib::Request& req, httplib::Response& res) {
-    if (authToken.empty()) return true; // No auth configured
+    const std::string token = authTokenCopy(); // snapshot: ApplyConfig may rewrite it concurrently
+    if (token.empty()) return true; // No auth configured
 
     std::string auth = req.get_header_value("Authorization");
     if (auth.size() > 7 && auth.substr(0, 7) == "Bearer ") {
-        if (auth.substr(7) == authToken) return true;
+        if (auth.substr(7) == token) return true;
     }
 
     logToFile("SECURITY: Unauthorized request");
@@ -623,8 +624,8 @@ HttpServerComponent::HttpServerComponent()
 
     // Timeout applied to in-flight forwarded requests (read/write property).
     AddProperty(u"Timeout", u"Таймаут",
-        [&](VH var) { var = (int64_t)this->timeout; },
-        [&](VH var) { this->timeout = (int)(int64_t)var; });
+        [&](VH var) { var = (int64_t)this->timeout.load(); },
+        [&](VH var) { this->timeout.store((int)(int64_t)var); });
 
     // Tool definitions cache (write-only property; expects JSON array).
     AddProperty(u"Tools", u"Инструменты",
@@ -787,7 +788,7 @@ void HttpServerComponent::doStartListen(int port)
         {
             std::unique_lock<std::mutex> lock(pending->mtx);
             bool gotResponse = pending->cv.wait_for(lock,
-                std::chrono::seconds(timeout),
+                std::chrono::seconds(timeout.load()),
                 [&] { return pending->ready.load(); });
 
             if (gotResponse) {
@@ -1116,9 +1117,22 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
 
         // Merge the native search-tool schemas owned by this component. The
         // search subsystem is self-contained: these are always present even if
-        // 1C never registers them. Pagination below applies to the union.
-        for (auto& def : nativeToolDefinitions()) {
-            tools.push_back(std::move(def));
+        // 1C never registers them. Native names win: tools/call routes them to
+        // the Rust core BEFORE consulting the 1C registry, so a 1C-registered
+        // duplicate would be unreachable — drop it from the listing instead of
+        // advertising two entries with one name (MCP forbids duplicate names).
+        // Pagination below applies to the union.
+        {
+            json merged = json::array();
+            for (auto& t : tools) {
+                const std::string name =
+                    t.is_object() ? t.value("name", std::string()) : std::string();
+                if (!isNativeTool(name)) merged.push_back(std::move(t));
+            }
+            for (auto& def : nativeToolDefinitions()) {
+                merged.push_back(std::move(def));
+            }
+            tools = std::move(merged);
         }
 
         json page = paginateJsonArray(tools, params);
@@ -1209,7 +1223,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
                 [this, pending](size_t, httplib::DataSink& sink) {
                     std::unique_lock<std::mutex> lock(pending->mtx);
                     bool hasData = pending->cv.wait_for(lock,
-                        std::chrono::seconds(timeout),
+                        std::chrono::seconds(timeout.load()),
                         [&] {
                             return !pending->sseMessages.empty() || pending->streamCompleted;
                         });
@@ -1219,7 +1233,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
                             makeJsonRpcToolResponse(pending->rpcIdJson,
                                 makeTextToolResult(
                                     "Timeout: 1C did not respond within " +
-                                    std::to_string(timeout) + " seconds.",
+                                    std::to_string(timeout.load()) + " seconds.",
                                     true))));
                         pending->streamCompleted = true;
                     }
@@ -1254,7 +1268,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
         {
             std::unique_lock<std::mutex> lock(pending->mtx);
             bool gotResponse = pending->cv.wait_for(lock,
-                std::chrono::seconds(timeout),
+                std::chrono::seconds(timeout.load()),
                 [&] { return pending->ready.load(); });
 
             if (gotResponse) {
@@ -1274,7 +1288,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
                 rpcResp["result"] = {
                     {"isError", true},
                     {"content", {{{"type", "text"}, {"text",
-                        "Timeout: 1C did not respond within " + std::to_string(timeout) + " seconds"}}}}
+                        "Timeout: 1C did not respond within " + std::to_string(timeout.load()) + " seconds"}}}}
                 };
             }
         }
@@ -1345,7 +1359,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
         {
             std::unique_lock<std::mutex> lock(pending->mtx);
             bool gotResponse = pending->cv.wait_for(lock,
-                std::chrono::seconds(timeout),
+                std::chrono::seconds(timeout.load()),
                 [&] { return pending->ready.load(); });
 
             json rpcResp;
@@ -1367,7 +1381,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
                 }
             } else {
                 rpcResp["error"] = {{"code", -32000},
-                    {"message", "Timeout: 1C did not respond within " + std::to_string(timeout) + " seconds"}};
+                    {"message", "Timeout: 1C did not respond within " + std::to_string(timeout.load()) + " seconds"}};
             }
 
             res.set_content(rpcResp.dump(), "application/json");
@@ -1438,7 +1452,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
         {
             std::unique_lock<std::mutex> lock(pending->mtx);
             bool gotResponse = pending->cv.wait_for(lock,
-                std::chrono::seconds(timeout),
+                std::chrono::seconds(timeout.load()),
                 [&] { return pending->ready.load(); });
 
             json rpcResp;
@@ -1459,7 +1473,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
                 }
             } else {
                 rpcResp["error"] = {{"code", -32000},
-                    {"message", "Timeout: 1C did not respond within " + std::to_string(timeout) + " seconds"}};
+                    {"message", "Timeout: 1C did not respond within " + std::to_string(timeout.load()) + " seconds"}};
             }
 
             res.set_content(rpcResp.dump(), "application/json");
@@ -1681,7 +1695,10 @@ void HttpServerComponent::doSetAuthToken(const std::u16string& token)
     std::string utf8 = WCHAR2MB(std::basic_string_view<WCHAR_T>(
         reinterpret_cast<const WCHAR_T*>(token.data()), token.size()));
 
-    authToken = utf8;
+    {
+        std::lock_guard<std::mutex> lock(authTokenMutex);
+        authToken = utf8;
+    }
     logToFile("Auth token " + std::string(utf8.empty() ? "disabled" : "set"));
 }
 
@@ -1720,7 +1737,7 @@ std::string HttpServerComponent::buildStatusJson()
         status["logging_enabled"] = loggingEnabled;
         status["log_path"] = logPath;
     }
-    status["auth_enabled"] = !authToken.empty();
+    status["auth_enabled"] = !authTokenCopy().empty();
     status["version"] = VERSION_SEMVER;
     return status.dump();
 }
@@ -1769,7 +1786,7 @@ void HttpServerComponent::doApplyConfig(const std::u16string& jsonStr)
     }
 
     if (cfg.contains("timeout") && cfg["timeout"].is_number_integer()) {
-        timeout = cfg["timeout"].get<int>();
+        timeout.store(cfg["timeout"].get<int>());
     }
 
     // Pre-serialized JSON arrays — forward verbatim to the existing handlers.

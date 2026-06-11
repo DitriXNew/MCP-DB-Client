@@ -62,7 +62,9 @@ private:
     httplib::Server* server = nullptr;
     std::thread serverThread;
     std::atomic<bool> running{false};
-    int timeout = 30;
+    // Seconds to wait for 1C; written via ApplyConfig/property while HTTP
+    // worker threads read it in wait_for — hence atomic.
+    std::atomic<int> timeout{30};
     int listenPort = 0;
 
 public:
@@ -117,7 +119,15 @@ private:
     // -----------------------------------------------------------------------
     // Security configuration.
     // -----------------------------------------------------------------------
-    std::string authToken;       // Bearer token; empty = no auth required.
+    // Bearer token; empty = no auth required. ApplyConfig may rewrite it while
+    // HTTP worker threads compare it in validateAuth — every access goes
+    // through authTokenMutex (readers take a copy via authTokenCopy()).
+    std::string authToken;
+    mutable std::mutex authTokenMutex;
+    std::string authTokenCopy() const {
+        std::lock_guard<std::mutex> lock(authTokenMutex);
+        return authToken;
+    }
     RateLimiter rateLimiter;
 
     bool validateOrigin(const httplib::Request& req, httplib::Response& res);

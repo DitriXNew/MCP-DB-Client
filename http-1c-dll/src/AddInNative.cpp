@@ -484,16 +484,16 @@ std::wstring AddInNative::WCHAR2WC(std::basic_string_view<WCHAR_T> src) {
 std::u16string AddInNative::MB2WCHAR(std::string_view src) {
 #ifdef _WINDOWS
 	// UTF-8 -> UTF-16 via the Win32 API directly: thread-safe (no shared static
-	// state — see WCHAR2MB) and one allocation instead of the previous two (the
-	// old path went UTF-8 -> std::wstring -> std::u16string).
+	// state — see WCHAR2MB). The API fills a wchar_t buffer; the result is then
+	// widened element-wise into char16_t — writing through a casted wchar_t*
+	// into the u16string's own buffer would violate strict aliasing.
 	if (src.empty()) return std::u16string();
 	const int slen = static_cast<int>(src.size());
 	const int needed = MultiByteToWideChar(CP_UTF8, 0, src.data(), slen, nullptr, 0);
 	if (needed <= 0) return std::u16string();
-	std::u16string out(static_cast<size_t>(needed), u'\0');
-	MultiByteToWideChar(CP_UTF8, 0, src.data(), slen,
-		reinterpret_cast<wchar_t*>(&out[0]), needed);
-	return out;
+	std::wstring wide(static_cast<size_t>(needed), L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, src.data(), slen, &wide[0], needed);
+	return std::u16string(wide.begin(), wide.end());
 #else
 	// Non-Windows: a LOCAL converter (no `static`) — thread-safe per call.
 	std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> cvt_utf8_utf16;
