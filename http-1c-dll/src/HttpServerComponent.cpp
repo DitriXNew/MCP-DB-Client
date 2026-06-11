@@ -397,12 +397,51 @@ json nativeToolDefinitions() {
 //
 // rcore.dll is loaded at RUNTIME (see RustCore.h). When it's absent — the "lite"
 // component — every native tool returns a structured `rag_not_installed` result
-// telling the caller to install the RAG (full) package.
+// telling the caller to install the RAG (full) package. When the file IS there
+// but failed to load, the result instead carries `rag_load_failed` with the
+// Win32 error and a hint — "file is present, why lite?!" is otherwise
+// undebuggable (the classic case: Windows Server 2019 has no in-box
+// DirectML.dll and the VC++ runtime may be missing).
+//
+// Returns {code, message} describing why the Rust core is unavailable.
+std::pair<std::string, std::string> ragUnavailableError() {
+    const unsigned long err = RCore::lastLoadError();
+    if (err == 0) {
+        return {"rag_not_installed",
+            "Semantic search backend (rcore.dll) is not installed — this is "
+            "the lite component. Install the RAG (full) package to enable "
+            "search/grep/get_segment/list_collections."};
+    }
+    std::string hint;
+    switch (err) {
+    case 126: // ERROR_MOD_NOT_FOUND — a DEPENDENT module is missing
+        hint = "a DLL rcore.dll depends on was not found. Make sure "
+               "DirectML.dll from the bundle sits in the SAME directory as "
+               "rcore.dll, and that the Microsoft Visual C++ runtime "
+               "(vcruntime140.dll / vcruntime140_1.dll / msvcp140.dll) is "
+               "installed on this host.";
+        break;
+    case 193: // ERROR_BAD_EXE_FORMAT
+        hint = "bitness/format mismatch — rcore.dll must be x86-64.";
+        break;
+    case 1114: // ERROR_DLL_INIT_FAILED
+        hint = "a dependent DLL failed to initialize — the shipped "
+               "DirectML.dll may be incompatible with this Windows version.";
+        break;
+    default:
+        hint = "see the Win32 error code.";
+        break;
+    }
+    return {"rag_load_failed",
+        "rcore.dll is present next to the component but FAILED to load "
+        "(Win32 error " + std::to_string(err) + "): " + hint};
+}
+
 json dispatchNativeTool(const std::string& toolName, const json& arguments) {
     if (!RCore::available()) {
-        return makeTextToolResult(
-            R"({"code":"rag_not_installed","message":"Semantic search backend (rcore.dll) is not installed — this is the lite component. Install the RAG package to enable search/grep/get_segment/list_collections."})",
-            true);
+        const auto [code, message] = ragUnavailableError();
+        json err = {{"code", code}, {"message", message}};
+        return makeTextToolResult(err.dump(), true);
     }
 
     std::string argsJson;
@@ -690,8 +729,12 @@ HttpServerComponent::HttpServerComponent()
 
             std::string envelope;
             if (!RCore::available()) {
-                envelope =
-                    R"({"ok":false,"error":{"code":"rag_not_installed","message":"Semantic search backend (rcore.dll) is not installed — this is the lite component. Install the RAG (full) package to enable search."}})";
+                const auto [code, message] = ragUnavailableError();
+                json errEnvelope = {
+                    {"ok", false},
+                    {"error", {{"code", code}, {"message", message}}}
+                };
+                envelope = errEnvelope.dump();
             } else {
                 RustString raw = RCore::dispatch(methodUtf8, payloadUtf8);
                 envelope = raw.str();
@@ -1783,6 +1826,11 @@ std::string HttpServerComponent::buildStatusJson()
         status["log_path"] = logPath;
     }
     status["auth_enabled"] = !authTokenCopy().empty();
+    // RAG availability + WHY it is unavailable: rag_load_error is the Win32
+    // code of a failed rcore.dll load while the file exists (0 = loaded fine
+    // or genuinely not installed) — see RustCore.h.
+    status["rag_available"] = RCore::available();
+    status["rag_load_error"] = (int64_t)RCore::lastLoadError();
     status["version"] = VERSION_SEMVER;
     return status.dump();
 }

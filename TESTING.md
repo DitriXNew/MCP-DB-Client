@@ -37,7 +37,7 @@ prints PASS/FAIL per test:
 | T7 | `tools/call` of a 1C tool with `timeout: 1`: `ExternalEvent(ToolCall)` reaches the stub and the "did not respond within 1 second" error returns within ~3 s |
 | T8 | UTF-8 round-trip: Russian tool name/description come back byte-identical through `MB2WCHAR`/`WCHAR2MB` |
 | T9 | Native `list_collections` end-to-end: ok-collections JSON (with `rcore.dll` beside the DLL) or structured `rag_not_installed` (lite) — both valid |
-| T10 | Late `rcore.dll` install: a second component copy in a temp dir without `rcore.dll` answers `rag_not_installed` (message names all 4 native tools); after copying `rcore.dll` beside it the SAME loaded module flips to full — no process restart (flip stage skips on the lite CI build) |
+| T10 | Late `rcore.dll` install: a second component copy in a temp dir without `rcore.dll` answers `rag_not_installed` (message names all 4 native tools; `GetStatus` shows `rag_available=false`, `rag_load_error=0`); after copying `rcore.dll` beside it the SAME loaded module flips to full (`rag_available=true`) — no process restart (flip stage skips on the lite CI build) |
 
 The harness never enables component logging and always finishes with
 `StopListen`, so it leaves no log files and no dangling threads.

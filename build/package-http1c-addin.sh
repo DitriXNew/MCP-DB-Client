@@ -53,11 +53,56 @@ fi
 PACKAGE_PATH="${2:-$DEFAULT_PACKAGE}"
 TEMPLATE_PATH="${3:-$REPO_ROOT/http-1c-dp/http1c/Templates/http1c/Ext/Template.bin}"
 
-# Source for DirectML.dll on the GitHub windows-latest runner / dev machines.
-# Version-coupling caveat: this DirectML.dll is paired with the onnxruntime that
-# ort bundled into rcore.dll. A future CPU-only onnxruntime build would drop the
-# DirectML import entirely and this copy could be removed.
-DIRECTML_SRC="${DIRECTML_SRC:-/c/Windows/System32/DirectML.dll}"
+# Source for DirectML.dll. rcore.dll hard-imports it (ort bundles the DirectML
+# execution provider) and the component loads rcore.dll with
+# LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, so the BUNDLED copy is what actually gets
+# used on hosts without an in-box DirectML (Windows Server 2019 = 1809;
+# DirectML ships in-box only since Windows 10 1903). A System32 copy taken from
+# a NEWER Windows is not guaranteed to run on older hosts, so we bundle the
+# official redistributable (NuGet Microsoft.AI.DirectML, supports 1709+).
+# Resolution order:
+#   1. explicit DIRECTML_SRC env override;
+#   2. redist cached under build/tools/directml/<version>/ (downloaded once);
+#   3. download of the pinned NuGet package;
+#   4. last resort: the build host's System32 copy (with a loud warning).
+DIRECTML_NUGET_VERSION="${DIRECTML_NUGET_VERSION:-1.15.4}"
+DIRECTML_CACHE="$REPO_ROOT/build/tools/directml/$DIRECTML_NUGET_VERSION"
+
+resolve_directml() {
+    if [[ -n "${DIRECTML_SRC:-}" ]]; then
+        echo "$DIRECTML_SRC"
+        return
+    fi
+    local cached="$DIRECTML_CACHE/DirectML.dll"
+    if [[ -f "$cached" ]]; then
+        echo "$cached"
+        return
+    fi
+    mkdir -p "$DIRECTML_CACHE"
+    local pkg_zip="$DIRECTML_CACHE/pkg.zip"
+    local pkg_dir="$DIRECTML_CACHE/pkg"
+    if curl -fsSL --retry 3 \
+            "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/$DIRECTML_NUGET_VERSION" \
+            -o "$pkg_zip" 2>/dev/null; then
+        # A .nupkg is a zip; the x64 runtime DLL lives at bin/x64-win/DirectML.dll.
+        # Expand-Archive needs a .zip extension, hence the rename on download.
+        powershell.exe -NoProfile -Command \
+            "Expand-Archive -LiteralPath '$(cygpath -w "$pkg_zip")' -DestinationPath '$(cygpath -w "$pkg_dir")' -Force" \
+            >/dev/null 2>&1 || true
+        if [[ -f "$pkg_dir/bin/x64-win/DirectML.dll" ]]; then
+            cp "$pkg_dir/bin/x64-win/DirectML.dll" "$cached"
+        fi
+        rm -rf "$pkg_zip" "$pkg_dir"
+        if [[ -f "$cached" ]]; then
+            echo "$cached"
+            return
+        fi
+    fi
+    echo "WARNING: could not fetch the DirectML $DIRECTML_NUGET_VERSION redistributable;" >&2
+    echo "falling back to this host's System32 DirectML.dll — the bundle may not load" >&2
+    echo "on OLDER Windows (e.g. Server 2019). Set DIRECTML_SRC to override." >&2
+    echo "/c/Windows/System32/DirectML.dll"
+}
 
 if [[ ! -f "$DLL_PATH" ]]; then
     echo "DLL not found: $DLL_PATH"
@@ -95,14 +140,16 @@ if [[ "$VARIANT" == "full" ]]; then
     fi
     PAYLOAD+=("$RCORE_SRC|rcore.dll")
 
-    if [[ ! -f "$DIRECTML_SRC" ]]; then
-        echo "FULL variant requested but DirectML.dll not found: $DIRECTML_SRC"
+    DIRECTML_RESOLVED="$(resolve_directml)"
+    if [[ ! -f "$DIRECTML_RESOLVED" ]]; then
+        echo "FULL variant requested but DirectML.dll not found: $DIRECTML_RESOLVED"
         echo "rcore.dll hard-imports DirectML.dll (ort's DirectML execution provider);"
         echo "without it rcore.dll fails to load and the component degrades to lite."
         echo "Set DIRECTML_SRC to its location, or install the DirectML runtime."
         exit 1
     fi
-    PAYLOAD+=("$DIRECTML_SRC|DirectML.dll")
+    echo "DirectML.dll source: $DIRECTML_RESOLVED"
+    PAYLOAD+=("$DIRECTML_RESOLVED|DirectML.dll")
 fi
 
 # ---- Build MANIFEST.XML listing every native DLL ---------------------------

@@ -900,6 +900,21 @@ int wmain(int argc, wchar_t** argv) {
                   std::string("rag_not_installed message names ") + native);
         }
 
+        // GetStatus distinguishes "genuinely not installed" (rag_load_error=0)
+        // from "present but failed to load" (nonzero Win32 code).
+        {
+            tVariant ret;
+            REQUIRE(h2.callFunc(L"GetStatus", &ret, nullptr, 0),
+                    "CallAsFunc(GetStatus) on the temp instance");
+            if (g_fatal) return;
+            const json st = json::parse(variantToUtf8(ret), nullptr, false);
+            freeVariant(ret);
+            CHECK(!st.is_discarded() && st.value("rag_available", true) == false,
+                  "status: rag_available=false without rcore.dll");
+            CHECK(!st.is_discarded() && st.value("rag_load_error", -1) == 0,
+                  "status: rag_load_error=0 when rcore.dll is simply absent");
+        }
+
         // Stage B — drop rcore.dll next to the RUNNING component and call again:
         // the loader must retry and leave lite mode within the same process.
         if (fileExists(srcDir + L"rcore.dll")) {
@@ -918,6 +933,16 @@ int wmain(int argc, wchar_t** argv) {
                             code.c_str(), (int)isError);
                 CHECK(payload.is_object() && code != "rag_not_installed",
                       "after copying rcore.dll the loader picks it up without a restart");
+
+                tVariant ret;
+                REQUIRE(h2.callFunc(L"GetStatus", &ret, nullptr, 0),
+                        "CallAsFunc(GetStatus) after the late install");
+                if (!g_fatal) {
+                    const json st = json::parse(variantToUtf8(ret), nullptr, false);
+                    freeVariant(ret);
+                    CHECK(!st.is_discarded() && st.value("rag_available", false) == true,
+                          "status: rag_available flips to true after the install");
+                }
             }
         } else {
             std::printf("    SKIP flip stage: no rcore.dll beside the primary DLL (lite build)\n");

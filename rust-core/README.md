@@ -87,7 +87,11 @@ The `Embedder` trait has two impls:
 
 `configure` selects the backend: `model` / `model_path` non-empty (with the
 feature compiled in) → `FastEmbedder`, else `MockEmbedder`. `embed_workers`
-sizes the bulk pool (default auto ≈ `ncpu/2`, capped).
+sizes the bulk pool: absent ⇒ **1**; `0` ⇒ auto (`ncpu/2` clamped to 1..=4);
+`n` ⇒ exactly n. **Each bulk worker is a separate model session — a full model
+copy in RAM** (e5-small fp32 ≈ 0.5–1.5 GB per session under load, plus one
+query session), so `auto` on a big server can cost ~5 model copies. There is no
+hard memory quota in the core; size the pool to your RAM.
 
 **Model whitelist:** `model` must be one of the built-in names (matched
 case-insensitively; empty/absent ⇒ the default):

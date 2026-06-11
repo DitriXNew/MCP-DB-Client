@@ -89,6 +89,13 @@ struct State {
     free_fn_t     freeStr  = nullptr;
     shutdown_fn_t shutdown = nullptr;
     std::atomic<bool> ready{false}; // module loaded AND all 4 symbols resolved
+    // Win32 error of the last FAILED load attempt while rcore.dll EXISTS on
+    // disk (0 = never failed / file simply absent = genuine lite). This is the
+    // difference between "RAG not installed" and "RAG installed but broken"
+    // (e.g. ERROR_MOD_NOT_FOUND 126 = a DEPENDENT dll like DirectML.dll or the
+    // VC++ runtime is missing; 193 = bitness mismatch; 1114 = a dependent
+    // DllMain failed). Surfaced via GetStatus and the lite-mode tool errors.
+    std::atomic<unsigned long> loadError{0};
 };
 
 // An ordinary function whose address lives inside THIS module — used as the
@@ -146,9 +153,30 @@ inline void load(State& s) {
         return;
     }
 
-    s.module = LoadLibraryW((dir + L"rcore.dll").c_str());
-    if (!s.module) {
+    const std::wstring path = dir + L"rcore.dll";
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        s.loadError.store(0, std::memory_order_relaxed);
         return; // lite component: rcore.dll simply isn't installed.
+    }
+
+    // The file IS there — load it so that its OWN dependencies (DirectML.dll
+    // ships next to rcore.dll in the full bundle) are searched in rcore.dll's
+    // directory too. Plain LoadLibrary resolves dependents starting from the
+    // PROCESS EXE's directory (1cv8.exe), so on hosts without an in-box
+    // DirectML (e.g. Windows Server 2019 = 1809, DirectML shipped in 1903)
+    // the import silently failed and the component degraded to lite even
+    // though every file was in place.
+    s.module = LoadLibraryExW(path.c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!s.module && GetLastError() == ERROR_INVALID_PARAMETER) {
+        // Loader without LOAD_LIBRARY_SEARCH_* support — the altered search
+        // path likewise substitutes the DLL's directory for the exe's.
+        s.module = LoadLibraryExW(path.c_str(), nullptr,
+            LOAD_WITH_ALTERED_SEARCH_PATH);
+    }
+    if (!s.module) {
+        s.loadError.store(GetLastError(), std::memory_order_relaxed);
+        return; // present but unloadable — the error code tells the user why.
     }
 
     s.version  = reinterpret_cast<version_fn_t>(
@@ -162,12 +190,14 @@ inline void load(State& s) {
 
     // Require the whole ABI: a partial/mismatched DLL is treated as "not there"
     // so we degrade to the lite path instead of crashing on a null pointer.
-    // (A DLL caught mid-copy by "install from archive" lands here too — it is
+    // (A DLL caught mid-copy by a manual install lands here too — it is
     // unloaded and the NEXT call retries the now-complete file.)
     if (s.version && s.dispatch && s.freeStr && s.shutdown) {
+        s.loadError.store(0, std::memory_order_relaxed);
         s.ready.store(true, std::memory_order_release);
         return;
     }
+    s.loadError.store(ERROR_PROC_NOT_FOUND, std::memory_order_relaxed);
     FreeLibrary(s.module);
     s.module   = nullptr;
     s.version  = nullptr;
@@ -199,6 +229,13 @@ inline const State& loaded() {
 // flip lite -> full at runtime after the user installs rcore.dll.
 inline bool available() {
     return detail::loaded().ready.load(std::memory_order_acquire);
+}
+
+// Win32 error of the last failed load attempt while rcore.dll exists on disk;
+// 0 when the core is loaded OR the file is simply absent (genuine lite).
+// Lets callers distinguish "not installed" from "installed but won't load".
+inline unsigned long lastLoadError() {
+    return detail::loaded().loadError.load(std::memory_order_relaxed);
 }
 
 // Free a char* returned by an rcore_* function, via the LOADED rcore_free_string
@@ -235,6 +272,7 @@ inline void shutdown() {
 #else // !_WIN32 — inert lite stubs (no Rust core on this platform)
 
 inline bool available() { return false; }
+inline unsigned long lastLoadError() { return 0; }
 inline void freeString(char*) {}
 inline void shutdown() {}
 
