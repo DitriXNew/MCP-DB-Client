@@ -18,6 +18,9 @@
 //   T7  tools/call timeout: ExternalEvent fired, "1 second" error, no hang
 //   T8  UTF-8 round-trip of Russian tool name/description
 //   T9  native list_collections callable (ok-collections OR rag_not_installed)
+//   T10 late rcore.dll install: lite copy answers rag_not_installed (message
+//       names all 4 native tools), then rcore.dll is copied in and the SAME
+//       loaded module flips to full — no process restart (loader retry)
 //
 // Usage: http1c_smoke.exe [path\to\libhttp1cWin.dll]
 //   Default DLL path: "..\bin\libhttp1cWin.dll" relative to the exe
@@ -754,6 +757,152 @@ int wmain(int argc, wchar_t** argv) {
             ragNotInstalled ? "rag_not_installed (lite)" : "UNEXPECTED");
         CHECK(okCollections || ragNotInstalled,
               "list_collections returned ok-collections or rag_not_installed, got: " + text);
+    });
+
+    // -----------------------------------------------------------------------
+    // T10: late rcore.dll install — lite flips to full WITHOUT a restart.
+    //      A second copy of the component DLL is loaded from a temp dir with
+    //      no rcore.dll beside it: native search must answer rag_not_installed
+    //      and the message must name all four native tools. Then rcore.dll is
+    //      copied in and the SAME loaded module is called again — the RCore
+    //      loader retries the failed load and the answer must no longer be
+    //      rag_not_installed. The flip stage needs the real rcore.dll from the
+    //      full bundle, so on the lite CI build it is skipped (stage A — the
+    //      rag_not_installed contract — still runs everywhere).
+    // -----------------------------------------------------------------------
+    runTest("T10 late rcore.dll install (lite -> full, no restart)", [&] {
+        const size_t srcSlash = dllPath.find_last_of(L"\\/");
+        const std::wstring srcDir = (srcSlash == std::wstring::npos)
+            ? std::wstring() : dllPath.substr(0, srcSlash + 1);
+
+        wchar_t tmpBuf[MAX_PATH] = L"";
+        REQUIRE(::GetTempPathW(MAX_PATH, tmpBuf) != 0, "GetTempPath succeeded");
+        if (g_fatal) return;
+        const std::wstring dir = std::wstring(tmpBuf) + L"http1c_smoke_t10_" +
+            std::to_wstring(::GetCurrentProcessId()) + L"\\";
+        ::CreateDirectoryW(dir.c_str(), nullptr);
+
+        // Force the lite layout: component DLL only. A stale rcore.dll left by
+        // a previous run (PID reuse) would defeat stage A — remove it first.
+        ::DeleteFileW((dir + L"rcore.dll").c_str());
+        REQUIRE(::CopyFileW(dllPath.c_str(), (dir + L"libhttp1cWin.dll").c_str(), FALSE),
+                "copy the component DLL into an rcore-free temp dir");
+        if (g_fatal) return;
+
+        Harness h2; // separate module path => separate statics => fresh RCore state
+        REQUIRE(h2.load(dir + L"libhttp1cWin.dll"), "load the temp copy of the component");
+        if (g_fatal) return;
+        h2.comp = nullptr;
+        h2.getClassObject(L"HttpServer", &h2.comp);
+        REQUIRE(h2.comp && h2.comp->setMemManager(&h2.mem) &&
+                h2.comp->Init(static_cast<IAddInDefBase*>(&h2.conn)),
+                "init the temp component instance");
+        if (g_fatal) return;
+
+        json cfg;
+        cfg["logging_enabled"] = false;
+        cfg["tools_json"] = "[]";
+        cfg["timeout"] = 2;
+        CHECK(h2.applyConfig(cfg), "ApplyConfig on the temp instance");
+
+        const int port2 = pickFreePort();
+        std::printf("    temp instance port: %d\n", port2);
+        tVariant pPort, ret;
+        setVariantInt(pPort, port2);
+        const bool listening = h2.callFunc(L"StartListen", &ret, &pPort, 1);
+        freeVariant(ret);
+        REQUIRE(listening, "StartListen on the temp instance");
+        if (g_fatal) return;
+
+        auto cli = makeClient(port2);
+        bool up = false;
+        for (int i = 0; i < 100 && !up; ++i) {
+            auto res = cli->Get("/health");
+            if (res && res->status == 200) up = true;
+            else std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        REQUIRE(up, "temp instance /health responds 200");
+        if (g_fatal) return;
+
+        json initParams = {
+            {"protocolVersion", "2025-03-26"},
+            {"capabilities", json::object()},
+            {"clientInfo", {{"name", "http1c_smoke_t10"}, {"version", "1.0"}}}
+        };
+        RpcOptions initOpt;
+        initOpt.accept = "application/json, text/event-stream";
+        auto initRes = mcpPost(*cli, rpcRequest("initialize", 1, initParams), initOpt);
+        REQUIRE(initRes && initRes->status == 200, "temp instance initialize -> 200");
+        if (g_fatal) return;
+        RpcOptions sess;
+        sess.sessionId = initRes->get_header_value("Mcp-Session-Id");
+
+        // tools/call search -> parsed inner payload (the text of content[0]).
+        auto callSearch = [&](int id, bool& isError) -> json {
+            json params = {
+                {"name", "search"},
+                {"arguments", {{"query", "ping"}}}
+            };
+            auto res = mcpPost(*cli, rpcRequest("tools/call", id, params), sess);
+            if (!res || res->status != 200) { isError = true; return json(); }
+            const json body = json::parse(res->body, nullptr, false);
+            if (body.is_discarded() || !body.contains("result")) { isError = true; return json(); }
+            isError = body["result"].value("isError", false);
+            std::string text;
+            if (body["result"].contains("content") && !body["result"]["content"].empty()) {
+                text = body["result"]["content"][0].value("text", std::string());
+            }
+            return json::parse(text, nullptr, false);
+        };
+
+        // Stage A — without rcore.dll: structured rag_not_installed naming
+        // every native tool (so a caller knows the full surface it is missing).
+        bool isError = false;
+        json payload = callSearch(2, isError);
+        CHECK(isError && payload.is_object() &&
+              payload.value("code", std::string()) == "rag_not_installed",
+              "without rcore.dll native search returns rag_not_installed");
+        const std::string msg = payload.is_object()
+            ? payload.value("message", std::string()) : std::string();
+        for (const char* native : {"search", "grep", "get_segment", "list_collections"}) {
+            CHECK(msg.find(native) != std::string::npos,
+                  std::string("rag_not_installed message names ") + native);
+        }
+
+        // Stage B — drop rcore.dll next to the RUNNING component and call again:
+        // the loader must retry and leave lite mode within the same process.
+        if (fileExists(srcDir + L"rcore.dll")) {
+            REQUIRE(::CopyFileW((srcDir + L"rcore.dll").c_str(),
+                                (dir + L"rcore.dll").c_str(), FALSE),
+                    "copy rcore.dll next to the running temp component");
+            if (fileExists(srcDir + L"DirectML.dll")) { // lazy-loaded by ort; ship alongside
+                ::CopyFileW((srcDir + L"DirectML.dll").c_str(),
+                            (dir + L"DirectML.dll").c_str(), FALSE);
+            }
+            if (!g_fatal) {
+                payload = callSearch(3, isError);
+                const std::string code = payload.is_object()
+                    ? payload.value("code", std::string()) : std::string("<non-json>");
+                std::printf("    after install: search answered code=\"%s\" isError=%d\n",
+                            code.c_str(), (int)isError);
+                CHECK(payload.is_object() && code != "rag_not_installed",
+                      "after copying rcore.dll the loader picks it up without a restart");
+            }
+        } else {
+            std::printf("    SKIP flip stage: no rcore.dll beside the primary DLL (lite build)\n");
+        }
+
+        tVariant none;
+        tVarInit(&none);
+        CHECK(h2.callProc(L"StopListen", &none, 0), "temp instance StopListen");
+        h2.destroy();
+        // Best-effort cleanup: both DLLs stay mapped until process exit (no
+        // FreeLibrary by design), so deletes may fail — that is fine, the next
+        // run gets a fresh PID-suffixed dir and scrubs stale files itself.
+        ::DeleteFileW((dir + L"libhttp1cWin.dll").c_str());
+        ::DeleteFileW((dir + L"DirectML.dll").c_str());
+        ::DeleteFileW((dir + L"rcore.dll").c_str());
+        ::RemoveDirectoryW(dir.c_str());
     });
 
     // -----------------------------------------------------------------------

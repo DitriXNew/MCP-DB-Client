@@ -133,9 +133,14 @@ if (RCORE_FASTEMBED AND NOT UNIX)
 	# Rust sources that should trigger a rebuild. CONFIGURE_DEPENDS re-globs at
 	# build time so editing a .rs file rebuilds the cdylib (cargo itself is
 	# incremental, but CMake needs the dependency to know it must invoke cargo).
+	# Cargo.lock (dependency bumps) and .cargo/config.toml (CRT/link flags)
+	# change the produced DLL just as much as source edits do.
 	file(GLOB_RECURSE RCORE_SOURCES CONFIGURE_DEPENDS
 		"${RCORE_DIR}/src/*.rs")
-	list(APPEND RCORE_SOURCES "${RCORE_DIR}/Cargo.toml")
+	list(APPEND RCORE_SOURCES
+		"${RCORE_DIR}/Cargo.toml"
+		"${RCORE_DIR}/Cargo.lock"
+		"${RCORE_DIR}/.cargo/config.toml")
 
 	# Build the cdylib with the dynamic CRT (ort needs /MD), then copy rcore.dll
 	# into the component output dir (bin/). The copied DLL is the OUTPUT.

@@ -399,7 +399,7 @@ json nativeToolDefinitions() {
 json dispatchNativeTool(const std::string& toolName, const json& arguments) {
     if (!RCore::available()) {
         return makeTextToolResult(
-            R"({"code":"rag_not_installed","message":"Semantic search backend (rcore.dll) is not installed — this is the lite component. Install the RAG package to enable search/grep/get_segment."})",
+            R"({"code":"rag_not_installed","message":"Semantic search backend (rcore.dll) is not installed — this is the lite component. Install the RAG package to enable search/grep/get_segment/list_collections."})",
             true);
     }
 

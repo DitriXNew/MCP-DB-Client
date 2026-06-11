@@ -35,7 +35,8 @@
 // project still supports UNIX) this header degrades to inert stubs so the rest
 // of the component compiles as the lite variant — no <windows.h> leakage.
 #if defined(_WIN32)
-#include <mutex>   // std::once_flag / std::call_once
+#include <atomic>  // std::atomic<bool> ready (lock-free fast path)
+#include <mutex>   // std::mutex serializing load attempts
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -49,8 +50,15 @@
 // The DLL is located NEXT TO THIS COMPONENT (libhttp1cWin.dll), not the process
 // working directory: we resolve this module's own path via GetModuleHandleExW
 // (FROM_ADDRESS of a function defined here) + GetModuleFileNameW, then load
-// "<that dir>\\rcore.dll". Loading happens once, guarded by std::call_once, so
-// concurrent httplib worker threads calling search/grep are safe.
+// "<that dir>\\rcore.dll".
+//
+// A FAILED load is retried on the next call (serialized by a mutex): the user
+// can install rcore.dll next to libhttp1cWin.dll while 1C is running (e.g. the
+// VA plugin's "install from archive" button) and the very next search call
+// picks it up — no process restart. A failed probe is just LoadLibrary on a
+// missing file (cheap), and it only happens on lite-mode search calls. Once
+// loaded, the DLL stays loaded; the lock-free `ready` fast path makes the
+// loaded case contention-free for concurrent httplib worker threads.
 //
 // If rcore.dll is missing or any of the 4 entry points is absent, available()
 // returns false and the loader is an inert no-op (lite component) — never a
@@ -70,14 +78,17 @@ using shutdown_fn_t  = void  (*)(void);
 
 namespace detail {
 
-// Resolved-once loader state. Populated by load() under std::call_once.
+// Loader state. Pointer fields are written only under loadMutex(); readers
+// reach them through the `ready` acquire/release handshake in loaded(): the
+// release store of ready=true happens AFTER the pointers are populated, so any
+// thread that observes ready==true also observes the resolved pointers.
 struct State {
     HMODULE       module   = nullptr;
     version_fn_t  version  = nullptr;
     dispatch_fn_t dispatch = nullptr;
     free_fn_t     freeStr  = nullptr;
     shutdown_fn_t shutdown = nullptr;
-    bool          ready    = false; // module loaded AND all 4 symbols resolved
+    std::atomic<bool> ready{false}; // module loaded AND all 4 symbols resolved
 };
 
 // An ordinary function whose address lives inside THIS module — used as the
@@ -90,9 +101,9 @@ inline State& state() {
     return s;
 }
 
-inline std::once_flag& onceFlag() {
-    static std::once_flag flag;
-    return flag;
+inline std::mutex& loadMutex() {
+    static std::mutex m;
+    return m;
 }
 
 // Directory containing this component DLL, with a trailing backslash, or empty
@@ -151,28 +162,43 @@ inline void load(State& s) {
 
     // Require the whole ABI: a partial/mismatched DLL is treated as "not there"
     // so we degrade to the lite path instead of crashing on a null pointer.
-    s.ready = s.version && s.dispatch && s.freeStr && s.shutdown;
-    if (!s.ready) {
-        FreeLibrary(s.module);
-        s.module   = nullptr;
-        s.version  = nullptr;
-        s.dispatch = nullptr;
-        s.freeStr  = nullptr;
-        s.shutdown = nullptr;
+    // (A DLL caught mid-copy by "install from archive" lands here too — it is
+    // unloaded and the NEXT call retries the now-complete file.)
+    if (s.version && s.dispatch && s.freeStr && s.shutdown) {
+        s.ready.store(true, std::memory_order_release);
+        return;
     }
+    FreeLibrary(s.module);
+    s.module   = nullptr;
+    s.version  = nullptr;
+    s.dispatch = nullptr;
+    s.freeStr  = nullptr;
+    s.shutdown = nullptr;
 }
 
 inline const State& loaded() {
     State& s = state();
-    std::call_once(onceFlag(), [&s] { load(s); });
+    // Fast path: already loaded — lock-free (acquire pairs with the release
+    // store in load(), making the resolved pointers visible).
+    if (s.ready.load(std::memory_order_acquire)) {
+        return s;
+    }
+    // Not loaded yet (or every previous attempt failed): retry under the lock
+    // so a late-installed rcore.dll is picked up without a process restart.
+    std::lock_guard<std::mutex> lock(loadMutex());
+    if (!s.ready.load(std::memory_order_relaxed)) { // re-check under the lock
+        load(s);
+    }
     return s;
 }
 
 } // namespace detail
 
 // True iff rcore.dll loaded AND all 4 entry points resolved (full component).
+// Retries the load on every call until it succeeds (see loaded()), so this can
+// flip lite -> full at runtime after the user installs rcore.dll.
 inline bool available() {
-    return detail::loaded().ready;
+    return detail::loaded().ready.load(std::memory_order_acquire);
 }
 
 // Free a char* returned by an rcore_* function, via the LOADED rcore_free_string
@@ -182,7 +208,7 @@ inline void freeString(char* s) {
         return;
     }
     const detail::State& st = detail::loaded();
-    if (st.ready && st.freeStr) {
+    if (st.ready.load(std::memory_order_acquire) && st.freeStr) {
         st.freeStr(s);
     }
     // If the core isn't loaded we cannot have a pointer it allocated, so there
@@ -201,7 +227,7 @@ RustString dispatch(const std::string& method, const std::string& payloadJson);
 // component destructor — the Rust singleton outlives any single instance.
 inline void shutdown() {
     const detail::State& st = detail::loaded();
-    if (st.ready && st.shutdown) {
+    if (st.ready.load(std::memory_order_acquire) && st.shutdown) {
         st.shutdown();
     }
 }
@@ -281,7 +307,7 @@ namespace RCore {
 
 inline RustString version() {
     const detail::State& st = detail::loaded();
-    if (!st.ready) {
+    if (!st.ready.load(std::memory_order_acquire)) {
         return RustString();
     }
     return RustString::adopt(st.version());
@@ -289,7 +315,7 @@ inline RustString version() {
 
 inline RustString dispatch(const std::string& method, const std::string& payloadJson) {
     const detail::State& st = detail::loaded();
-    if (!st.ready) {
+    if (!st.ready.load(std::memory_order_acquire)) {
         return RustString();
     }
     return RustString::adopt(st.dispatch(method.c_str(), payloadJson.c_str()));

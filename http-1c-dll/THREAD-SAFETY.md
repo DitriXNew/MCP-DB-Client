@@ -50,17 +50,19 @@ The new native search path executes **entirely on a httplib worker thread** (ins
 | `sseStreams` | `sseStreamsMutex` (+ per-stream `mtx`) | workers + 1C (broadcast) | **Safe** |
 | Logging (`g_logPath`, `g_loggingEnabled`) | `g_loggingMutex` | all | **Safe** |
 | Instance logging (`logPath`, `loggingEnabled`) | `loggingMutex` (+ see note) | workers + 1C | **Safe** with one benign data race on `loggingEnabled` (pre-existing) |
-| `authToken` | **none** | workers (read) + 1C (write) | **Benign data race** (pre-existing, not introduced by native path) |
+| `authToken` | `authTokenMutex` (readers snapshot via `authTokenCopy()`) | workers (read) + 1C (write via `ApplyConfig`/`SetAuthToken`) | **Safe** (was a pre-existing race; fixed during PR review) |
 | `rateLimiter` | internal `RateLimiter::mtx` | workers | **Safe** |
-| `running` / `listenPort` / `timeout` | `atomic` / plain int | workers + 1C | `running` safe; `listenPort`/`timeout` benign (pre-existing) |
+| `running` / `timeout` | `std::atomic<bool>` / `std::atomic<int>` | workers + 1C | **Safe** (`timeout` was a benign race; made atomic during PR review) |
+| `listenPort` | plain int | workers + 1C | **Benign** (written once in `doStartListen` before workers exist) |
 | Native helpers (`isNativeTool`, `nativeToolDefinitions`, `dispatchNativeTool`, `metaFiltersSchema`) | — (stateless) | workers | **Safe** (reentrant, no shared state) |
 | Rust core singleton (`CORE`) | `RwLock<Core>` **inside Rust** | workers (search) + 1C (ingest/configure, once wired) | **Safe** (locking owned by Rust) |
 
 **Bottom line: the native search path introduces no new C++ data races.** It is a stateless,
-synchronous pass-through to a Rust core that does its own locking. The only races in the file are
-two **pre-existing, benign** unsynchronized reads of config strings/ints (`authToken`,
-`loggingEnabled`, `timeout`, `listenPort`) that predate this work and are not material. No C++
-code changes were required; details and reasoning follow.
+synchronous pass-through to a Rust core that does its own locking. The audit originally flagged
+four **pre-existing, benign** unsynchronized reads of config strings/ints; two of them
+(`authToken`, `timeout`) were subsequently fixed during the PR review (`authTokenMutex` +
+`std::atomic<int>`), leaving only `loggingEnabled` and `listenPort` as benign, effectively
+write-once values. Details and reasoning follow.
 
 ---
 
@@ -189,31 +191,31 @@ synchronizing through the condition variable. This is correct and unchanged by t
 
 ---
 
-## Pre-existing, non-material races (not introduced by this card; not fixed)
+## Pre-existing, non-material races (audit findings; status updated)
 
 These predate the native path. They are unsynchronized reads/writes of small scalar/string config
-values. They are flagged for honesty but are **not** material enough to warrant a fix in this
-audit, and fixing them is out of this card's "minimal C++ change" mandate since the native path
-neither created nor worsened them.
+values. The audit originally left all of them unfixed under the card's "minimal C++ change"
+mandate; items 1 and 3 (`timeout`) were **subsequently fixed during the PR review** because
+`ApplyConfig` made both genuinely runtime-mutable under live traffic (token rotation / timeout
+re-config), which promoted them from "benign" to "must-fix" exactly as item 4 of the latent-risks
+section predicted.
 
-1. **`authToken`** (`HttpServerComponent.h:120`). Read on worker threads in `validateAuth`
-   (`authToken.empty()`, `auth.substr(7) == authToken`) and in `Status` (`!authToken.empty()`);
-   written on the 1C thread in `doSetAuthToken` (`authToken = utf8;`) with **no mutex**. A
-   concurrent `std::string` assignment vs. read is a formal data race (UB), though in practice the
-   token is set once at startup before traffic. *Latent risk:* if a future feature rotates the token
-   at runtime while serving, this becomes a real bug. **Minimal future fix:** a dedicated
-   `authMutex` (or `std::shared_mutex`), or store the token snapshot in an
-   `std::shared_ptr<const std::string>` swapped atomically.
+1. **`authToken`** — **FIXED.** Originally read on worker threads in `validateAuth`/`Status` and
+   written on the 1C thread in `doSetAuthToken` with no mutex (a formal data race on a
+   `std::string`). Now every access goes through `authTokenMutex`: `doSetAuthToken` assigns under
+   the lock, and readers take a snapshot via `authTokenCopy()`
+   (`HttpServerComponent.h`), so `validateAuth` compares against a stable copy even while
+   `ApplyConfig` rotates the token mid-flight.
 
-2. **`loggingEnabled`** (instance field, `HttpServerComponent.h:130`). The `LoggingEnabled` getter
-   reads it and the setter writes it without `loggingMutex` (only the mirrored *global*
-   `g_loggingEnabled` is locked); `Status` reads it under `loggingMutex` but the property accessor
-   does not. Benign `bool` race.
+2. **`loggingEnabled`** (instance field). The `LoggingEnabled` getter reads it and the setter
+   writes it without `loggingMutex` (only the mirrored *global* `g_loggingEnabled` is locked);
+   `Status` reads it under `loggingMutex` but the property accessor does not. Benign `bool` race —
+   still present, still non-material.
 
-3. **`timeout`** (`HttpServerComponent.h:65`, plain `int`) and **`listenPort`** — written by 1C
-   properties / `doStartListen`, read on workers (`wait_for(seconds(timeout))`, `Status`,
-   `/health`) without synchronization. Benign torn-read territory for an `int`; values are
-   effectively configured once.
+3. **`timeout`** — **FIXED:** now `std::atomic<int>` (`HttpServerComponent.h`), read with
+   `.load()` in `wait_for`/`Status` and stored via `ApplyConfig`/the `Timeout` property.
+   **`listenPort`** — still a plain int, but it is written once in `doStartListen` before the
+   listener starts serving; benign.
 
 (`running` is already `std::atomic<bool>`, so it is fine.)
 
@@ -242,16 +244,18 @@ neither created nor worsened them.
    reviewer does not "helpfully" add a C++ mutex around `rcore_dispatch` and reintroduce
    head-of-line blocking.
 
-3. **`rcore_shutdown` wiring.** `RustCore.h` documents that `rcore_shutdown()` should be hooked onto
-   `doStopListen()` / form-close, **not** `~HttpServerComponent` (the Rust singleton outlives any
-   one component instance). As of `feat/search-core`, `doStopListen` does not yet call
-   `rcore_shutdown`. This is a lifecycle/teardown concern (background-worker join on DLL unload),
-   not a data race, but it is the natural place to wire it in a later stage. Calling it from the
-   destructor instead would be a latent bug.
+3. **`rcore_shutdown` wiring — DONE.** `RustCore.h` documents that `rcore_shutdown()` should be
+   hooked onto `doStopListen()` / form-close, **not** `~HttpServerComponent` (the Rust singleton
+   outlives any one component instance). `doStopListen` now calls `RCore::shutdown()` after the
+   listener thread is joined and all pending requests are released — exactly the wiring this audit
+   recommended. Calling it from the destructor instead would still be a latent bug; keep it where
+   it is.
 
-4. **Config-string races (above) under runtime reconfiguration.** If any of `authToken` /
-   `timeout` / logging fields become runtime-mutable under live traffic (e.g. token rotation, hot
-   re-config), promote them from "benign" to "must-fix" and add the corresponding mutex/atomic.
+4. **Config-string races (above) under runtime reconfiguration — TRIGGERED AND RESOLVED.**
+   `ApplyConfig` made `authToken` and `timeout` runtime-mutable under live traffic, which promoted
+   them from "benign" to "must-fix"; both got their mutex/atomic (see the updated verdict table).
+   The remaining write-once fields (`loggingEnabled`, `listenPort`) keep their benign status until
+   something makes them hot-reconfigurable too.
 
 ---
 
