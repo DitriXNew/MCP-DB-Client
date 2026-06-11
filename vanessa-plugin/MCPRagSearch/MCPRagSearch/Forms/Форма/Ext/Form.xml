@@ -610,6 +610,33 @@
 							<ContextMenu name="УстройствоContextMenu" id="62"/>
 							<ExtendedTooltip name="УстройствоExtendedTooltip" id="63"/>
 						</InputField>
+						<InputField name="ПотокиИндексации" id="101">
+							<DataPath>ПотокиИндексации</DataPath>
+							<Title>
+								<v8:item>
+									<v8:lang>ru</v8:lang>
+									<v8:content>Потоки индексации</v8:content>
+								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>Indexing workers</v8:content>
+								</v8:item>
+							</Title>
+							<ToolTip>
+								<v8:item>
+									<v8:lang>ru</v8:lang>
+									<v8:content>Сколько параллельных сессий модели использовать при индексации. 0 — на усмотрение компоненты (половина ядер, максимум 4). Каждая сессия — отдельная копия модели в памяти (~0.5–1.5 ГБ для e5-small), поэтому по умолчанию 1.</v8:content>
+								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>How many parallel model sessions to use for indexing. 0 — let the add-in decide (half the cores, capped at 4). Each session is a separate model copy in RAM (~0.5–1.5 GB for e5-small), hence the default of 1.</v8:content>
+								</v8:item>
+							</ToolTip>
+							<Width>5</Width>
+							<HorizontalStretch>false</HorizontalStretch>
+							<ContextMenu name="ПотокиИндексацииКонтекстноеМеню" id="102"/>
+							<ExtendedTooltip name="ПотокиИндексацииРасширеннаяПодсказка" id="103"/>
+						</InputField>
 						<Table name="ТаблицаКоллекций" id="74">
 							<HeightInTableRows>4</HeightInTableRows>
 							<DataPath>ТаблицаКоллекций</DataPath>
@@ -1000,6 +1027,30 @@
 			<SavedData>true</SavedData>
 			<Save>
 				<Field>Устройство</Field>
+			</Save>
+		</Attribute>
+		<Attribute name="ПотокиИндексации" id="15">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Потоки индексации</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Indexing workers</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:decimal</v8:Type>
+				<v8:NumberQualifiers>
+					<v8:Digits>2</v8:Digits>
+					<v8:FractionDigits>0</v8:FractionDigits>
+					<v8:AllowedSign>Nonnegative</v8:AllowedSign>
+				</v8:NumberQualifiers>
+			</Type>
+			<SavedData>true</SavedData>
+			<Save>
+				<Field>ПотокиИндексации</Field>
 			</Save>
 		</Attribute>
 		<Attribute name="СтатусСервера" id="11">

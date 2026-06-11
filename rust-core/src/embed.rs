@@ -62,6 +62,13 @@ pub trait Embedder: Send + Sync {
     fn last_error(&self) -> Option<String> {
         None
     }
+
+    /// Release the heavyweight BULK (indexing) sessions to give RAM back after
+    /// an ingest completes — each real bulk session is a full model copy. The
+    /// query session stays loaded (search latency must not pay a model reload);
+    /// the next bulk embed lazily re-creates what was dropped. Default no-op
+    /// (the mock holds no sessions).
+    fn trim_bulk(&self) {}
 }
 
 /// L2-normalize a vector in place. A zero (or non-finite) vector is left as an

@@ -93,6 +93,12 @@ copy in RAM** (e5-small fp32 ≈ 0.5–1.5 GB per session under load, plus one
 query session), so `auto` on a big server can cost ~5 model copies. There is no
 hard memory quota in the core; size the pool to your RAM.
 
+**`trim_memory`** drops the bulk sessions to give that RAM back once an ingest
+is done (call it when `stats` reports `vector_status: ready`): the query
+session stays loaded, and the next ingest lazily re-creates the bulk sessions
+from the same model/config. Idempotent; `{"ok":true,"result":{"trimmed":bool}}`
+(`false` = no embedder yet). A no-op on the mock backend.
+
 **Model whitelist:** `model` must be one of the built-in names (matched
 case-insensitively; empty/absent ⇒ the default):
 

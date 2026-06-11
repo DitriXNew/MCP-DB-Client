@@ -239,6 +239,26 @@ fn dispatch(method: &str, payload_json: &str) -> String {
             Envelope::ok(json!({ "reset": true }))
         }
 
+        // Give RAM back after an ingest: drop the bulk (indexing) model
+        // sessions — each is a full model copy. The query session stays loaded
+        // (search latency must not pay a model reload); the next ingest lazily
+        // re-creates the bulk sessions. Idempotent; a no-op for the mock.
+        "trim_memory" => {
+            let embedder = match CORE.read() {
+                Ok(core) => core.embedder.clone(),
+                Err(_) => {
+                    return Envelope::err(codes::INTERNAL, "core lock poisoned").to_json_string()
+                }
+            };
+            let had_embedder = embedder.is_some();
+            if let Some(e) = embedder {
+                // Outside the core lock: dropping ort sessions can take a
+                // moment and must not stall concurrent searches.
+                e.trim_bulk();
+            }
+            Envelope::ok(json!({ "trimmed": had_embedder }))
+        }
+
         // Load/select the embedder and fix `dim`. Idempotent; reconfiguring
         // with a different dim while data is indexed resets the index.
         "configure" => match parse_config(&payload) {
@@ -1002,6 +1022,45 @@ mod tests {
         let out = unsafe { rcore_dispatch(m.as_ptr(), p.as_ptr()) };
         let s = unsafe { take_and_free(out) };
         serde_json::from_str(&s).unwrap()
+    }
+
+    /// `trim_memory` answers ok both before any configure (no embedder) and
+    /// after one, is idempotent, and a follow-up ingest+search still works —
+    /// the bulk sessions must come back lazily (a no-op for the mock, but the
+    /// dispatch contract and the don't-break-ingest property hold either way).
+    #[test]
+    fn trim_memory_contract_and_ingest_after_trim() {
+        let _g = e2e_guard();
+
+        // Before configure: nothing to trim, still an ok envelope.
+        let v = call("trim_memory", "");
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["result"]["trimmed"], json!(false));
+
+        call("configure", "{}");
+        let v = call("trim_memory", "");
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["result"]["trimmed"], json!(true));
+        // Idempotent.
+        let v = call("trim_memory", "");
+        assert_eq!(v["ok"], json!(true));
+
+        // Ingest AFTER a trim must still embed and be searchable (keyword path
+        // is deterministic; dense would need the embedding wait).
+        call(
+            "index_segments",
+            r#"{"collection":"trimmed","doc_id":"t","segments":[{"text":"unique trim marker"}]}"#,
+        );
+        let hits = call(
+            "search",
+            r#"{"query":"unique trim marker","collection":"trimmed","mode":"keyword","k":1}"#,
+        );
+        assert_eq!(hits["ok"], json!(true), "search after trim: {hits}");
+        assert_eq!(
+            hits["result"]["hits"].as_array().map(|a| a.len()),
+            Some(1),
+            "ingest after trim_memory must still index: {hits}"
+        );
     }
 
     #[test]

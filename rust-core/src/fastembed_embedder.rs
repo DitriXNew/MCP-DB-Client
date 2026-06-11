@@ -222,6 +222,18 @@ fn tunings(
     )
 }
 
+/// How to re-create a dropped bulk session (see [`Embedder::trim_bulk`]): the
+/// same inputs `new_builtin` / `new_local` used for the original load.
+enum ReloadSpec {
+    Builtin {
+        model: EmbeddingModel,
+        cache_dir: Option<String>,
+    },
+    Local {
+        model_path: String,
+    },
+}
+
 /// Production embedder: two separately-loaded fastembed models behind their own
 /// mutexes (see the module docs for the two-instance rationale).
 pub struct FastEmbedder {
@@ -231,7 +243,15 @@ pub struct FastEmbedder {
     /// its own session via [`Embedder::embed_passages_at`] (worker slot →
     /// session index), so jobs embed concurrently with no cross-session lock
     /// contention (cost: one model copy in RAM per session).
-    bulk_pool: Vec<Mutex<TextEmbedding>>,
+    ///
+    /// `None` = the slot was trimmed ([`Embedder::trim_bulk`]) to give RAM back
+    /// after an ingest; the next bulk embed on that slot lazily reloads it via
+    /// `reload` + `bulk_tuning`.
+    bulk_pool: Vec<Mutex<Option<TextEmbedding>>>,
+    /// Inputs needed to lazily re-create a trimmed bulk session.
+    reload: ReloadSpec,
+    /// Tuning the bulk sessions were (and will be re-) created with.
+    bulk_tuning: SessionTuning,
     /// Round-robin cursor selecting a bulk session for the *fallback* path —
     /// [`Embedder::embed_passages`] callers that have no stable worker slot
     /// (e.g. ad-hoc/test callers). The pinned worker path never touches it.
@@ -289,16 +309,21 @@ impl FastEmbedder {
         let (bulk_t, query_t) = tunings(bulk_device, intra_threads, m);
         let mut bulk_pool = Vec::with_capacity(m);
         for _ in 0..m {
-            bulk_pool.push(Mutex::new(
+            bulk_pool.push(Mutex::new(Some(
                 Self::load_builtin(model.clone(), cache_dir, bulk_t)
                     .map_err(|e| format!("load bulk model: {e}"))?,
-            ));
+            )));
         }
-        let query = Self::load_builtin(model, cache_dir, query_t)
+        let query = Self::load_builtin(model.clone(), cache_dir, query_t)
             .map_err(|e| format!("load query model: {e}"))?;
 
         let mut me = FastEmbedder {
             bulk_pool,
+            reload: ReloadSpec::Builtin {
+                model,
+                cache_dir: cache_dir.map(str::to_string),
+            },
+            bulk_tuning: bulk_t,
             bulk_cursor: AtomicUsize::new(0),
             query: Mutex::new(query),
             last_error: Mutex::new(None),
@@ -342,15 +367,19 @@ impl FastEmbedder {
         let (bulk_t, query_t) = tunings(bulk_device, intra_threads, m);
         let mut bulk_pool = Vec::with_capacity(m);
         for _ in 0..m {
-            bulk_pool.push(Mutex::new(
+            bulk_pool.push(Mutex::new(Some(
                 Self::load_local(model_path, bulk_t).map_err(|e| format!("load bulk model: {e}"))?,
-            ));
+            )));
         }
         let query =
             Self::load_local(model_path, query_t).map_err(|e| format!("load query model: {e}"))?;
 
         let mut me = FastEmbedder {
             bulk_pool,
+            reload: ReloadSpec::Local {
+                model_path: model_path.to_string(),
+            },
+            bulk_tuning: bulk_t,
             bulk_cursor: AtomicUsize::new(0),
             query: Mutex::new(query),
             last_error: Mutex::new(None),
@@ -424,15 +453,29 @@ impl FastEmbedder {
     /// passage and measuring the vector length. Done once at construction so
     /// `dim()` is O(1) and always truthful for whatever model was loaded.
     fn probe_dim(&self) -> Result<usize, String> {
-        let mut m = self.bulk_pool[0]
+        let mut slot = self.bulk_pool[0]
             .lock()
             .map_err(|_| "embedder mutex poisoned".to_string())?;
+        let m = slot
+            .as_mut()
+            .ok_or_else(|| "dim probe: bulk session missing".to_string())?;
         let out = m
             .embed(vec![format!("{PASSAGE_PREFIX}probe")], None)
             .map_err(|e| format!("dim probe embed failed: {e}"))?;
         out.first()
             .map(|v| v.len())
             .ok_or_else(|| "dim probe returned no vector".to_string())
+    }
+
+    /// Re-create one bulk session from the stored [`ReloadSpec`] (after a
+    /// [`Embedder::trim_bulk`] released it).
+    fn reload_bulk_session(&self) -> Result<TextEmbedding, String> {
+        match &self.reload {
+            ReloadSpec::Builtin { model, cache_dir } => {
+                Self::load_builtin(model.clone(), cache_dir.as_deref(), self.bulk_tuning)
+            }
+            ReloadSpec::Local { model_path } => Self::load_local(model_path, self.bulk_tuning),
+        }
     }
 
     /// Record an embed failure so [`Embedder::last_error`] (and therefore the
@@ -484,6 +527,50 @@ impl FastEmbedder {
             }
         }
     }
+
+    /// Bulk-path variant of [`Self::run`] over an `Option`al session slot:
+    /// a trimmed slot ([`Embedder::trim_bulk`]) is lazily re-created from the
+    /// stored [`ReloadSpec`] before embedding. Same zero-vector degradation on
+    /// any failure (lock poison, reload error, ort error).
+    fn run_bulk(&self, idx: usize, texts: &[String]) -> Vec<Vec<f32>> {
+        let prefixed: Vec<String> = texts
+            .iter()
+            .map(|t| format!("{PASSAGE_PREFIX}{t}"))
+            .collect();
+        let mut guard = match self.bulk_pool[idx].lock() {
+            Ok(g) => g,
+            Err(_) => {
+                eprintln!("rcore: embed skipped — model mutex poisoned");
+                Self::note_error(
+                    &self.last_error,
+                    "embed skipped — model mutex poisoned".to_string(),
+                );
+                return vec![vec![0.0; self.dim]; texts.len()];
+            }
+        };
+        if guard.is_none() {
+            // The slot was trimmed after a previous ingest — reload in place.
+            match self.reload_bulk_session() {
+                Ok(session) => *guard = Some(session),
+                Err(e) => {
+                    let msg = format!("bulk session reload failed: {e}");
+                    eprintln!("rcore: {msg}");
+                    Self::note_error(&self.last_error, msg);
+                    return vec![vec![0.0; self.dim]; texts.len()];
+                }
+            }
+        }
+        let model = guard.as_mut().expect("just ensured Some");
+        match model.embed(prefixed, Some(self.embed_batch)) {
+            Ok(vecs) => vecs,
+            Err(e) => {
+                let msg = format!("embed failed for {} texts: {e}", texts.len());
+                eprintln!("rcore: {msg}");
+                Self::note_error(&self.last_error, msg);
+                vec![vec![0.0; self.dim]; texts.len()]
+            }
+        }
+    }
 }
 
 impl Embedder for FastEmbedder {
@@ -502,14 +589,7 @@ impl Embedder for FastEmbedder {
         } else {
             self.bulk_cursor.fetch_add(1, Ordering::Relaxed) % n
         };
-        Self::run(
-            &self.bulk_pool[idx],
-            &self.last_error,
-            PASSAGE_PREFIX,
-            texts,
-            self.dim,
-            self.embed_batch,
-        )
+        self.run_bulk(idx, texts)
     }
 
     fn embed_passages_at(&self, slot: usize, texts: &[String]) -> Vec<Vec<f32>> {
@@ -521,18 +601,22 @@ impl Embedder for FastEmbedder {
         // briefly run one last drained job against a smaller new pool — the
         // modulo keeps that in bounds instead of panicking.
         let n = self.bulk_pool.len().max(1);
-        Self::run(
-            &self.bulk_pool[slot % n],
-            &self.last_error,
-            PASSAGE_PREFIX,
-            texts,
-            self.dim,
-            self.embed_batch,
-        )
+        self.run_bulk(slot % n, texts)
     }
 
     fn bulk_concurrency(&self) -> usize {
         self.bulk_pool.len()
+    }
+
+    fn trim_bulk(&self) {
+        // Drop every bulk session (a full model copy each) to give RAM back
+        // after an ingest. The query session is intentionally untouched. A
+        // poisoned slot is skipped — nothing to free safely there anyway.
+        for slot in &self.bulk_pool {
+            if let Ok(mut guard) = slot.lock() {
+                *guard = None;
+            }
+        }
     }
 
     fn embed_query(&self, text: &str) -> Vec<f32> {
