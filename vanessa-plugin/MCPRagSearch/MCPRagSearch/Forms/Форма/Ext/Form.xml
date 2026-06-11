@@ -249,6 +249,11 @@
 							<CommandName>Form.Command.УстановитьИзАрхива</CommandName>
 							<ExtendedTooltip name="УстановитьИзАрхиваРасширеннаяПодсказка" id="73"/>
 						</Button>
+						<Button name="УстановитьИзПапки" id="99">
+							<Type>UsualButton</Type>
+							<CommandName>Form.Command.УстановитьИзПапки</CommandName>
+							<ExtendedTooltip name="УстановитьИзПапкиРасширеннаяПодсказка" id="100"/>
+						</Button>
 					</ChildItems>
 				</UsualGroup>
 				<InputField name="ТокенАвторизации" id="14">
@@ -931,6 +936,21 @@
 				</v8:item>
 			</ToolTip>
 			<Action>УстановитьИзАрхива</Action>
+		</Command>
+		<Command name="УстановитьИзПапки" id="6">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Установить из папки…</v8:content>
+				</v8:item>
+			</Title>
+			<ToolTip>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Указать каталог с уже распакованным бандлом (libhttp1cWin.dll + rcore.dll + DirectML.dll) — без архива; проверит состав и подставит каталог в поле «Каталог компоненты»</v8:content>
+				</v8:item>
+			</ToolTip>
+			<Action>УстановитьИзПапки</Action>
 		</Command>
 	</Commands>
 </Form>
