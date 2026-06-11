@@ -1126,12 +1126,32 @@ pub fn build_line_offsets(text: &str) -> Vec<usize> {
 ///     of the doc, or right after another boundary close) simply starts its
 ///     chunk — an empty chunk is never emitted.
 ///
+/// Lead-pull mode (`lead: Some(regex)`, only meaningful alongside `boundary`) —
+/// keep a scenario's leading comment / `@tag` block with its scenario:
+///   * When a boundary line at index `i` would start a new chunk, scan UPWARD
+///     from `i-1` over the contiguous run of lines that are each EITHER blank
+///     (trimmed empty) OR match `lead`. The new chunk's start is moved up to the
+///     TOPMOST line in that run that MATCHES `lead` (blank lines above the
+///     topmost lead-match are NOT pulled; blanks BETWEEN a lead-match and the
+///     boundary fall within the pulled range and ARE included). With no
+///     lead-match in the run the start is unchanged.
+///   * The scan never crosses into a previous chunk (lower bound = the current
+///     in-progress chunk's start line). If pulling would empty the previous
+///     chunk (start == current chunk start) no empty chunk is emitted — the new
+///     chunk simply begins there (the same empty-chunk guard as a boundary at a
+///     chunk start). Line ranges stay contiguous; only the START moves up.
+///
 /// `boundary: None` (or a regex no line matches) is byte-identical to plain
 /// token-budget chunking.
 ///
 /// Returns chunks with 1-based inclusive line ranges. An empty document yields a
 /// single empty chunk covering line 1 so the doc is always representable.
-pub fn chunk_text(text: &str, cfg: &ChunkConfig, boundary: Option<&Regex>) -> Vec<Chunk> {
+pub fn chunk_text(
+    text: &str,
+    cfg: &ChunkConfig,
+    boundary: Option<&Regex>,
+    lead: Option<&Regex>,
+) -> Vec<Chunk> {
     // Line model matches `build_line_offsets` / grep: split on '\n'. This keeps
     // line numbers consistent across chunking, the offset table, and get_segment.
     let lines: Vec<&str> = text.split('\n').collect();
@@ -1142,9 +1162,52 @@ pub fn chunk_text(text: &str, cfg: &ChunkConfig, boundary: Option<&Regex>) -> Ve
         return chunks; // unreachable (split always yields ≥1), but be safe.
     }
 
-    // Line-level boundary test. With no regex every line is a non-boundary,
-    // which keeps this path byte-identical to plain token-budget chunking.
-    let is_boundary = |idx: usize| boundary.is_some_and(|re| re.is_match(lines[idx]));
+    let is_lead = |idx: usize| lead.is_some_and(|re| re.is_match(lines[idx]));
+
+    // Compute the *effective section starts*: the 0-based line index at which
+    // each boundary-delimited section's chunk must START. With no `lead` regex
+    // this is exactly the set of boundary lines (byte-identical to the original
+    // behavior). With `lead`, each boundary's start is pulled UP to the TOPMOST
+    // line of the contiguous blank/lead run immediately above it — so a
+    // scenario's leading comment / `@tag` block stays with that scenario rather
+    // than the previous chunk. Pulls are floored at the previous section start
+    // (left-to-right) so two adjacent sections never steal each other's lines.
+    //
+    // `section_start[idx] == true` means line `idx` BEGINS a new section: it
+    // must start a chunk, overlap before it is suppressed, and an empty chunk is
+    // never emitted in front of it (the existing boundary guards, now keyed on
+    // these computed positions instead of the raw boundary lines).
+    let mut section_start = vec![false; n];
+    if let Some(re) = boundary {
+        let mut floor = 0usize; // pulls must not cross below the previous start
+        for b in 0..n {
+            if !re.is_match(lines[b]) {
+                continue;
+            }
+            // Pull up over a contiguous run of blank-or-lead lines; the start is
+            // the TOPMOST lead-match in that run (blank-only runs don't pull).
+            let mut pulled = b;
+            if lead.is_some() {
+                let mut j = b;
+                while j > floor {
+                    let cand = j - 1;
+                    let blank = lines[cand].trim().is_empty();
+                    let leadm = is_lead(cand);
+                    if !blank && !leadm {
+                        break; // run ends: a non-blank, non-lead line
+                    }
+                    if leadm {
+                        pulled = cand; // highest lead-match so far
+                    }
+                    j = cand;
+                }
+            }
+            section_start[pulled] = true;
+            // The next section may not pull past this one's start.
+            floor = pulled;
+        }
+    }
+    let is_boundary = |idx: usize| section_start[idx];
 
     let mut start = 0usize; // 0-based index of the current chunk's first line
     while start < n {
@@ -1158,9 +1221,10 @@ pub fn chunk_text(text: &str, cfg: &ChunkConfig, boundary: Option<&Regex>) -> Ve
             // Grow the chunk one line at a time while we stay within the target
             // budget. We always keep at least the starting line (end == start).
             while end + 1 < n {
-                // A boundary line must START its own chunk: close the current
-                // one before it. (The starting line itself may be a boundary —
-                // that is exactly the "boundary starts a chunk" case.)
+                // A section-start line must BEGIN its own chunk: close the
+                // current one before it. (The starting line itself may be a
+                // section start — that is exactly the "section starts a chunk"
+                // case.)
                 if is_boundary(end + 1) {
                     break;
                 }
@@ -1183,11 +1247,12 @@ pub fn chunk_text(text: &str, cfg: &ChunkConfig, boundary: Option<&Regex>) -> Ve
         });
 
         // Advance. Normally we step to `end + 1`, but back up `overlap_lines` so
-        // consecutive chunks share context. EXCEPT across a boundary: when the
-        // next chunk starts at a boundary line, the back-up is suppressed so
-        // the section-initial chunk carries no trailing lines of the previous
-        // one. Never let overlap stall progress: the next start must be
-        // strictly greater than the current start.
+        // consecutive chunks share context. EXCEPT across a section start: when
+        // the next chunk begins a section (a boundary line, possibly lead-pulled
+        // up to its leading comment/tag run), the back-up is suppressed so the
+        // section-initial chunk carries no trailing lines of the previous one.
+        // Never let overlap stall progress: the next start must be strictly
+        // greater than the current start.
         let next_start = if end + 1 < n && is_boundary(end + 1) {
             end + 1
         } else {
@@ -1223,6 +1288,22 @@ pub struct RawIndexRequest {
     /// absent (or empty, filtered at parse) ⇒ plain token-budget chunking,
     /// byte-identical to the boundary-less behavior.
     pub boundary_regex: Option<String>,
+    /// Optional *lead* pattern (`chunk_cfg.boundary_lead_regex` on the wire),
+    /// only meaningful WHEN `boundary_regex` is present. A contiguous run of
+    /// blank/lead-matching lines immediately above a boundary line is pulled
+    /// DOWN into the boundary's (new) chunk — so a scenario's leading comment
+    /// or `@tag` block stays attached to it rather than the previous chunk.
+    /// Compiled once by [`prepare_index_raw`]; an invalid pattern is the same
+    /// structural [`RawIndexError::BadPattern`] as `boundary_regex`. Absent
+    /// (or empty, filtered at parse) ⇒ no lead pulling.
+    pub boundary_lead_regex: Option<String>,
+    /// When true (and `boundary_regex` is present), prepend the document's
+    /// pre-first-boundary header (the `Функционал:`/`Feature:` title +
+    /// description + Background above the first scenario) to every later
+    /// chunk's EMBED text only — restoring feature-file context for each
+    /// scenario chunk. Pure-source `Segment.text` / line ranges are untouched;
+    /// only `embed_texts[]` change. Default false ⇒ byte-identical embeds.
+    pub prepend_header: bool,
 }
 
 /// Outcome of the synchronous `index_raw` accept. `doc_id` is always populated
@@ -1284,22 +1365,36 @@ pub struct PreparedRawIndex {
 /// of `&mut Core`. Call this OUTSIDE the global write lock, then hand the
 /// result to [`commit_index_raw`] under the lock.
 ///
-/// Fails — without ingesting anything — only when `boundary_regex` is present
-/// but does not compile ([`RawIndexError::BadPattern`], same precedent as an
-/// invalid `grep` pattern).
+/// Fails — without ingesting anything — only when `boundary_regex` or
+/// `boundary_lead_regex` is present but does not compile
+/// ([`RawIndexError::BadPattern`], same precedent as an invalid `grep`
+/// pattern).
 pub fn prepare_index_raw(
     req: RawIndexRequest,
     max_seq_len: Option<u64>,
 ) -> Result<PreparedRawIndex, RawIndexError> {
-    // (0) Compile the optional boundary regex FIRST, before any other work: an
-    // invalid pattern must fail the whole call structurally (nothing ingested).
-    // An empty pattern is treated as absent (byte-identical chunking to today).
+    // (0) Compile the optional boundary + lead regexes FIRST, before any other
+    // work: an invalid pattern must fail the whole call structurally (nothing
+    // ingested). An empty pattern is treated as absent (byte-identical chunking
+    // to today). `boundary_lead_regex` and `prepend_header` are only meaningful
+    // WHEN a boundary regex is present (no boundaries ⇒ no per-section chunks to
+    // pull leads into or prepend a header to); we still compile lead defensively
+    // so an invalid lead pattern is reported even if boundary is absent.
     let boundary: Option<Regex> = match req.boundary_regex.as_deref().filter(|s| !s.is_empty()) {
         Some(pat) => {
             Some(Regex::new(pat).map_err(|e| RawIndexError::BadPattern(e.to_string()))?)
         }
         None => None,
     };
+    let lead: Option<Regex> = match req.boundary_lead_regex.as_deref().filter(|s| !s.is_empty()) {
+        Some(pat) => {
+            Some(Regex::new(pat).map_err(|e| RawIndexError::BadPattern(e.to_string()))?)
+        }
+        None => None,
+    };
+    // The lead pull only fires alongside a boundary regex; drop it otherwise so
+    // the chunker stays byte-identical when no boundaries exist.
+    let lead_for_chunk = if boundary.is_some() { lead.as_ref() } else { None };
 
     // (1) Normalize newlines once, up front. Everything downstream — offsets,
     // chunk line numbers, stored text — is in terms of this LF-only text.
@@ -1318,8 +1413,39 @@ pub fn prepare_index_raw(
     );
 
     // (4) Chunk the normalized text into line-snapped segments, honoring the
-    // optional boundary lines (e.g. one chunk run per Gherkin scenario).
-    let chunks = chunk_text(&full_text, &cfg, boundary.as_ref());
+    // optional boundary lines (e.g. one chunk run per Gherkin scenario) and the
+    // optional lead pull (a scenario's leading comment/@tag block stays with it).
+    let chunks = chunk_text(&full_text, &cfg, boundary.as_ref(), lead_for_chunk);
+
+    // prepend_header: when on (and boundaries exist), compute the document's
+    // pre-first-boundary header (the `Функционал:`/`Feature:` title +
+    // description + Background above the first scenario) and prepend a capped
+    // copy of it to EVERY later chunk's EMBED text — restoring feature context
+    // for each scenario chunk. Pure-source `Segment.text` / line ranges stay
+    // untouched; only `embed_texts[]` change.
+    //
+    // `first_boundary_line` is 1-based; `header_capped` is the source text of
+    // lines [1 .. first_boundary_line-1], truncated to 200 tokens so a huge
+    // preamble can't dominate the embedding. With no boundary match the header
+    // is empty and the feature is a no-op for this doc.
+    let (first_boundary_line, header_capped): (u64, String) =
+        if req.prepend_header && boundary.is_some() {
+            let re = boundary.as_ref().unwrap();
+            let doc_lines: Vec<&str> = full_text.split('\n').collect();
+            match doc_lines.iter().position(|l| re.is_match(l)) {
+                // 1-based line number of the first boundary line.
+                Some(idx0) => {
+                    let first = (idx0 + 1) as u64;
+                    // Lines strictly above the first boundary form the header.
+                    let header_text = doc_lines[..idx0].join("\n");
+                    (first, truncate_to_tokens(&header_text, 200))
+                }
+                None => (0, String::new()), // no boundary in doc ⇒ feature off
+            }
+        } else {
+            (0, String::new())
+        };
+    let prepend_on = first_boundary_line > 0 && !header_capped.trim().is_empty();
 
     // Build the doc's segments + the parallel embed-text list.
     let mut segments: Vec<Segment> = Vec::with_capacity(chunks.len());
@@ -1338,7 +1464,25 @@ pub fn prepare_index_raw(
         if is_blank {
             skipped_now += 1;
         }
-        embed_texts.push(if is_blank { String::new() } else { embed_full });
+        // Prepend the capped header to this chunk's embed text when on — but
+        // only for chunks NOT entirely inside the header region (line_end >=
+        // first_boundary_line) and only when the chunk's own embed text is
+        // non-blank (never prepend onto a blank/skipped chunk). Header chunk(s)
+        // themselves (line_end < first_boundary_line) keep their embed text
+        // unchanged. After prepending, clamp the whole thing to cfg.max_tokens
+        // so the combined text still fits the model budget.
+        let embed_text = if !is_blank
+            && prepend_on
+            && chunk.line_end >= first_boundary_line
+        {
+            let combined = format!("{header_capped}\n{embed_full}");
+            truncate_to_tokens(&combined, cfg.max_tokens)
+        } else if is_blank {
+            String::new()
+        } else {
+            embed_full
+        };
+        embed_texts.push(embed_text);
         let kw_counts = token_multiset(&chunk.text);
         segments.push(Segment {
             segment_id: 0, // placeholder; the real id is allocated at commit
@@ -2971,7 +3115,7 @@ mod tests {
         // Six single-word lines; target 3 tokens means ~3 lines per chunk.
         // overlap=1 → the last line of a chunk repeats as the first of the next.
         let text = "l1\nl2\nl3\nl4\nl5\nl6";
-        let chunks = chunk_text(text, &cfg(3, 100, 1), None);
+        let chunks = chunk_text(text, &cfg(3, 100, 1), None, None);
         // Each chunk is at most 3 lines (the target), snapped to whole lines.
         assert!(chunks.len() >= 2, "must split into multiple chunks");
         for ch in &chunks {
@@ -3004,7 +3148,7 @@ mod tests {
         // become exactly one oversized chunk covering just that line.
         let huge = "tok ".repeat(50); // ~50 whitespace tokens, one line
         let text = format!("short before\n{}\nshort after", huge.trim());
-        let chunks = chunk_text(&text, &cfg(3, 5, 1), None);
+        let chunks = chunk_text(&text, &cfg(3, 5, 1), None, None);
         // Find the oversized chunk: it must be exactly one line, whole.
         let oversized: Vec<&Chunk> = chunks.iter().filter(|c| c.oversized).collect();
         assert_eq!(oversized.len(), 1, "exactly one oversized chunk");
@@ -3035,14 +3179,14 @@ mod tests {
 
         // Premise: WITHOUT the boundary the same config puts a section header
         // mid-chunk, so it is the boundary (not the budget) doing the work.
-        let blind = chunk_text(text, &cfg(4, 100, 2), None);
+        let blind = chunk_text(text, &cfg(4, 100, 2), None, None);
         assert!(
             blind.iter().any(|c| (c.line_start..=c.line_end)
                 .any(|li| li != c.line_start && re.is_match(lines[(li - 1) as usize]))),
             "premise: blind chunking must merge across a section boundary"
         );
 
-        let chunks = chunk_text(text, &cfg(4, 100, 2), Some(&re));
+        let chunks = chunk_text(text, &cfg(4, 100, 2), Some(&re), None);
         // A boundary line may only ever be a chunk's FIRST line — i.e. no
         // chunk contains lines from two sections.
         for ch in &chunks {
@@ -3094,7 +3238,7 @@ mod tests {
         doc.push_str("Сценарий: В\nшаг финал");
         let lines: Vec<&str> = doc.split('\n').collect();
         let re = Regex::new("^Сценарий:").unwrap();
-        let chunks = chunk_text(&doc, &cfg(6, 100, 1), Some(&re));
+        let chunks = chunk_text(&doc, &cfg(6, 100, 1), Some(&re), None);
 
         // The big section spans lines 1..=9; it must split…
         let in_big: Vec<&Chunk> = chunks.iter().filter(|c| c.line_end <= 9).collect();
@@ -3131,17 +3275,213 @@ mod tests {
         // chunker. Hardcoded expectation for 6 one-token lines with target 3 /
         // overlap 1, as produced by the original greedy packing.
         let text = "l1\nl2\nl3\nl4\nl5\nl6";
-        let chunks = chunk_text(text, &cfg(3, 100, 1), None);
+        let chunks = chunk_text(text, &cfg(3, 100, 1), None, None);
         let ranges: Vec<(u64, u64)> =
             chunks.iter().map(|c| (c.line_start, c.line_end)).collect();
         assert_eq!(ranges, vec![(1, 3), (3, 5), (5, 6), (6, 6)]);
         // A regex that matches no line is equally inert.
         let re = Regex::new("^Сценарий:").unwrap();
-        let same: Vec<(u64, u64)> = chunk_text(text, &cfg(3, 100, 1), Some(&re))
+        let same: Vec<(u64, u64)> = chunk_text(text, &cfg(3, 100, 1), Some(&re), None)
             .iter()
             .map(|c| (c.line_start, c.line_end))
             .collect();
         assert_eq!(same, ranges);
+    }
+
+    #[test]
+    fn chunker_lead_regex_pulls_comment_tag_block_into_scenario() {
+        // Gherkin-ish doc. A blank line + a `# comment` + an `@tag` sit above
+        // «Сценарий: Б». Lead-pull must move that comment+tag INTO Б's chunk
+        // (Б's chunk starts at the comment line, not at the «Сценарий: Б» line),
+        // and the previous chunk (А) must NOT contain them. A pure-blank gap
+        // (the line above «Сценарий: В», with no comment/tag) must NOT be
+        // pulled — В's chunk starts at its own «Сценарий: В» line.
+        //
+        // Lines (1-based):
+        //   1 Сценарий: А
+        //   2 шаг один
+        //   3                     <- blank gap before Б's lead block
+        //   4 # коммент для Б
+        //   5 @smoke
+        //   6 Сценарий: Б
+        //   7 шаг два
+        //   8                     <- pure-blank gap before В (no comment/tag)
+        //   9 Сценарий: В
+        //  10 шаг три
+        let text = "Сценарий: А\nшаг один\n\n# коммент для Б\n@smoke\nСценарий: Б\nшаг два\n\nСценарий: В\nшаг три";
+        let lines: Vec<&str> = text.split('\n').collect();
+        let bre = Regex::new("^Сценарий:").unwrap();
+        // Lead matches a `#` comment or an `@tag` line.
+        let lre = Regex::new(r"^\s*(#|@)").unwrap();
+        // A generous target keeps each section in a single chunk so the test
+        // observes the lead-pull boundary, not a token-budget mid-section split.
+        let chunks = chunk_text(text, &cfg(50, 100, 1), Some(&bre), Some(&lre));
+
+        // Find Б's chunk: the chunk whose range contains «Сценарий: Б» (line 6).
+        let b_chunk = chunks
+            .iter()
+            .find(|c| c.line_start <= 6 && 6 <= c.line_end)
+            .expect("Б must live in some chunk");
+        // Lead-pull moved Б's chunk start UP to the comment line (4), pulling the
+        // blank-between (5 is the @tag, 4 is the comment) — the topmost lead line
+        // is the comment at line 4.
+        assert_eq!(
+            b_chunk.line_start, 4,
+            "Б's chunk must start at the leading comment line, not at «Сценарий: Б»"
+        );
+        assert!(
+            b_chunk.text.starts_with("# коммент для Б"),
+            "Б's chunk text must begin with the pulled comment block, got: {:?}",
+            b_chunk.text
+        );
+        assert!(
+            b_chunk.text.contains("@smoke"),
+            "the @tag must be inside Б's chunk"
+        );
+
+        // А's chunk must NOT contain the pulled comment/tag.
+        let a_chunk = chunks
+            .iter()
+            .find(|c| c.line_start <= 1 && 1 <= c.line_end)
+            .expect("А must live in some chunk");
+        assert!(
+            !a_chunk.text.contains("# коммент для Б") && !a_chunk.text.contains("@smoke"),
+            "А's chunk must not contain Б's leading comment/tag, got: {:?}",
+            a_chunk.text
+        );
+        // The blank line 3 above Б's comment block is NOT pulled (it sits above
+        // the topmost lead-match), so it stays with the previous (А) chunk.
+        assert!(
+            a_chunk.line_end >= 3,
+            "the blank gap above Б's lead block is not pulled into Б"
+        );
+
+        // Pure-blank gap before В (line 8 is blank, no comment/tag): В's chunk
+        // must start at its own «Сценарий: В» line (9), the blank is NOT pulled.
+        let v_chunk = chunks
+            .iter()
+            .find(|c| c.line_start <= 9 && 9 <= c.line_end)
+            .expect("В must live in some chunk");
+        assert_eq!(
+            v_chunk.line_start, 9,
+            "a pure-blank gap (no lead line) must NOT be pulled into В"
+        );
+        // No chunk straddles a section start (the boundary line / its lead head).
+        // Every line is covered exactly once across chunk starts→ends contiguity.
+        assert_eq!(chunks.first().unwrap().line_start, 1);
+        assert_eq!(chunks.last().unwrap().line_end, lines.len() as u64);
+    }
+
+    #[test]
+    fn prepend_header_adds_feature_context_to_embed_only_not_stored_text() {
+        // Doc: a `Функционал:` title + a description line form the header, then
+        // two «Сценарий:» sections. With prepend_header on, each scenario chunk's
+        // EMBED text must CONTAIN the feature title while its stored `text` /
+        // line range stays the pure scenario. The header chunk's own embed text
+        // is unchanged.
+        //
+        // Lines:
+        //   1 Функционал: Управление заказами
+        //   2 Описание фичи про заказы
+        //   3 Сценарий: Создание
+        //   4 шаг создания
+        //   5 Сценарий: Удаление
+        //   6 шаг удаления
+        let text = "Функционал: Управление заказами\nОписание фичи про заказы\nСценарий: Создание\nшаг создания\nСценарий: Удаление\nшаг удаления";
+        let req = RawIndexRequest {
+            collection: "feat".to_string(),
+            description: None,
+            doc_id: Some("d".to_string()),
+            name: "f".to_string(),
+            meta: serde_json::json!({}),
+            text: text.to_string(),
+            target_tokens: Some(50),
+            max_tokens: Some(200),
+            overlap_lines: Some(0),
+            boundary_regex: Some("^Сценарий:".to_string()),
+            boundary_lead_regex: None,
+            prepend_header: true,
+        };
+        let prep = prepare_index_raw(req, None).expect("valid patterns");
+
+        // first boundary is line 3 → header = lines 1..=2.
+        // Locate the two scenario chunks (those whose line_start >= 3) and the
+        // header chunk (line_end < 3).
+        let mut saw_scenario = 0;
+        for (i, seg) in prep.segments.iter().enumerate() {
+            let ls = seg.line_start.unwrap();
+            let le = seg.line_end.unwrap();
+            let embed = &prep.embed_texts[i];
+            if le < 3 {
+                // Header chunk: its embed text must be the pure header, NOT
+                // doubled with itself.
+                assert!(
+                    !embed.contains("Сценарий"),
+                    "header chunk embed must not include a scenario"
+                );
+                assert_eq!(
+                    embed, &seg.text,
+                    "header chunk embed text is unchanged (== stored text)"
+                );
+            } else {
+                // Scenario chunk: embed text carries the feature title, stored
+                // text does NOT.
+                saw_scenario += 1;
+                assert!(
+                    embed.contains("Функционал: Управление заказами"),
+                    "scenario chunk embed must contain the feature title, got: {embed:?}"
+                );
+                assert!(
+                    !seg.text.contains("Функционал:"),
+                    "stored scenario text must stay pure (no header), got: {:?}",
+                    seg.text
+                );
+                // Line range stays the pure scenario (>= the first boundary).
+                assert!(ls >= 3, "scenario chunk range must not include the header");
+            }
+        }
+        assert_eq!(saw_scenario, 2, "both scenarios must be present as chunks");
+    }
+
+    #[test]
+    fn prepend_header_off_leaves_embed_text_identical_to_stored() {
+        // Parity: with prepend_header off (default), every chunk's embed text is
+        // exactly its stored text (no header prefix), even with boundaries on.
+        let text = "Функционал: X\nОписание\nСценарий: A\nшаг\nСценарий: B\nшаг2";
+        let mk = |prepend: bool| {
+            let req = RawIndexRequest {
+                collection: "c".to_string(),
+                description: None,
+                doc_id: Some("d".to_string()),
+                name: "n".to_string(),
+                meta: serde_json::json!({}),
+                text: text.to_string(),
+                target_tokens: Some(50),
+                max_tokens: Some(200),
+                overlap_lines: Some(0),
+                boundary_regex: Some("^Сценарий:".to_string()),
+                boundary_lead_regex: None,
+                prepend_header: prepend,
+            };
+            prepare_index_raw(req, None).expect("valid")
+        };
+        let off = mk(false);
+        // Off ⇒ embed text == stored text for every chunk.
+        for (i, seg) in off.segments.iter().enumerate() {
+            assert_eq!(
+                off.embed_texts[i], seg.text,
+                "prepend_header off must leave embed text == stored text"
+            );
+        }
+        // On ⇒ at least one scenario chunk differs (header prefixed).
+        let on = mk(true);
+        assert!(
+            on.segments
+                .iter()
+                .enumerate()
+                .any(|(i, seg)| on.embed_texts[i] != seg.text),
+            "prepend_header on must change at least one embed text"
+        );
     }
 
     // ===================================================================
@@ -3164,6 +3504,8 @@ mod tests {
                 max_tokens: Some(8),
                 overlap_lines: Some(1),
                 boundary_regex: None,
+                boundary_lead_regex: None,
+                prepend_header: false,
             },
         )
         .expect("accept without a boundary_regex cannot fail");

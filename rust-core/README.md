@@ -64,11 +64,23 @@ line-granular token-budget chunker — `target_tokens` (default 300),
 `max_tokens`, `overlap_lines` (default 2) — and `boundary_regex` makes
 chunking **structure-aware**: a line matching the regex always starts a new
 chunk, and no overlap is carried across the boundary, so a chunk never glues
-the tail of one section to the head of the next. The VA plugin uses this to
-chunk `.feature` files per Gherkin scenario. A region bigger than the token
-budget still splits into several chunks with normal overlap *inside* it. An
-invalid `boundary_regex` fails the whole call with `bad_pattern` before any
-state is touched.
+the tail of one section to the head of the next. A region bigger than the token
+budget still splits into several chunks with normal overlap *inside* it. Two
+companion knobs refine it (both only meaningful alongside `boundary_regex`):
+
+- `boundary_lead_regex` — a line matching it immediately above a boundary
+  (with interleaved blanks) is pulled INTO the boundary's chunk, not left in
+  the previous one. The VA plugin sets it to `^[ \t]*[@#]` so a Gherkin
+  scenario's leading `@tags` / `#comments` stay with that scenario.
+- `prepend_header` (bool) — the document's pre-first-boundary header (e.g. the
+  `Функционал:`/`Feature:` title + description + `Background` above the first
+  scenario) is prepended, capped to ~200 tokens, to **every later chunk's embed
+  text only** — restoring feature context to each scenario's embedding. The
+  stored `text` and line ranges stay pure source (grep / get_segment unchanged).
+
+The VA plugin uses all three to chunk `.feature` files per Gherkin scenario.
+An invalid `boundary_regex` / `boundary_lead_regex` fails the whole call with
+`bad_pattern` before any state is touched.
 
 **Hit meta:** `search` hits echo the **effective** meta — the document-level
 `meta` overlaid by the segment-level `meta`, segment winning on collision. It

@@ -677,6 +677,19 @@ fn parse_raw_index_request(payload: &Value) -> Result<RawIndexRequest, String> {
     let boundary_regex = cfg
         .and_then(|c| opt_str(c, "boundary_regex"))
         .filter(|s| !s.is_empty());
+    // Optional lead pattern (only meaningful WHEN boundary_regex is present): a
+    // contiguous blank/lead run immediately above a boundary line is pulled DOWN
+    // into the boundary's chunk, so a scenario's leading comment/@tag block
+    // stays with it. Compiled in prepare (invalid ⇒ structural bad_pattern).
+    // Empty string treated as absent.
+    let boundary_lead_regex = cfg
+        .and_then(|c| opt_str(c, "boundary_lead_regex"))
+        .filter(|s| !s.is_empty());
+    // Optional flag (only meaningful WHEN boundary_regex is present): prepend
+    // the doc's pre-first-boundary header to every later chunk's EMBED text only.
+    let prepend_header = cfg
+        .map(|c| bool_or(c, "prepend_header", false))
+        .unwrap_or(false);
 
     Ok(RawIndexRequest {
         collection,
@@ -689,6 +702,8 @@ fn parse_raw_index_request(payload: &Value) -> Result<RawIndexRequest, String> {
         max_tokens,
         overlap_lines,
         boundary_regex,
+        boundary_lead_regex,
+        prepend_header,
     })
 }
 
@@ -1796,6 +1811,88 @@ mod tests {
         let src: Vec<&str> = text.split('\n').collect();
         let expected = src[(ls - 1) as usize..=(le - 1) as usize].join("\n");
         assert_eq!(v["result"]["text"], json!(expected));
+    }
+
+    #[test]
+    fn index_raw_invalid_boundary_lead_regex_is_bad_pattern_and_ingests_nothing() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // An invalid `boundary_lead_regex` must fail the whole call with the
+        // same structural bad_pattern error, BEFORE any state mutation — mirror
+        // of the invalid-boundary_regex test.
+        let v = call(
+            "index_raw",
+            r#"{"collection":"rawlead","doc_id":"lx","text":"Сценарий: A\nb",
+                "chunk_cfg":{"boundary_regex":"^Сценарий:","boundary_lead_regex":"(unclosed"}}"#,
+        );
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["error"]["code"], json!(codes::BAD_PATTERN));
+        // Nothing was ingested: the collection must not exist…
+        let st = call("stats", "");
+        assert!(
+            st["result"]["collections"]["rawlead"].is_null(),
+            "failed index_raw must not create the collection"
+        );
+        // …and the doc must not be readable.
+        let v = call("get_segment", r#"{"doc_id":"lx","line_start":1,"line_end":1}"#);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["error"]["code"], json!(codes::NOT_FOUND));
+    }
+
+    #[test]
+    fn index_raw_lead_and_prepend_header_keep_source_text_pure() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // Header (lines 1-2) + two scenarios; scenario B has a leading comment
+        // (line 5) + @tag (line 6) above «Сценарий: B» (line 7). With lead-pull
+        // and prepend_header BOTH on, the doc must ingest, reach Ready, and
+        // get_segment must still return the PURE source lines (the prepend is
+        // embed-only; the lead-pull only changes chunk boundaries, not source).
+        let text = "Функционал: Заказы\nОписание фичи\nСценарий: A\nшаг A\n# коммент B\n@smoke\nСценарий: B\nшаг B";
+        let payload = serde_json::json!({
+            "collection": "fl",
+            "doc_id": "fl1",
+            "name": "orders.feature",
+            "text": text,
+            "chunk_cfg": {
+                "target_tokens": 30,
+                "overlap_lines": 0,
+                "boundary_regex": "^Сценарий:",
+                "boundary_lead_regex": r"^\s*(#|@)",
+                "prepend_header": true
+            },
+        });
+        let v = call("index_raw", &payload.to_string());
+        assert_eq!(v["ok"], json!(true));
+        assert!(store::wait_until_ready("fl", std::time::Duration::from_secs(5)));
+
+        // The leading comment/tag (lines 5-6) must land in B's chunk. Search the
+        // comment word and confirm the matching chunk's range starts at line 5
+        // (the pulled comment) and covers the «Сценарий: B» header at line 7.
+        let q = serde_json::json!({
+            "query": "коммент", "collection": "fl", "mode": "keyword", "k": 5
+        });
+        let v = call("search", &q.to_string());
+        assert_eq!(v["ok"], json!(true));
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "the pulled comment must be searchable in B's chunk");
+        assert!(
+            hits.iter().any(|h| h["line_start"] == json!(5)),
+            "B's chunk must start at the pulled comment line (5), got hits: {hits:?}"
+        );
+
+        // Source purity: get_segment over B's scenario header (line 7) returns
+        // exactly the source line, with NO prepended header text.
+        let v = call("get_segment", r#"{"doc_id":"fl1","line_start":7,"line_end":7}"#);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["result"]["text"], json!("Сценарий: B"));
+        // And the full pulled chunk (lines 5-7) is exactly the source slice.
+        let v = call("get_segment", r#"{"doc_id":"fl1","line_start":5,"line_end":7}"#);
+        assert_eq!(
+            v["result"]["text"],
+            json!("# коммент B\n@smoke\nСценарий: B"),
+            "stored source stays pure: lead-pull/prepend never mutate it"
+        );
     }
 
     // -- Stage 2: hybrid search (mode: dense | keyword | hybrid) -------------
