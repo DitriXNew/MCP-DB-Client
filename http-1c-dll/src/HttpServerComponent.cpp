@@ -215,6 +215,18 @@ json metaFiltersSchema() {
                 {"type", "object"},
                 {"description", "AND filter: keep results matching all of these key-value pairs."},
                 {"additionalProperties", true}
+            }},
+            {"tags_all", {
+                {"type", "array"},
+                {"items", {{"type", "string"}}},
+                {"description", "Require EVERY listed tag to be present in the hit's "
+                                "effective `tags` meta array."}
+            }},
+            {"tags_any", {
+                {"type", "array"},
+                {"items", {{"type", "string"}}},
+                {"description", "Require AT LEAST ONE of the listed tags to be present "
+                                "in the hit's effective `tags` meta array."}
             }}
         }},
         {"additionalProperties", false}
@@ -240,6 +252,12 @@ json nativeToolDefinitions() {
                     {"type", "string"},
                     {"description", "Restrict the search to a single collection. "
                                     "When omitted, all collections are searched."}
+                }},
+                {"collections", {
+                    {"type", "array"},
+                    {"items", {{"type", "string"}}},
+                    {"description", "Search a subset of collections; takes precedence "
+                                    "over `collection`. Absent = all collections."}
                 }},
                 {"k", {
                     {"type", "integer"},
