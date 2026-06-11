@@ -105,7 +105,20 @@ model dropdown unconditionally. An unknown `model` name makes `configure` fail
 with a structural `bad_model` error (message lists the supported names) before
 any state is touched; this validation is identical with or without the
 `fastembed` feature. A non-empty `model_path` (offline local files) bypasses
-the whitelist — local files are loaded by path, not by name.
+the whitelist — local files are loaded by path, not by name. The directory must
+contain exactly these files (flat layout; the hf-hub *cache* layout
+`models--*/blobs|snapshots` is NOT accepted):
+
+```
+<model_path>/onnx/model.onnx        (or <model_path>/model.onnx)
+<model_path>/tokenizer.json
+<model_path>/config.json
+<model_path>/special_tokens_map.json
+<model_path>/tokenizer_config.json
+```
+
+A quantized ONNX works too — just name it `model.onnx`; no other file names are
+probed.
 
 **Model cache:** `configure`'s optional `cache_dir` sets the directory the
 built-in model is downloaded into / loaded from (the fastembed/hf-hub cache
