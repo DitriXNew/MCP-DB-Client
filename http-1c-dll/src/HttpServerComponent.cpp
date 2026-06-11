@@ -492,6 +492,22 @@ std::string HttpServerComponent::generateSessionId() {
     return std::string(buf);
 }
 
+// Evict least-recently-active sessions until the map is below MAX_SESSIONS.
+// Linear scan is fine at this size; callers hold sessionMutex.
+void HttpServerComponent::evictSessionsIfFullLocked() {
+    while (sessions.size() >= MAX_SESSIONS) {
+        auto lru = sessions.begin();
+        for (auto it = sessions.begin(); it != sessions.end(); ++it) {
+            if (it->second->lastActivity < lru->second->lastActivity) {
+                lru = it;
+            }
+        }
+        logToFile("MCP: session cap (" + std::to_string(MAX_SESSIONS)
+            + ") reached - evicting LRU session " + lru->first);
+        sessions.erase(lru);
+    }
+}
+
 std::string HttpServerComponent::createSession(const std::string& protocolVersion) {
     auto session = std::make_shared<McpSession>();
     session->sessionId = generateSessionId();
@@ -501,6 +517,7 @@ std::string HttpServerComponent::createSession(const std::string& protocolVersio
     session->lastActivity = session->createdAt;
 
     std::lock_guard<std::mutex> lock(sessionMutex);
+    evictSessionsIfFullLocked();
     sessions[session->sessionId] = session;
     return session->sessionId;
 }
@@ -1077,6 +1094,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
             session->lastActivity = session->createdAt;
             {
                 std::lock_guard<std::mutex> lock(sessionMutex);
+                evictSessionsIfFullLocked();
                 sessions[sessionId] = session;
             }
             logToFile("MCP: unknown session " + sessionId + " resurrected (server restart?)");

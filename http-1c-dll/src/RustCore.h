@@ -30,12 +30,18 @@
 
 #include <string>
 #include <utility> // std::exchange
+
+// The Rust core ships as a Windows DLL only; on non-Windows builds (the CMake
+// project still supports UNIX) this header degrades to inert stubs so the rest
+// of the component compiles as the lite variant — no <windows.h> leakage.
+#if defined(_WIN32)
 #include <mutex>   // std::once_flag / std::call_once
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#endif // _WIN32
 
 // ---------------------------------------------------------------------------
 // RCore — lazy, thread-safe runtime loader for rcore.dll.
@@ -53,6 +59,8 @@
 class RustString; // fwd
 
 namespace RCore {
+
+#if defined(_WIN32)
 
 // ---- C ABI signatures of rcore.dll's exported entry points. ----
 using version_fn_t   = char* (*)(void);
@@ -198,6 +206,17 @@ inline void shutdown() {
     }
 }
 
+#else // !_WIN32 — inert lite stubs (no Rust core on this platform)
+
+inline bool available() { return false; }
+inline void freeString(char*) {}
+inline void shutdown() {}
+
+RustString version();
+RustString dispatch(const std::string& method, const std::string& payloadJson);
+
+#endif // _WIN32
+
 } // namespace RCore
 
 // ---------------------------------------------------------------------------
@@ -258,6 +277,8 @@ private:
 
 namespace RCore {
 
+#if defined(_WIN32)
+
 inline RustString version() {
     const detail::State& st = detail::loaded();
     if (!st.ready) {
@@ -273,6 +294,13 @@ inline RustString dispatch(const std::string& method, const std::string& payload
     }
     return RustString::adopt(st.dispatch(method.c_str(), payloadJson.c_str()));
 }
+
+#else // !_WIN32
+
+inline RustString version() { return RustString(); }
+inline RustString dispatch(const std::string&, const std::string&) { return RustString(); }
+
+#endif // _WIN32
 
 } // namespace RCore
 

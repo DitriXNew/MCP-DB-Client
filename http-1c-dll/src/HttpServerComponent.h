@@ -111,6 +111,12 @@ private:
     std::mutex sessionMutex;
     std::map<std::string, std::shared_ptr<McpSession>> sessions;
 
+    // Cap on tracked sessions: resurrection accepts arbitrary client-supplied
+    // ids, so without a bound a client could grow the map forever (memory DoS).
+    // When the cap is hit, the least-recently-active session is evicted.
+    static constexpr size_t MAX_SESSIONS = 256;
+    void evictSessionsIfFullLocked(); // requires sessionMutex to be held
+
     std::string createSession(const std::string& protocolVersion);
     std::shared_ptr<McpSession> findSession(const std::string& sessionId);
 

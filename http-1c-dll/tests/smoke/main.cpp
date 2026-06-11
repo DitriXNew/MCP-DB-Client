@@ -529,6 +529,43 @@ int wmain(int argc, wchar_t** argv) {
     });
 
     // -----------------------------------------------------------------------
+    // T5b: the session map is capped — a flood of unknown ids cannot grow it
+    //      without bound (LRU eviction at MAX_SESSIONS=256). Paced to respect
+    //      the component's token-bucket rate limiter, so this test takes ~12s.
+    // -----------------------------------------------------------------------
+    runTest("T5b session cap under id flood", [&] {
+        auto cli = makeClient(port);
+        int served = 0;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+        for (int i = 0; i < 300 && std::chrono::steady_clock::now() < deadline; ++i) {
+            RpcOptions opt; opt.sessionId = "flood-" + std::to_string(i);
+            for (;;) {
+                auto res = mcpPost(*cli, rpcRequest("tools/list", 1000 + i), opt);
+                if (res && res->status == 429) { // rate limiter — wait for refill
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    if (std::chrono::steady_clock::now() >= deadline) break;
+                    continue;
+                }
+                if (res && res->status == 200) ++served;
+                break;
+            }
+        }
+        CHECK(served >= 280, "id flood mostly served, got " + std::to_string(served) + "/300");
+
+        tVariant ret;
+        REQUIRE(h.callFunc(L"GetStatus", &ret, nullptr, 0), "CallAsFunc(GetStatus)");
+        if (g_fatal) return;
+        const json st = json::parse(variantToUtf8(ret), nullptr, false);
+        freeVariant(ret);
+        REQUIRE(!st.is_discarded() && st.contains("active_sessions"),
+                "GetStatus returns active_sessions");
+        if (g_fatal) return;
+        const int active = st["active_sessions"].get<int>();
+        CHECK(active <= 256, "sessions capped at 256 (active=" + std::to_string(active) + ")");
+        CHECK(active >= 200, "cap actually engaged near the limit (active=" + std::to_string(active) + ")");
+    });
+
+    // -----------------------------------------------------------------------
     // T6: Bearer auth + concurrency smoke against ApplyConfig token flips.
     // -----------------------------------------------------------------------
     runTest("T6 auth + concurrent token flips", [&] {
