@@ -88,3 +88,23 @@ echo ""
 echo "Running tests..."
 echo "========================================"
 ./http1c_tests.exe
+
+# ---- Black-box smoke harness (loads bin/libhttp1cWin.dll like 1C does) ----
+# Builds ONLY the http1c_smoke target so a libhttp1cWin.dll locked by a running
+# 1C session does not break the run; the exe is tested against the existing
+# bin/libhttp1cWin.dll. A separate build dir (build-smoke) keeps this from
+# clobbering a developer's Ninja-configured http-1c-dll/build.
+DLL_DIR="$REPO_ROOT/http-1c-dll"
+
+cd "$DLL_DIR"
+rm -rf build-smoke
+mkdir build-smoke
+cd build-smoke
+
+"$CMAKE" .. -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release -DHTTP1C_BUILD_TESTS=ON
+"$CMAKE" --build . --target http1c_smoke
+
+echo ""
+echo "Running smoke harness..."
+echo "========================================"
+"$DLL_DIR/bin/http1c_smoke.exe"

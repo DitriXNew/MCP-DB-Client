@@ -41,6 +41,7 @@ build/artifacts/
 
 # CMake and out-of-source build directories
 http-1c-dll/build/
+http-1c-dll/build-smoke/
 http-1c-dll/artifacts/
 tests/build/
 build_dbg/

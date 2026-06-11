@@ -2,6 +2,44 @@
 
 This guide is designed for an AI agent (such as GitHub Copilot in VS Code) that connects to the http1c MCP server. All tests are performed by invoking MCP tools, reading resources, and using prompts through the standard MCP client interface — not via raw HTTP/curl.
 
+## Automated C++ smoke harness
+
+`http-1c-dll/tests/smoke/main.cpp` builds into a console exe (`http1c_smoke.exe`)
+that needs **no 1C at all**: it loads the built `bin/libhttp1cWin.dll` exactly
+like 1C:Enterprise does (`LoadLibrary` → `GetClassObject("HttpServer")` →
+`setMemManager` → `Init` with stubbed `IMemoryManager` /
+`IAddInDefBase(+Ex)` interfaces), then drives the component over real HTTP and
+asserts behavior. CI runs it on every push (see `.github/workflows/ci.yml`);
+`build/run-tests.sh` also builds and runs it after the unit tests.
+
+**Build & run locally** (from a VS Developer/vcvars x64 prompt):
+
+```bash
+cd http-1c-dll
+mkdir build && cd build
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DHTTP1C_BUILD_TESTS=ON
+cmake --build .            # or: cmake --build . --target http1c_smoke
+../bin/http1c_smoke.exe    # optional arg: path to libhttp1cWin.dll
+```
+
+The exe exits 0 when everything passes (nonzero = number of failed checks) and
+prints PASS/FAIL per test:
+
+| Test | Covers |
+|------|--------|
+| T1 | DLL load, `GetClassObject`, `Init`, call plumbing (`GetProcessId` = current pid) |
+| T2 | `ApplyConfig` (`tools_json`, `timeout`, logging off) → `StartListen` → MCP `initialize` returns `serverInfo` + `Mcp-Session-Id` |
+| T3 | `tools/list` is the union of 1C tools + the 4 native search tools, names unique, count = 5 |
+| T4 | Reserved-name rejection: registering a tool named `search` raises `AddError` ("reserved…") and leaves the tool cache unchanged |
+| T5 | Unknown `Mcp-Session-Id` is transparently resurrected (HTTP 200, not 404) |
+| T6 | Bearer auth (401 without / 200 with token) + concurrency smoke: 4×50 requests racing `ApplyConfig` token flips — only 200/401/429 allowed (429 = the component's own rate limiter), no 5xx/hang |
+| T7 | `tools/call` of a 1C tool with `timeout: 1`: `ExternalEvent(ToolCall)` reaches the stub and the "did not respond within 1 second" error returns within ~3 s |
+| T8 | UTF-8 round-trip: Russian tool name/description come back byte-identical through `MB2WCHAR`/`WCHAR2MB` |
+| T9 | Native `list_collections` end-to-end: ok-collections JSON (with `rcore.dll` beside the DLL) or structured `rag_not_installed` (lite) — both valid |
+
+The harness never enables component logging and always finishes with
+`StopListen`, so it leaves no log files and no dangling threads.
+
 ## Prerequisites
 
 1. The `http1c.epf` data processor is open in 1C:Enterprise.

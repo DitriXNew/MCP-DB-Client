@@ -97,6 +97,30 @@ target_include_directories(${TARGET} PRIVATE src)
 # ---------------------------------------------------------------------------
 option(RCORE_FASTEMBED "Also build rcore.dll (real fastembed search core) for the full package" OFF)
 
+# ===========================================================================
+# Black-box smoke harness (tests/smoke) — a console exe that LoadLibrary's the
+# BUILT bin/libhttp1cWin.dll exactly like 1C does (GetClassObject + stubbed 1C
+# interfaces) and drives it over real HTTP. It does NOT link the DLL, so the
+# CRT choice is free; we keep the DLL's flags (/MT via add_definitions above)
+# for simplicity. OFF by default; CI enables it with -DHTTP1C_BUILD_TESTS=ON.
+# ===========================================================================
+option(HTTP1C_BUILD_TESTS "Build the http1c_smoke black-box test exe" OFF)
+
+if (HTTP1C_BUILD_TESTS AND NOT UNIX)
+	add_executable(http1c_smoke tests/smoke/main.cpp)
+	target_compile_definitions(http1c_smoke PRIVATE UNICODE _UNICODE
+			_WIN32_WINNT=0x0601 NOMINMAX WIN32_LEAN_AND_MEAN _WINDOWS
+			_SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING)
+	target_include_directories(http1c_smoke PRIVATE include)
+	target_compile_options(http1c_smoke PRIVATE /utf-8)
+	target_link_libraries(http1c_smoke PRIVATE ws2_32)
+	set_target_properties(http1c_smoke PROPERTIES
+			CXX_STANDARD 17
+			CXX_STANDARD_REQUIRED ON
+			RUNTIME_OUTPUT_DIRECTORY "${HTTP1C_OUTPUT_DIR}"
+			PDB_OUTPUT_DIRECTORY "${HTTP1C_OUTPUT_DIR}")
+endif()
+
 if (RCORE_FASTEMBED AND NOT UNIX)
 	set(RCORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rust-core")
 	set(RCORE_TARGET_TRIPLE "x86_64-pc-windows-msvc")

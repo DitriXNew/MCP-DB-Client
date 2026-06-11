@@ -45,15 +45,25 @@ jobs:
         shell: bash
         run: cargo test --manifest-path rust-core/Cargo.toml
 
-      - name: Build DLL (Release, lite)
+      - name: Build DLL (Release, lite) + smoke harness
         shell: bash
         run: |
           cd http-1c-dll
           rm -rf build
           mkdir build
           cd build
-          cmake .. -G "Ninja" -DCMAKE_BUILD_TYPE=Release
+          cmake .. -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DHTTP1C_BUILD_TESTS=ON
           cmake --build .
+
+      # Black-box smoke: loads the freshly built bin/libhttp1cWin.dll the way
+      # 1C does (LoadLibrary + GetClassObject + stubbed 1C interfaces) and
+      # drives it over real HTTP (T1-T9: init, tools/list union, reserved-name
+      # rejection, session resurrection, auth races, timeout, UTF-8, native
+      # list_collections). rcore.dll is not in bin/ here, so the native tools
+      # exercise the structured rag_not_installed path.
+      - name: Run smoke harness (black-box, bin/libhttp1cWin.dll)
+        shell: bash
+        run: ./http-1c-dll/bin/http1c_smoke.exe
 
       # Full ("RAG") build check: compile the rcore.dll cdylib with the
       # fastembed feature and the dynamic CRT (ort/onnxruntime needs /MD). This
