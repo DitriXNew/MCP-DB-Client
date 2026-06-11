@@ -188,6 +188,8 @@
 											<v8:content>Server</v8:content>
 										</v8:item>
 									</Title>
+									<MultiLine>true</MultiLine>
+									<Height>2</Height>
 									<HorizontalStretch>true</HorizontalStretch>
 									<ContextMenu name="СтатусСервераContextMenu" id="30"/>
 									<ExtendedTooltip name="СтатусСервераExtendedTooltip" id="31"/>
@@ -205,6 +207,8 @@
 											<v8:content>Indexing</v8:content>
 										</v8:item>
 									</Title>
+									<MultiLine>true</MultiLine>
+									<Height>2</Height>
 									<HorizontalStretch>true</HorizontalStretch>
 									<ContextMenu name="СтатусИндексацииContextMenu" id="33"/>
 									<ExtendedTooltip name="СтатусИндексацииExtendedTooltip" id="34"/>
@@ -226,6 +230,22 @@
 									<HorizontalStretch>false</HorizontalStretch>
 									<ContextMenu name="СчетчикИнструментовContextMenu" id="36"/>
 									<ExtendedTooltip name="СчетчикИнструментовExtendedTooltip" id="37"/>
+								</InputField>
+								<InputField name="ВерсияКомпоненты" id="104">
+									<DataPath>ВерсияКомпоненты</DataPath>
+									<ReadOnly>true</ReadOnly>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Версия</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Version</v8:content>
+										</v8:item>
+									</Title>
+									<Width>12</Width>
+									<HorizontalStretch>false</HorizontalStretch>
 								</InputField>
 							</ChildItems>
 						</UsualGroup>
@@ -298,11 +318,11 @@
 									<ToolTip>
 										<v8:item>
 											<v8:lang>ru</v8:lang>
-											<v8:content>Распакованный бандл http1c-addin-full.zip. Компонента подключается прямо из этой папки (in-place), чтобы rcore.dll был рядом.</v8:content>
+											<v8:content>Необязательно. Оставьте пустым — компонента берётся из встроенного макета. Заполните, чтобы загрузить свой бандл (libhttp1cWin.dll, rcore.dll, DirectML.dll).</v8:content>
 										</v8:item>
 										<v8:item>
 											<v8:lang>en</v8:lang>
-											<v8:content>Unpacked http1c-addin-full.zip bundle. The add-in is attached directly from this folder (in-place) so that rcore.dll is next to it.</v8:content>
+											<v8:content>Optional. Leave empty to use the built-in embedded add-in. Fill in to load your own bundle (libhttp1cWin.dll, rcore.dll, DirectML.dll).</v8:content>
 										</v8:item>
 									</ToolTip>
 									<HorizontalStretch>true</HorizontalStretch>
@@ -1087,6 +1107,21 @@
 				<v8:Type>xs:string</v8:Type>
 				<v8:StringQualifiers>
 					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="ВерсияКомпоненты" id="16">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Версия компоненты</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>50</v8:Length>
 					<v8:AllowedLength>Variable</v8:AllowedLength>
 				</v8:StringQualifiers>
 			</Type>
