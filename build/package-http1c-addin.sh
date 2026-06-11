@@ -3,8 +3,9 @@
 # Packages the built DLL(s) into a 1C add-in ZIP bundle and copies it as template.
 #
 # Two variants (select via the VARIANT env var, default "lite"):
-#   * lite — libhttp1cWin.dll alone. The search tools (search/grep/get_segment)
-#            return a structured "install RAG package" error at runtime.
+#   * lite — libhttp1cWin.dll alone. The search tools (search/grep/get_segment/
+#            list_collections) return a structured "install RAG package" error
+#            at runtime.
 #   * full — libhttp1cWin.dll + rcore.dll (the real fastembed search core) +
 #            DirectML.dll. rcore.dll hard-imports DirectML.dll (ort bundles the
 #            DirectML execution provider), so the full bundle MUST ship it or

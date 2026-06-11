@@ -2338,8 +2338,9 @@ EndProcedure
 // Drives the Rust search core (rcore.dll) from 1C via the component's
 // RagDispatch(method, payloadJson) method. Ingest/admin calls (configure,
 // index_segments, stats, search, delete_collection) are issued from here; the
-// search/grep/get_segment MCP tools are served by the component itself (no 1C
-// round-trip), so once data is indexed an MCP client can search it too.
+// search/grep/get_segment/list_collections MCP tools are served by the
+// component itself (no 1C round-trip), so once data is indexed an MCP client
+// can search it too.
 //
 // End-to-end test flow:
 //   1. Connect              - load the native component.

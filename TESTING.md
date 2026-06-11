@@ -349,7 +349,7 @@ curl -s -w "\nHTTP:%{http_code}" -X POST http://localhost:8888/mcp \
 
 ---
 
-## Test 20: Security — Invalid Session
+## Test 20: Unknown Session — Transparent Resurrection
 
 **Action:** Send a request with a non-existent session ID:
 ```bash
@@ -359,7 +359,7 @@ curl -s -w "\nHTTP:%{http_code}" -X POST http://localhost:8888/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"ping"}'
 ```
 
-**Expected:** HTTP 404, body: `{"error":"Session not found"}`
+**Expected:** HTTP 200 with a normal `ping` result — an unknown session ID is **not** rejected with 404; the session is transparently **resurrected** (recreated under the presented ID). This keeps IDE clients alive across server restarts (they typically never re-initialize after a 404). With logging enabled, the log contains `MCP: unknown session ... resurrected (server restart?)`. See also Test 38.
 
 ---
 
@@ -396,7 +396,7 @@ curl -s -w "\nHTTP:%{http_code}" -X DELETE http://localhost:8888/mcp \
   -H "Mcp-Session-Id: $SESSION_ID"
 ```
 
-**Expected:** HTTP 200. Subsequent requests with this session ID return 404.
+**Expected:** HTTP 200 — the server-side session state is freed. Note: a *subsequent* request that still presents this session ID is served again (the ID is transparently resurrected, see Test 20); `DELETE` releases resources, it does not blacklist the ID.
 
 ---
 
@@ -500,40 +500,42 @@ curl -s -w "\nHTTP:%{http_code}" -X DELETE http://localhost:8888/mcp \
 
 ## Search Subsystem Tests (RAG)
 
-These tests cover the `search` / `grep` / `get_segment` tools served natively by
-the component (see the [Search Subsystem](README.md#search-subsystem-rag) docs).
+These tests cover the `search` / `grep` / `get_segment` / `list_collections`
+tools served natively by the component (see the
+[Search Subsystem](README.md#search-subsystem-rag) docs).
 They are **always advertised in `tools/list`** — so the tool counts in Test 1
-and Test 28 are actually **+3** (the demo tools plus `search`, `grep`,
-`get_segment`).
+and Test 28 are actually **+4** (the demo tools plus `search`, `grep`,
+`get_segment`, `list_collections`).
 
 **Distribution matters:**
-- **lite** (`libhttp1cWin.dll` only) — the three tools are listed but every call
+- **lite** (`libhttp1cWin.dll` only) — the four tools are listed but every call
   returns a structured `rag_not_installed` result. Run Tests 30–31 only.
 - **full** (`+ rcore.dll + DirectML.dll`) — the tools run for real. Run all of
-  Tests 30–36.
+  Tests 30–40.
 
 **Prerequisite for the "full" tests:** the operator must have **indexed some
-content first**. Indexing, `configure`, `stats`, and `list_collections` are
-**1C-side admin operations** (driven from the form via the component's
-`RagDispatch` method) — they are *not* MCP tools and are not callable by the
-client. Use the form's **Sync** button (or the headless self-test) to populate
-at least one collection before searching. `list_collections` is what the
-operator/AI uses on the 1C side to confirm a collection reached
-`vector_status: ready`.
+content first**. Indexing, `configure`, and `stats` are **1C-side admin
+operations** (driven from the form via the component's `RagDispatch` method) —
+they are *not* MCP tools and are not callable by the client. Use the form's
+**Sync** button (or the headless self-test) to populate at least one collection
+before searching. `list_collections` exists on both sides: as a `RagDispatch`
+method for the operator and as the fourth native MCP tool (Test 37) — either
+way it is how you confirm a collection reached `vector_status: ready`.
 
 ---
 
-## Test 30: List Tools — Includes search / grep / get_segment
+## Test 30: List Tools — Includes search / grep / get_segment / list_collections
 
 **Action:** Ask Copilot to list the tools available from `1c-mcp-server`.
 
-**Expected:** In addition to the demo + screenshot tools, three search tools are present:
+**Expected:** In addition to the demo + screenshot tools, four search tools are present:
 - `search` — semantic / keyword / hybrid ranked search
 - `grep` — RE2 regex / substring scan over stored text
 - `get_segment` — O(1) line-range slice of a document by `doc_id`
+- `list_collections` — the collection registry (no arguments)
 
 **Verify:**
-- All three tools appear with descriptions and an `inputSchema`.
+- All four tools appear with descriptions and an `inputSchema`.
 - `search` exposes `query`, `collection`, `mode` (dense/keyword/hybrid), `k`, and meta-filter parameters.
 - The schemas are identical whether the lite or full distribution is loaded.
 
@@ -547,7 +549,7 @@ operator/AI uses on the 1C side to confirm a collection reached
 
 **Verify:**
 - The server stays up; the error is a normal tool result, not a transport failure.
-- The same applies to `grep` and `get_segment`.
+- The same applies to `grep`, `get_segment`, and `list_collections`.
 
 > On a **full** install with a ready collection this call returns real hits instead — skip to Test 32.
 
@@ -614,6 +616,130 @@ operator/AI uses on the 1C side to confirm a collection reached
 
 ---
 
+## Test 37: list_collections — Collection registry via MCP
+
+**Action:** On a **full** install with at least one indexed collection, call the `list_collections` tool (no arguments).
+
+**Expected result:** A `collections` array, one entry per collection, each with `name`, `description`, `n_docs`, `n_segments`, `vector_status` (`empty`/`building`/`ready`/`error`), and `text_ready`.
+
+**Verify:**
+- Every collection indexed from the 1C side is present, sorted by name.
+- `description` carries the human/AI-facing text supplied at ingest (empty if none was given).
+- On a **lite** install the call returns `rag_not_installed`, like the other three tools.
+
+---
+
+## Test 38: Session Resurrection — Server restart does not strand clients
+
+**Action:**
+1. Initialize a session and save `$SESSION_ID` (as in Test 10).
+2. In 1C, press **Disconnect**, then **Connect** again (server restart — all in-memory sessions are gone).
+3. Re-send a request with the *old* session ID:
+```bash
+curl -s -w "\nHTTP:%{http_code}" -X POST http://localhost:8888/mcp \
+  -H "Content-Type: application/json" \
+  -H "Mcp-Session-Id: $SESSION_ID" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"ping"}'
+```
+
+**Expected:** HTTP 200 with a normal `ping` result — the old session is transparently recreated under the same ID; no 404, no re-initialize required.
+
+**Verify:**
+- The request succeeds immediately after the restart.
+- With logging enabled, the log contains `MCP: unknown session <id> resurrected (server restart?)`.
+- An MCP client (VS Code) that stayed configured across the restart keeps working without reconnecting.
+
+---
+
+## Test 39: index_raw — collection_description visible in the registry
+
+**Action:** From the 1C side, ingest a raw document with a collection description via `RagDispatch`: `index_raw` with `{"collection":"desc_test","collection_description":"Throwaway docs for testing","name":"doc.txt","text":"line one\nline two"}` (the Vanessa plugin's file-collections table does exactly this per file). Then call the `list_collections` MCP tool.
+
+**Expected result:** The `desc_test` entry carries `"description": "Throwaway docs for testing"`.
+
+**Verify:**
+- The same description is visible in the 1C-side `stats` payload.
+- Same last-non-empty-wins semantics as `index_segments`: re-ingesting with an empty description keeps the old text; a new non-empty one replaces it.
+
+---
+
+## Test 40: search — Hits echo the effective segment meta
+
+**Action:** Index (1C side) a document whose doc-level `meta` is `{"src":"doc","lang":"en"}` and one of whose segments carries `meta: {"lang":"ru"}`. Then `search` for that segment.
+
+**Expected result:** The hit's `meta` is the **effective** view — doc meta overlaid by segment meta, segment wins on collision: `{"src":"doc","lang":"ru"}`.
+
+**Verify:**
+- Doc-only keys (`src`) are preserved; colliding keys take the segment value (`lang: ru`).
+- This is the same view the `filter` clauses match against — `all: {"lang":"ru"}` matches the hit, and the returned `meta` shows why.
+
+---
+
+## Vanessa Plugin Tests (MCPRagSearch)
+
+These tests target the **MCPRagSearch** plugin (see
+[`vanessa-plugin/README.md`](vanessa-plugin/README.md)) rather than the demo
+processor. Prerequisites: Vanessa Automation is open, the plugin form is
+started in **MCP+RAG** mode (default port **8765**), and the indexing status
+shows `Готово`. Adjust the URL/port in the curl examples accordingly.
+
+---
+
+## Test 41: Prompts — search-guide and the get_search_guide tool
+
+**Action:**
+1. Send `prompts/list` (curl, as in Test 13, against port 8765).
+2. Send `prompts/get` with `{"name":"search-guide"}`.
+3. Call the `get_search_guide` tool via the MCP client.
+
+**Expected:**
+- `prompts/list` returns one prompt: `search-guide` (title `Vanessa: как искать шаги (RAG)`), no arguments.
+- `prompts/get` returns one `user` message whose text is the search skill (collections, search modes, workflow) from the `СкилПоиска` template.
+- The `get_search_guide` tool returns the **same** skill text — it duplicates the prompt for clients that hide MCP prompts.
+
+**Verify:**
+- The prompt text and the tool text are identical.
+- `prompts/get` also accepts the legacy name `search_guide`.
+
+---
+
+## Test 42: File Collections — Indexing from the form table
+
+**Action:** Add a row to the «Коллекции файлов» table (e.g. collection `project_features`, a description, a folder with `.feature` files), press «Переиндексировать», wait for `Готово`. Then, via MCP: `list_collections`, `search` scoped to the collection, `grep` for a known literal, and `get_segment` with a `doc_id` (file path) + line range taken from a hit.
+
+**Expected:**
+- `list_collections` shows the collection with the table row's description and non-zero counts.
+- `search`/`grep` hits carry `doc_id` = full file path and `meta.path`/`meta.ext`.
+- `get_segment` returns the exact lines of the source file.
+
+**Verify:** Files larger than 5 MB are skipped with a message; table rows without a collection name or folder are skipped.
+
+---
+
+## Test 43: vanessa_kb — Knowledge base collection
+
+**Action:** After indexing, call `list_collections`, then `search` with `{"query":"как провести документ","collection":"vanessa_kb","mode":"dense"}`.
+
+**Expected:**
+- `vanessa_kb` is present in the registry (one document; one segment per Q&A entry from the VA `БазаЗнанийДляMCP` template).
+- Hits are question+answer segments; `meta.type` is `qa` and `meta.num` is the question number.
+
+**Verify:** The top hit's text starts with `Вопрос:` and contains a relevant answer.
+
+---
+
+## Test 44: Watcher — Automatic reindex on language / step library change
+
+**Action:** With the plugin running in MCP+RAG mode, change the Gherkin generator language in VA settings (or load additional step libraries so the step count changes). Wait up to 30 seconds.
+
+**Expected:** The plugin notices the change (the watcher polls every 30 s), reports it («Язык генератора Gherkin изменился…» / «Библиотека шагов изменилась…») and reindexes `vanessa_steps` automatically.
+
+**Verify:**
+- After reindexing completes, `vanessa_steps` hits carry the new `meta.lang`.
+- The watcher only runs while the transport is started in MCP+RAG mode.
+
+---
+
 ## Summary Checklist
 
 After completing all tests, verify:
@@ -641,17 +767,25 @@ After completing all tests, verify:
 - [ ] Server remains stable after all tests
 - [ ] Cross-validation: catalog count from `evaluate` matches resource data
 - [ ] Origin validation blocks external domains (HTTP 403)
-- [ ] Invalid session IDs are rejected (HTTP 404)
+- [ ] Unknown session IDs are transparently resurrected (HTTP 200, no 404)
 - [ ] Invalid JSON returns parse error (-32700)
 - [ ] Unknown methods return method not found (-32601)
 - [ ] DELETE terminates sessions
-- [ ] `search` / `grep` / `get_segment` appear in `tools/list` (both distributions)
-- [ ] Lite distribution returns `rag_not_installed` (not a crash) for all three
+- [ ] `search` / `grep` / `get_segment` / `list_collections` appear in `tools/list` (both distributions)
+- [ ] Lite distribution returns `rag_not_installed` (not a crash) for all four
 - [ ] `grep` matches work before embedding finishes; bad regex is a structured error
 - [ ] `search mode=dense` ranks the semantically closest segment near the top
 - [ ] `search mode=hybrid` surfaces the exact-identifier record (SKU/INN/article)
 - [ ] `get_segment` returns the exact line range and clamps out-of-range requests
 - [ ] `search` meta filters (`all`/`any`) and `collection` scoping work
+- [ ] `list_collections` returns the registry with names, descriptions, counts and statuses
+- [ ] An old session ID still works after a server restart (resurrection)
+- [ ] `index_raw` `collection_description` shows up in `list_collections` / `stats`
+- [ ] Search hits echo the effective meta (doc overlaid by segment, segment wins)
+- [ ] Plugin: `search-guide` prompt and `get_search_guide` tool return the same skill text
+- [ ] Plugin: file collections are indexed and searchable (`search`/`grep`/`get_segment`)
+- [ ] Plugin: `vanessa_kb` is present with Q&A segments (`meta.type=qa`, `meta.num`)
+- [ ] Plugin: watcher auto-reindexes on Gherkin language / step library change
 
 ## Troubleshooting
 

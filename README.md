@@ -63,7 +63,7 @@ This means the project is not a fixed set of built-in utilities. It is an MCP tr
 - **Tool annotations** — `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`
 - **Output schemas** — typed response contracts for tool results
 - **Dynamic registration** — register/update tools, resources, prompts at runtime from 1C
-- **Built-in semantic search (RAG)** — optional `search` / `grep` / `get_segment` tools backed by a Rust search core (`rcore`) with dense/keyword/hybrid retrieval (see [Search Subsystem](#search-subsystem-rag))
+- **Built-in semantic search (RAG)** — optional `search` / `grep` / `get_segment` / `list_collections` tools backed by a Rust search core (`rcore`) with dense/keyword/hybrid retrieval (see [Search Subsystem](#search-subsystem-rag))
 
 ## Architecture
 
@@ -261,7 +261,7 @@ Component.AuthToken = "";
 The component also enforces:
 - **Origin validation** — only requests from `localhost` / `127.0.0.1` / VS Code origins are accepted
 - **Rate limiting** — token-bucket algorithm (60 burst, 20/sec)
-- **Session management** — `Mcp-Session-Id` assigned on initialize, validated on subsequent requests
+- **Session management** — `Mcp-Session-Id` assigned on initialize, validated on subsequent requests. A request presenting an **unknown** session id is not rejected with 404 — the session is transparently **resurrected** under the presented id, so a server restart does not strand connected MCP clients that never re-initialize (logged as `MCP: unknown session ... resurrected (server restart?)`)
 
 ## Native Component API
 
@@ -336,7 +336,7 @@ Events sent from the native component to 1C:
 | `notifications/initialized` | Native — accepted silently |
 | `ping` | Native — returns empty result |
 | `tools/list` | Native — paginated, from cache |
-| `tools/call` | `search` / `grep` / `get_segment` handled natively by the search core; all other tools delegated to 1C via ExternalEvent |
+| `tools/call` | `search` / `grep` / `get_segment` / `list_collections` handled natively by the search core; all other tools delegated to 1C via ExternalEvent |
 | `resources/list` | Native — paginated, from cache |
 | `resources/read` | Delegated to 1C via ExternalEvent |
 | `prompts/list` | Native — paginated, from cache |
@@ -412,13 +412,14 @@ The shape of the subsystem follows directly from its constraints — they are pa
 
 ### MCP tools
 
-Three search tools are served **natively by the component** — they are handled inside the DLL and are *not* forwarded to 1C via `ExternalEvent`:
+Four search tools are served **natively by the component** — they are handled inside the DLL and are *not* forwarded to 1C via `ExternalEvent`:
 
 | Tool | Purpose |
 |------|---------|
-| `search` | Semantic / keyword / hybrid ranked search over indexed segments. Returns hits with `doc_id`, `name`, `collection`, `score`, segment line ranges, and (optionally) text. |
+| `search` | Semantic / keyword / hybrid ranked search over indexed segments. Returns hits with `doc_id`, `name`, `collection`, `score`, segment line ranges, (optionally) text, and the hit's **effective `meta`** — document meta overlaid by segment meta (segment wins on collision), the same view the meta filters match against. |
 | `grep` | RE2 regex search (linear time, no backreferences/lookaround) over the stored document text. Works the instant a document is ingested — no vectors needed. |
 | `get_segment` | O(1) line-range slice of a raw document by `doc_id` via an offset table. Out-of-range requests are clamped and the actual range is returned. |
+| `list_collections` | The collection registry — AI-facing discovery of what is searchable before querying (see [Collections](#collections-and-the-collection-registry)). Takes no arguments. |
 
 `search` supports three retrieval modes via the `mode` argument:
 
@@ -433,7 +434,7 @@ Both `search` and `grep` accept metadata filters (`all`/`any` clauses) and a `co
 Documents are pushed into the core through `rcore`'s JSON ABI. Ingest is **asynchronous**: the call is accepted under a short lock and returns immediately, while a background worker embeds the segments off-thread. Text-based tools (`grep`, `get_segment`) work right after acceptance; dense `search` becomes available once embedding finishes (`stats` exposes per-collection progress).
 
 - **`index_segments`** — ingest a document as a list of pre-chunked segments (each with optional `embed_text`, line range, and per-segment `meta`). `doc_id` is required so segments can be upserted/deleted.
-- **`index_raw`** — ingest a raw multi-line document; the core normalizes line endings, builds a line-offset table, stores the full text, and chunks it (line-snapped, by token budget, with overlap). `doc_id` is optional (auto-assigned and returned in the ack).
+- **`index_raw`** — ingest a raw multi-line document; the core normalizes line endings, builds a line-offset table, stores the full text, and chunks it (line-snapped, by token budget, with overlap). `doc_id` is optional (auto-assigned and returned in the ack). Accepts the same optional `collection_description` as `index_segments` (last non-empty wins).
 
 Each segment carries two distinct texts:
 
@@ -444,7 +445,14 @@ Each segment carries two distinct texts:
 
 Every document belongs to a **collection** (a named bucket: `qa_steps`, `products`, `clients`, …). Collections are created implicitly on first ingest and can carry a free-text **description**.
 
-- **`list_collections`** returns the registry: for each collection its `name`, `description`, `n_docs`, `n_segments`, `vector_status` (`empty` / `building` / `ready` / `error`), and `text_ready`. This is how an AI client **discovers what is searchable** before querying.
+- **`list_collections`** returns the registry: for each collection its `name`, `description`, `n_docs`, `n_segments`, `vector_status` (`empty` / `building` / `ready` / `error`), and `text_ready`. This is how an AI client **discovers what is searchable** before querying — it is exposed both as a `RagDispatch` method and as the fourth **native MCP tool** (no arguments):
+
+  ```json
+  { "collections": [
+    { "name": "qa_steps", "description": "Vanessa BDD step catalog",
+      "n_docs": 2, "n_segments": 780, "text_ready": true, "vector_status": "ready" }
+  ] }
+  ```
 - **`search`** scopes by `collection`: omit it to search **all** collections, pass one name, or pass a **comma-separated list** (or a `collections` array) to search a chosen subset. So an agent can read the registry, pick the relevant collections by description, and search just those.
 
 ### Embedding worker pool
@@ -457,14 +465,15 @@ All of the following are invoked from 1C via the async `RagDispatch(method, payl
 
 | Method | Purpose |
 |--------|---------|
-| `configure` | Load the model once (`model_path`, `device`, `normalize`, `max_seq_len`, `intra_threads`, `embed_workers`). `dim` is fixed by the model. Idempotent; re-configuring with a different model/dim after indexing implies `reset`. |
+| `configure` | Load the model once — `model` (a built-in name from the whitelist: `multilingual-e5-small` (default) / `multilingual-e5-base` / `multilingual-e5-large`; an unknown name fails with a structural `bad_model` error listing the supported names), `cache_dir` (directory the built-in model is downloaded into / cached in), `model_path` (offline local files, bypasses the whitelist), `device`, `normalize`, `max_seq_len`, `intra_threads`, `embed_workers`. `dim` is fixed by the model. Idempotent; re-configuring with a different model/dim after indexing implies `reset`. |
 | `index_segments` | Async ingest of pre-chunked segments (with `embed_text`, line ranges, per-segment `meta`, optional collection `description`). |
-| `index_raw` | Async ingest of a raw document; the core chunks it (line-snapped, token-budgeted, overlapping) and builds the offset table. |
-| `search` | Ranked retrieval — `mode` dense/keyword/hybrid, `collection`(s), meta filters, `k`, `min_score`, `max_per_doc`, `include_text`. |
+| `index_raw` | Async ingest of a raw document; the core chunks it (line-snapped, token-budgeted, overlapping) and builds the offset table. Same optional `collection_description` as `index_segments` (last non-empty wins). |
+| `search` | Ranked retrieval — `mode` dense/keyword/hybrid, `collection`(s), meta filters, `k`, `min_score`, `max_per_doc`, `include_text`. Hits echo the **effective** meta (doc overlaid by segment, segment wins) — the same view the filters match. |
 | `get_segment` | O(1) line-range slice of a raw document by `doc_id`. |
 | `grep` | RE2 regex / substring scan over stored text. |
 | `stats` | Global + per-collection counters, model, dim, memory estimate, collection statuses. |
 | `list_collections` | The collection registry (names + descriptions + counts + status). |
+| `list_models` | The built-in model whitelist — `{default, models:[…]}`. Works before `configure` and in the lite/mock build, so a client can always render a model picker. |
 | `delete_document` / `delete_collection` | Remove a document (by `doc_id`) or a whole collection. |
 | `reset` | Clear the entire index. |
 
@@ -472,7 +481,7 @@ All of the following are invoked from 1C via the async `RagDispatch(method, payl
 
 You write **adapters**: thin BSL that turns a domain object into generic records and pushes them in. The core stays domain-free.
 
-1. **Attach + configure once.** Attach the full component, then `configure` via `RagDispatch` with the local model path and `embed_workers`. (Component-level settings — logging/timeout — go through `ApplyConfig`, never through synchronous properties.)
+1. **Attach + configure once.** Attach the full component, then `configure` via `RagDispatch` with a built-in `model` name (or a local `model_path`, plus optionally `cache_dir`) and `embed_workers`. (Component-level settings — logging/timeout — go through `ApplyConfig`, never through synchronous properties.)
 2. **Index asynchronously.** For each domain object build segments — set `text` (verbatim) and `embed_text` (the enriched composite), attach `meta` (`{sku, inn, type, tags, …}`) and a `doc_id` for upsert — and call `index_segments`. The call returns immediately; embedding happens in the background.
 3. **Watch progress** by polling `list_collections` / `stats` until `vector_status = ready`. Text tools (`grep`, `get_segment`) work the instant a document is accepted; dense `search` lights up when embedding finishes.
 4. **Keep it fresh within the session.** When one object changes, re-`index_segments` just that `doc_id` (atomic upsert) or `delete_document` — never rebuild the whole corpus.
@@ -482,7 +491,7 @@ The reference end-to-end flow is exercised headlessly by the RAG self-test (stub
 
 ### Working with the subsystem — for the AI agent / MCP client
 
-From the client side it is just three MCP tools, but used in a deliberate order:
+From the client side it is just four MCP tools, but used in a deliberate order:
 
 1. **Discover.** Call `list_collections` first to see what this specific 1C base has indexed and read each collection's description — don't assume; the corpus is per-installation and per-session.
 2. **Search by meaning, scoped.** Call `search` with `mode: hybrid` for anything involving exact identifiers (SKU/INN/article/step syntax) and `dense` for pure intent. Scope to the relevant `collection`(s) from step 1, or omit to search everything. Use meta filters (`all`/`any`) to narrow.
@@ -497,8 +506,8 @@ The same `libhttp1cWin.dll` ships in **two distributions**. The component is pur
 
 | Distribution | Contents | Search behavior |
 |--------------|----------|-----------------|
-| **lite** | `libhttp1cWin.dll` only | `search` / `grep` / `get_segment` are advertised in `tools/list` but return a structured error (`code: rag_not_installed`) telling the caller to install the RAG package. |
-| **full** | `libhttp1cWin.dll` + `rcore.dll` + `DirectML.dll` | Real fastembed/onnxruntime search core; the three tools run for real. |
+| **lite** | `libhttp1cWin.dll` only | `search` / `grep` / `get_segment` / `list_collections` are advertised in `tools/list` but return a structured error (`code: rag_not_installed`) telling the caller to install the RAG package. |
+| **full** | `libhttp1cWin.dll` + `rcore.dll` + `DirectML.dll` | Real fastembed/onnxruntime search core; the four tools run for real. |
 
 Detection is automatic at runtime: if `rcore.dll` is present next to the component **and** all four ABI entry points (`rcore_version` / `rcore_dispatch` / `rcore_free_string` / `rcore_shutdown`) resolve, the component runs the full search path. A missing, partial, or version-mismatched `rcore.dll` degrades cleanly to the lite path (an "install RAG" error) — never a crash. The tool schemas are identical in both distributions, so a client sees the same `tools/list` either way.
 
@@ -515,6 +524,10 @@ The full search core uses onnxruntime's **DirectML** execution provider for GPU 
 > **`DirectML.dll` is a hard dependency of the full package.** ort's prebuilt onnxruntime bundles the DirectML provider, so `rcore.dll` hard-imports `DirectML.dll`. The **full** bundle must ship `DirectML.dll` alongside `rcore.dll`, otherwise `rcore.dll` fails to load and the component silently falls back to the lite "install RAG" behavior. On Windows it lives at `C:\Windows\System32\DirectML.dll`. (Version-coupling caveat: this `DirectML.dll` is paired with the bundled onnxruntime; a future CPU-only onnxruntime build would remove the import and this DLL could be dropped.)
 
 The embedding model itself is **fetched at runtime**, not at build time — nothing model-related is downloaded during the build or in CI.
+
+## Vanessa Automation Integration
+
+The repository ships a ready-made integration for [Vanessa Automation](https://github.com/Pr-Mex/vanessa-automation) (1C BDD testing): the **MCPRagSearch** plugin in [`vanessa-plugin/`](vanessa-plugin/README.md). It runs the http1c component inside the VA session and serves Vanessa's **entire MCP contract** through it — all VA tools are collected from MCPVA via a small facade (a micro-hook already present in the VA fork), while `search` / `grep` / `get_segment` / `list_collections` run natively over the indexed VA step library (`vanessa_steps`), the VA knowledge base (`vanessa_kb`), and arbitrary file collections. See [`vanessa-plugin/README.md`](vanessa-plugin/README.md) (Russian) for setup, the collections, the `search-guide` prompt / `get_search_guide` tool, and the auto-reindex watcher.
 
 ## Repository Layout
 
@@ -541,6 +554,8 @@ The embedding model itself is **fetched at runtime**, not at build time — noth
 ├── rust-core/                          # `rcore` — Rust search core (rcore.dll)
 │   ├── Cargo.toml                      # cdylib crate, `fastembed` feature
 │   └── src/                            # dispatch, embed, grep, filter, core
+├── vanessa-plugin/
+│   └── MCPRagSearch/                   # Vanessa Automation plugin (MCP server + RAG)
 ├── http-1c-dp/
 │   ├── http1c.xml                      # 1C data processor XML source
 │   └── http1c/

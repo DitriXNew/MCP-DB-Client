@@ -13,8 +13,8 @@ dynamic CRT (`/MD`), but the C++ 1C component can't compile under `/MD`
 as a separate `/MD` DLL with a self-contained static onnxruntime. One
 `libhttp1cWin.dll` then serves both distributions:
 
-- **lite** — `rcore.dll` absent → the `search`/`grep`/`get_segment` tools return
-  a structured `rag_not_installed` result.
+- **lite** — `rcore.dll` absent → the `search`/`grep`/`get_segment`/
+  `list_collections` tools return a structured `rag_not_installed` result.
 - **full** — `rcore.dll` present (next to the component) + `DirectML.dll` → real
   search.
 
@@ -59,7 +59,14 @@ immediately; a background worker pool embeds; collections expose a two-axis
 `text_ready` / `vector_status` state, polled via `stats` /
 `list_collections`).
 
-**Collection registry:** each collection carries an optional `description`;
+**Hit meta:** `search` hits echo the **effective** meta — the document-level
+`meta` overlaid by the segment-level `meta`, segment winning on collision. It
+is the same view the `filter` clauses match against, so what filtered a hit in
+is exactly what the hit reports back (segment-level labels stay visible).
+
+**Collection registry:** each collection carries an optional `description`,
+set via the `collection_description` field on `index_segments` **or**
+`index_raw` (same semantics on both: last non-empty wins);
 `list_collections` returns `{name, description, n_docs, n_segments,
 vector_status, text_ready}` so a caller can discover what is searchable and
 scope `search` to one or several collections.

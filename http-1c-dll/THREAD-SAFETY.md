@@ -87,9 +87,9 @@ All four helpers live in the file-local anonymous namespace (opens
 `HttpServerComponent.cpp:24`, closes line 420), so they have internal linkage and are plain free
 functions:
 
-- `isNativeTool` (`:189-193`) — three string compares on its parameter; pure.
+- `isNativeTool` (`:189-193`) — four string compares on its parameter; pure.
 - `metaFiltersSchema` (`:197-217`) — constructs and returns a fresh `json` from literals; pure.
-- `nativeToolDefinitions` (`:221-351`) — builds three fresh `json` objects from literals each call;
+- `nativeToolDefinitions` (`:221-351`) — builds four fresh `json` objects from literals each call;
   no statics, no globals; pure.
 - `dispatchNativeTool` (`:359-402`) — operates only on its parameters and stack locals
   (`argsJson`, `raw`, `envelopeStr`, `envelope`, `text`/`errText`); no shared state touched.
