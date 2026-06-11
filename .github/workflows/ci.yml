@@ -18,15 +18,66 @@ jobs:
         with:
           arch: x64
 
-      - name: Build DLL (Release)
+      # Git for Windows ships a GNU coreutils `link.exe` in usr/bin; under
+      # `shell: bash` it shadows the MSVC linker on PATH, so cargo/rustc link
+      # steps fail with a GNU `link` invoked on MSVC args. Remove it so cargo
+      # finds MSVC's link.exe.
+      - name: Remove GNU link.exe (shadows MSVC linker under bash)
+        shell: pwsh
+        run: |
+          $p = "C:\Program Files\Git\usr\bin\link.exe"
+          if (Test-Path $p) { Remove-Item $p -Force }
+
+      # The full (RAG) build produces the rcore.dll cdylib via `cargo build`
+      # (the lite C++ build needs no cargo), and the Rust-core tests below need
+      # cargo. Pin the toolchain for a deterministic, msvc-targeted build.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-core
+
+      - name: Test Rust core
+        shell: bash
+        run: cargo test --manifest-path rust-core/Cargo.toml
+
+      - name: Build DLL (Release, lite) + smoke harness
         shell: bash
         run: |
           cd http-1c-dll
           rm -rf build
           mkdir build
           cd build
-          cmake .. -G "Ninja" -DCMAKE_BUILD_TYPE=Release
+          cmake .. -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DHTTP1C_BUILD_TESTS=ON
           cmake --build .
+
+      # Black-box smoke: loads the freshly built bin/libhttp1cWin.dll the way
+      # 1C does (LoadLibrary + GetClassObject + stubbed 1C interfaces) and
+      # drives it over real HTTP (T1-T9: init, tools/list union, reserved-name
+      # rejection, session resurrection, auth races, timeout, UTF-8, native
+      # list_collections). rcore.dll is not in bin/ here, so the native tools
+      # exercise the structured rag_not_installed path.
+      - name: Run smoke harness (black-box, bin/libhttp1cWin.dll)
+        shell: bash
+        run: ./http-1c-dll/bin/http1c_smoke.exe
+
+      # Full ("RAG") build check: compile the rcore.dll cdylib with the
+      # fastembed feature and the dynamic CRT (ort/onnxruntime needs /MD). This
+      # catches fastembed/ort build breakage without re-running CMake. The model
+      # is fetched at runtime, so nothing is downloaded here. Rust is cached
+      # above (Swatinem/rust-cache), so this stays cheap after the first run.
+      - name: Build rcore.dll (fastembed, dynamic CRT)
+        shell: bash
+        env:
+          RUSTFLAGS: "-C target-feature=-crt-static"
+        run: |
+          cargo build --release --features fastembed \
+            --target x86_64-pc-windows-msvc \
+            --manifest-path rust-core/Cargo.toml
 
       - name: Build tests
         shell: bash

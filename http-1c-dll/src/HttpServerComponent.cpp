@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "HttpServerComponent.h"
 #include "ScreenCapture.h"
+#include "RustCore.h"
 
 #include "../version.h"
 
@@ -178,6 +179,277 @@ json paginateJsonArray(const json& arr, const json& params) {
 }
 
 // =========================================================================
+// Native search tools — served by the Rust core (rcore.dll, loaded at runtime
+// via RustCore.h), NOT forwarded to 1C. The component owns these tool names and
+// their JSON Schemas, so the search subsystem is self-contained regardless of
+// whether 1C declares them. The tool SURFACE is uniform across lite/full: lite
+// advertises the same tools but returns "install RAG" when they are called.
+// =========================================================================
+
+// True if `toolName` is handled natively by the Rust core (search subsystem).
+bool isNativeTool(const std::string& toolName) {
+    return toolName == "search" ||
+           toolName == "get_segment" ||
+           toolName == "grep" ||
+           toolName == "list_collections";
+}
+
+// Shared `filter` schema fragment (free key-value, OR via `any` / AND via
+// `all`; no domain-specific fields — the core stays generic). The property is
+// named `filter` to match what the Rust core parses (MetaFilter::parse reads
+// the top-level `filter` object); advertising `meta_filters` would be silently
+// ignored.
+json metaFiltersSchema() {
+    return json{
+        {"type", "object"},
+        {"description", "Optional metadata filters over free key-value pairs. "
+                        "`any` matches if ANY pair matches (OR); `all` requires "
+                        "ALL pairs to match (AND). Combinable."},
+        {"properties", {
+            {"any", {
+                {"type", "object"},
+                {"description", "OR filter: keep results matching any of these key-value pairs."},
+                {"additionalProperties", true}
+            }},
+            {"all", {
+                {"type", "object"},
+                {"description", "AND filter: keep results matching all of these key-value pairs."},
+                {"additionalProperties", true}
+            }},
+            {"tags_all", {
+                {"type", "array"},
+                {"items", {{"type", "string"}}},
+                {"description", "Require EVERY listed tag to be present in the hit's "
+                                "effective `tags` meta array."}
+            }},
+            {"tags_any", {
+                {"type", "array"},
+                {"items", {{"type", "string"}}},
+                {"description", "Require AT LEAST ONE of the listed tags to be present "
+                                "in the hit's effective `tags` meta array."}
+            }}
+        }},
+        {"additionalProperties", false}
+    };
+}
+
+// The native tool definitions ({name, description, inputSchema}) merged into
+// tools/list. Schemas follow the Stage-1/Stage-2 contracts (§4.1, §5.3, §5.4).
+json nativeToolDefinitions() {
+    json searchTool = {
+        {"name", "search"},
+        {"description", "Semantic/keyword/hybrid search over indexed segments. "
+                        "Returns ranked hits with doc_id, name, score and segment "
+                        "line ranges."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"query", {
+                    {"type", "string"},
+                    {"description", "Search query text."}
+                }},
+                {"collection", {
+                    {"type", "string"},
+                    {"description", "Restrict the search to a single collection. "
+                                    "When omitted, all collections are searched."}
+                }},
+                {"collections", {
+                    {"type", "array"},
+                    {"items", {{"type", "string"}}},
+                    {"description", "Search a subset of collections; takes precedence "
+                                    "over `collection`. Absent = all collections."}
+                }},
+                {"k", {
+                    {"type", "integer"},
+                    {"minimum", 1},
+                    {"description", "Maximum number of hits to return (default 10)."}
+                }},
+                {"mode", {
+                    {"type", "string"},
+                    {"enum", json::array({"dense", "keyword", "hybrid"})},
+                    {"description", "Retrieval mode: dense (vectors), keyword "
+                                    "(lexical) or hybrid (RRF fusion)."}
+                }},
+                {"min_score", {
+                    {"type", "number"},
+                    {"description", "Drop hits scoring below this threshold."}
+                }},
+                {"max_per_doc", {
+                    {"type", "integer"},
+                    {"minimum", 1},
+                    {"description", "Cap the number of hits returned per document."}
+                }},
+                {"include_text", {
+                    {"type", "boolean"},
+                    {"description", "Include the full segment text in each hit "
+                                    "(default true). When false a short preview is returned."}
+                }},
+                {"filter", metaFiltersSchema()}
+            }},
+            {"required", json::array({"query"})},
+            {"additionalProperties", false}
+        }}
+    };
+
+    json getSegmentTool = {
+        {"name", "get_segment"},
+        {"description", "Return a line range of an indexed document by O(1) offset "
+                        "lookup. Out-of-range requests are clamped and the actual "
+                        "range returned."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"doc_id", {
+                    {"type", "string"},
+                    {"description", "Identifier of the document to slice."}
+                }},
+                {"line_start", {
+                    {"type", "integer"},
+                    {"minimum", 1},
+                    {"description", "First line of the range (1-based, inclusive)."}
+                }},
+                {"line_end", {
+                    {"type", "integer"},
+                    {"minimum", 1},
+                    {"description", "Last line of the range (inclusive)."}
+                }},
+                {"max_lines", {
+                    {"type", "integer"},
+                    {"minimum", 1},
+                    {"description", "Optional hard cap on the number of lines returned."}
+                }}
+            }},
+            {"required", json::array({"doc_id", "line_start", "line_end"})},
+            {"additionalProperties", false}
+        }}
+    };
+
+    json grepTool = {
+        {"name", "grep"},
+        {"description", "Regex search (RE2 / linear time, no backreferences or "
+                        "lookaround) over indexed document text. Returns matching "
+                        "lines with optional context."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"pattern", {
+                    {"type", "string"},
+                    {"description", "RE2 regular expression to match against each line."}
+                }},
+                {"collection", {
+                    {"type", "string"},
+                    {"description", "Restrict the search to a single collection. "
+                                    "When omitted, all collections are searched."}
+                }},
+                {"ignore_case", {
+                    {"type", "boolean"},
+                    {"description", "Case-insensitive matching (default false)."}
+                }},
+                {"multiline", {
+                    {"type", "boolean"},
+                    {"description", "Multiline mode: ^ and $ match at line boundaries."}
+                }},
+                {"context_lines", {
+                    {"type", "integer"},
+                    {"minimum", 0},
+                    {"description", "Number of context lines to include before and "
+                                    "after each match."}
+                }},
+                {"max_matches", {
+                    {"type", "integer"},
+                    {"minimum", 1},
+                    {"description", "Stop after this many total matches; sets `truncated`."}
+                }},
+                {"max_per_doc", {
+                    {"type", "integer"},
+                    {"minimum", 1},
+                    {"description", "Cap the number of matches returned per document."}
+                }},
+                {"filter", metaFiltersSchema()}
+            }},
+            {"required", json::array({"pattern"})},
+            {"additionalProperties", false}
+        }}
+    };
+
+    json listCollectionsTool = {
+        {"name", "list_collections"},
+        {"description", "List the searchable collections: name, human description "
+                        "of what each one holds, document/segment counts and state "
+                        "(text_ready; vector_status building/ready). Call this first "
+                        "to choose the `collection` argument for search/grep."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", json::object()},
+            {"additionalProperties", false}
+        }}
+    };
+
+    return json::array({searchTool, getSegmentTool, grepTool, listCollectionsTool});
+}
+
+// Call the Rust core for a native tool and turn its envelope into an MCP
+// tools/call result: {"content":[{"type":"text","text":<payload>}],
+// "isError":<bool>}. The text carries the inner `result` on success, or the
+// `error` object on failure — tool errors are STRUCTURAL results, never a
+// transport/session failure. Exception/panic-safe: any parse problem degrades
+// to a structured isError result rather than throwing.
+//
+// rcore.dll is loaded at RUNTIME (see RustCore.h). When it's absent — the "lite"
+// component — every native tool returns a structured `rag_not_installed` result
+// telling the caller to install the RAG (full) package.
+json dispatchNativeTool(const std::string& toolName, const json& arguments) {
+    if (!RCore::available()) {
+        return makeTextToolResult(
+            R"({"code":"rag_not_installed","message":"Semantic search backend (rcore.dll) is not installed — this is the lite component. Install the RAG package to enable search/grep/get_segment/list_collections."})",
+            true);
+    }
+
+    std::string argsJson;
+    try {
+        argsJson = arguments.is_null() ? std::string("{}") : arguments.dump();
+    } catch (...) {
+        argsJson = "{}";
+    }
+
+    RustString raw = RCore::dispatch(toolName, argsJson);
+    std::string envelopeStr = raw.str();
+
+    if (envelopeStr.empty()) {
+        return makeTextToolResult(
+            R"({"code":"internal","message":"rust core returned an empty response"})",
+            true);
+    }
+
+    json envelope = json::parse(envelopeStr, nullptr, false);
+    if (envelope.is_discarded() || !envelope.is_object()) {
+        // The core promises well-formed JSON; if that ever breaks, surface the
+        // raw body as a structured tool error instead of crashing.
+        return makeTextToolResult(envelopeStr, true);
+    }
+
+    bool ok = envelope.value("ok", false);
+    if (ok) {
+        std::string text;
+        if (envelope.contains("result")) {
+            text = envelope["result"].dump();
+        } else {
+            text = "null";
+        }
+        return makeTextToolResult(text, false);
+    }
+
+    // Failure envelope: emit the structured error object as the tool result text.
+    std::string errText;
+    if (envelope.contains("error")) {
+        errText = envelope["error"].dump();
+    } else {
+        errText = R"({"code":"internal","message":"rust core reported failure without an error body"})";
+    }
+    return makeTextToolResult(errText, true);
+}
+
+// =========================================================================
 // Origin validation for DNS rebinding protection.
 // Allowed origins: localhost variants only.
 // =========================================================================
@@ -222,6 +494,22 @@ std::string HttpServerComponent::generateSessionId() {
     return std::string(buf);
 }
 
+// Evict least-recently-active sessions until the map is below MAX_SESSIONS.
+// Linear scan is fine at this size; callers hold sessionMutex.
+void HttpServerComponent::evictSessionsIfFullLocked() {
+    while (sessions.size() >= MAX_SESSIONS) {
+        auto lru = sessions.begin();
+        for (auto it = sessions.begin(); it != sessions.end(); ++it) {
+            if (it->second->lastActivity < lru->second->lastActivity) {
+                lru = it;
+            }
+        }
+        logToFile("MCP: session cap (" + std::to_string(MAX_SESSIONS)
+            + ") reached - evicting LRU session " + lru->first);
+        sessions.erase(lru);
+    }
+}
+
 std::string HttpServerComponent::createSession(const std::string& protocolVersion) {
     auto session = std::make_shared<McpSession>();
     session->sessionId = generateSessionId();
@@ -231,6 +519,7 @@ std::string HttpServerComponent::createSession(const std::string& protocolVersio
     session->lastActivity = session->createdAt;
 
     std::lock_guard<std::mutex> lock(sessionMutex);
+    evictSessionsIfFullLocked();
     sessions[session->sessionId] = session;
     return session->sessionId;
 }
@@ -261,11 +550,12 @@ bool HttpServerComponent::validateOrigin(const httplib::Request& req, httplib::R
 }
 
 bool HttpServerComponent::validateAuth(const httplib::Request& req, httplib::Response& res) {
-    if (authToken.empty()) return true; // No auth configured
+    const std::string token = authTokenCopy(); // snapshot: ApplyConfig may rewrite it concurrently
+    if (token.empty()) return true; // No auth configured
 
     std::string auth = req.get_header_value("Authorization");
     if (auth.size() > 7 && auth.substr(0, 7) == "Bearer ") {
-        if (auth.substr(7) == authToken) return true;
+        if (auth.substr(7) == token) return true;
     }
 
     logToFile("SECURITY: Unauthorized request");
@@ -345,49 +635,18 @@ HttpServerComponent::HttpServerComponent()
             logToFile("Log path set to: " + this->logPath);
         });
 
-    // Operational status of the native listener (read-only property).
+    // Operational status of the native listener (read-only property). Async
+    // callers use the GetStatus function (property reads are blocked in
+    // async-only infobases). Both share buildStatusJson().
     AddProperty(u"Status", u"Статус",
-        [&](VH var) {
-            json status;
-            status["running"] = running.load();
-            status["port"] = listenPort;
-            {
-                std::lock_guard<std::mutex> lock(pendingMutex);
-                status["pending_requests"] = (int)pendingRequests.size();
-            }
-            {
-                std::lock_guard<std::mutex> lock(toolsMutex);
-                json tools = json::parse(cachedToolsJson, nullptr, false);
-                status["tools_registered"] = tools.is_array() ? (int)tools.size() : 0;
-            }
-            {
-                std::lock_guard<std::mutex> lock(resourcesMutex);
-                json res = json::parse(cachedResourcesJson, nullptr, false);
-                status["resources_registered"] = res.is_array() ? (int)res.size() : 0;
-            }
-            {
-                std::lock_guard<std::mutex> lock(promptsMutex);
-                json pr = json::parse(cachedPromptsJson, nullptr, false);
-                status["prompts_registered"] = pr.is_array() ? (int)pr.size() : 0;
-            }
-            {
-                std::lock_guard<std::mutex> lock(sessionMutex);
-                status["active_sessions"] = (int)sessions.size();
-            }
-            {
-                std::lock_guard<std::mutex> lock(loggingMutex);
-                status["logging_enabled"] = loggingEnabled;
-                status["log_path"] = logPath;
-            }
-            status["auth_enabled"] = !authToken.empty();
-            status["version"] = VERSION_SEMVER;
-            var = MB2WCHAR(status.dump());
-        });
+        [&](VH var) { var = MB2WCHAR(this->buildStatusJson()); });
 
     // Timeout applied to in-flight forwarded requests (read/write property).
     AddProperty(u"Timeout", u"Таймаут",
-        [&](VH var) { var = (int64_t)this->timeout; },
-        [&](VH var) { this->timeout = (int)(int64_t)var; });
+        [&](VH var) { var = (int64_t)this->timeout.load(); },
+        // Same clamp as ApplyConfig: a non-positive timeout would fail every
+        // forwarded call instantly.
+        [&](VH var) { this->timeout.store(std::max(1, (int)(int64_t)var)); });
 
     // Tool definitions cache (write-only property; expects JSON array).
     AddProperty(u"Tools", u"Инструменты",
@@ -408,6 +667,59 @@ HttpServerComponent::HttpServerComponent()
     AddProperty(u"AuthToken", u"ТокенАвторизации",
         nullptr,
         [&](VH var) { this->doSetAuthToken((std::u16string)var); });
+
+    // Drive the Rust search core (rcore.dll) directly from 1C — the ingest/admin
+    // methods that are NOT MCP tools: configure, index_segments, index_raw,
+    // stats, reset, delete_document, delete_collection. (search / get_segment /
+    // grep stay served by the component itself inside tools/call and are NOT
+    // routed here.) Returns the rcore JSON envelope verbatim:
+    //   {"ok":true,"result":...}  /  {"ok":false,"error":{"code","message"}}
+    // On the lite component (rcore.dll absent) returns a rag_not_installed
+    // envelope so the 1C side can detect it and prompt to install the RAG package.
+    AddFunction(u"RagDispatch", u"RagВыполнить",
+        [&](VH method, VH payload) {
+            std::u16string method16 = (std::u16string)method;
+            std::u16string payload16 = (std::u16string)payload;
+            std::string methodUtf8 = WCHAR2MB(std::basic_string_view<WCHAR_T>(
+                reinterpret_cast<const WCHAR_T*>(method16.data()), method16.size()));
+            std::string payloadUtf8 = WCHAR2MB(std::basic_string_view<WCHAR_T>(
+                reinterpret_cast<const WCHAR_T*>(payload16.data()), payload16.size()));
+            if (payloadUtf8.empty()) {
+                payloadUtf8 = "{}";
+            }
+
+            std::string envelope;
+            if (!RCore::available()) {
+                envelope =
+                    R"({"ok":false,"error":{"code":"rag_not_installed","message":"Semantic search backend (rcore.dll) is not installed — this is the lite component. Install the RAG (full) package to enable search."}})";
+            } else {
+                RustString raw = RCore::dispatch(methodUtf8, payloadUtf8);
+                envelope = raw.str();
+                if (envelope.empty()) {
+                    envelope =
+                        R"({"ok":false,"error":{"code":"internal","message":"rust core returned an empty response"}})";
+                }
+            }
+            this->result = MB2WCHAR(envelope);
+        },
+        {{1, std::u16string(u"{}")}});
+
+    // Async configuration sink. 1C cannot set component properties in
+    // async-only infobases (synchronous extension calls disabled), so the form
+    // funnels logging/timeout/tools/resources/prompts/auth through this single
+    // async procedure. Payload is a JSON object; every field is optional:
+    //   {"logging_enabled":bool,"log_path":str,"timeout":int,
+    //    "tools_json":str,"resources_json":str,"prompts_json":str,
+    //    "auth_token":str}
+    // The *_json fields are pre-serialized JSON arrays (forwarded verbatim to
+    // the existing register handlers).
+    AddProcedure(u"ApplyConfig", u"ПрименитьНастройки",
+        [&](VH cfg) { this->doApplyConfig((std::u16string)cfg); });
+
+    // Async status read (the Status property is unreadable in async-only
+    // infobases). Returns the same JSON as the Status property.
+    AddFunction(u"GetStatus", u"ПолучитьСтатус",
+        [&]() { this->result = MB2WCHAR(this->buildStatusJson()); });
 
     // Capture screenshots of all visible windows belonging to a process.
     // pid=0 means current process. Returns base64-encoded images.
@@ -497,7 +809,7 @@ void HttpServerComponent::doStartListen(int port)
         {
             std::unique_lock<std::mutex> lock(pending->mtx);
             bool gotResponse = pending->cv.wait_for(lock,
-                std::chrono::seconds(timeout),
+                std::chrono::seconds(timeout.load()),
                 [&] { return pending->ready.load(); });
 
             if (gotResponse) {
@@ -606,6 +918,15 @@ void HttpServerComponent::doStopListen()
     if (serverThread.joinable()) {
         serverThread.join();
     }
+
+    // The listener is fully stopped, so no worker thread can still be inside the
+    // native search path (RCore::dispatch). Now it is safe to cancel + join the
+    // Rust core's background worker so it isn't running when the DLL unloads.
+    // Best-effort and idempotent by contract; a no-op if rcore.dll was never
+    // loaded (lite component). Hooked here (server stop / form close), NOT in
+    // ~HttpServerComponent — the Rust singleton is process-global and outlives
+    // any single component instance.
+    RCore::shutdown();
 
     delete server;
     server = nullptr;
@@ -764,10 +1085,23 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
     if (!sessionId.empty()) {
         auto session = findSession(sessionId);
         if (!session) {
-            logToFile("MCP: invalid session " + sessionId);
-            res.status = 404;
-            res.set_content(R"({"error":"Session not found"})", "application/json");
-            return;
+            // Unknown id usually means the server restarted and the client kept
+            // its old session. The spec answer is 404 + client re-initialize,
+            // but common IDE clients don't re-init and every call then looks
+            // "hung" to the user. Sessions carry no negotiated state we depend
+            // on, so transparently resurrect the presented id instead.
+            session = std::make_shared<McpSession>();
+            session->sessionId = sessionId;
+            session->protocolVersion = MCP_PROTOCOL_VERSION;
+            session->initialized = true;
+            session->createdAt = std::chrono::steady_clock::now();
+            session->lastActivity = session->createdAt;
+            {
+                std::lock_guard<std::mutex> lock(sessionMutex);
+                evictSessionsIfFullLocked();
+                sessions[sessionId] = session;
+            }
+            logToFile("MCP: unknown session " + sessionId + " resurrected (server restart?)");
         }
     }
 
@@ -801,6 +1135,27 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
             tools = json::parse(cachedToolsJson, nullptr, false);
             if (tools.is_discarded()) tools = json::array();
         }
+        if (!tools.is_array()) tools = json::array();
+
+        // Merge the native search-tool schemas owned by this component. The
+        // search subsystem is self-contained: these are always present even if
+        // 1C never registers them. RegisterTools REJECTS reserved native names
+        // with an explicit error, so the dedupe below is defense-in-depth only
+        // (e.g. a cache written by an older component build): native wins, to
+        // stay consistent with tools/call routing. Pagination applies to the
+        // union.
+        {
+            json merged = json::array();
+            for (auto& t : tools) {
+                const std::string name =
+                    t.is_object() ? t.value("name", std::string()) : std::string();
+                if (!isNativeTool(name)) merged.push_back(std::move(t));
+            }
+            for (auto& def : nativeToolDefinitions()) {
+                merged.push_back(std::move(def));
+            }
+            tools = std::move(merged);
+        }
 
         json page = paginateJsonArray(tools, params);
 
@@ -829,6 +1184,35 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
             res.set_content(
                 makeJsonRpcError(rpcId, -32602, "Missing tool name in params").dump(),
                 "application/json");
+            return;
+        }
+
+        // ---- Native search tools: served by the Rust core, synchronously ----
+        // search / get_segment / grep are handled here and NOT forwarded to 1C.
+        // Tool-level errors come back as a structural isError result, so a bad
+        // regex or missing doc_id never tears down the transport/session.
+        if (isNativeTool(toolName)) {
+            logToFile("MCP -> tools/call (native): " + toolName);
+
+            json toolResult;
+            try {
+                toolResult = dispatchNativeTool(toolName, toolArgs);
+            } catch (const std::exception& e) {
+                toolResult = makeTextToolResult(
+                    std::string(R"({"code":"internal","message":"native tool dispatch threw: )") +
+                        e.what() + R"("})",
+                    true);
+            } catch (...) {
+                toolResult = makeTextToolResult(
+                    R"({"code":"internal","message":"native tool dispatch threw an unknown exception"})",
+                    true);
+            }
+
+            json rpcResp;
+            rpcResp["jsonrpc"] = "2.0";
+            rpcResp["id"] = rpcId;
+            rpcResp["result"] = toolResult;
+            res.set_content(rpcResp.dump(), "application/json");
             return;
         }
 
@@ -861,7 +1245,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
                 [this, pending](size_t, httplib::DataSink& sink) {
                     std::unique_lock<std::mutex> lock(pending->mtx);
                     bool hasData = pending->cv.wait_for(lock,
-                        std::chrono::seconds(timeout),
+                        std::chrono::seconds(timeout.load()),
                         [&] {
                             return !pending->sseMessages.empty() || pending->streamCompleted;
                         });
@@ -871,7 +1255,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
                             makeJsonRpcToolResponse(pending->rpcIdJson,
                                 makeTextToolResult(
                                     "Timeout: 1C did not respond within " +
-                                    std::to_string(timeout) + " seconds.",
+                                    std::to_string(timeout.load()) + " seconds.",
                                     true))));
                         pending->streamCompleted = true;
                     }
@@ -906,7 +1290,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
         {
             std::unique_lock<std::mutex> lock(pending->mtx);
             bool gotResponse = pending->cv.wait_for(lock,
-                std::chrono::seconds(timeout),
+                std::chrono::seconds(timeout.load()),
                 [&] { return pending->ready.load(); });
 
             if (gotResponse) {
@@ -926,7 +1310,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
                 rpcResp["result"] = {
                     {"isError", true},
                     {"content", {{{"type", "text"}, {"text",
-                        "Timeout: 1C did not respond within " + std::to_string(timeout) + " seconds"}}}}
+                        "Timeout: 1C did not respond within " + std::to_string(timeout.load()) + " seconds"}}}}
                 };
             }
         }
@@ -997,7 +1381,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
         {
             std::unique_lock<std::mutex> lock(pending->mtx);
             bool gotResponse = pending->cv.wait_for(lock,
-                std::chrono::seconds(timeout),
+                std::chrono::seconds(timeout.load()),
                 [&] { return pending->ready.load(); });
 
             json rpcResp;
@@ -1019,7 +1403,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
                 }
             } else {
                 rpcResp["error"] = {{"code", -32000},
-                    {"message", "Timeout: 1C did not respond within " + std::to_string(timeout) + " seconds"}};
+                    {"message", "Timeout: 1C did not respond within " + std::to_string(timeout.load()) + " seconds"}};
             }
 
             res.set_content(rpcResp.dump(), "application/json");
@@ -1090,7 +1474,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
         {
             std::unique_lock<std::mutex> lock(pending->mtx);
             bool gotResponse = pending->cv.wait_for(lock,
-                std::chrono::seconds(timeout),
+                std::chrono::seconds(timeout.load()),
                 [&] { return pending->ready.load(); });
 
             json rpcResp;
@@ -1111,7 +1495,7 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
                 }
             } else {
                 rpcResp["error"] = {{"code", -32000},
-                    {"message", "Timeout: 1C did not respond within " + std::to_string(timeout) + " seconds"}};
+                    {"message", "Timeout: 1C did not respond within " + std::to_string(timeout.load()) + " seconds"}};
             }
 
             res.set_content(rpcResp.dump(), "application/json");
@@ -1269,6 +1653,29 @@ void HttpServerComponent::doRegisterTools(const std::u16string& jsonStr)
         return;
     }
 
+    // Reserved names: the native search subsystem owns search/grep/get_segment/
+    // list_collections, and tools/call routes them to the Rust core BEFORE the
+    // 1C registry — a 1C tool with such a name would be unreachable. Fail the
+    // registration LOUDLY (1C gets an exception) so the developer renames the
+    // tool instead of silently losing it.
+    std::string reserved;
+    for (const auto& t : tools) {
+        const std::string name =
+            t.is_object() ? t.value("name", std::string()) : std::string();
+        if (isNativeTool(name)) {
+            if (!reserved.empty()) reserved += ", ";
+            reserved += name;
+        }
+    }
+    if (!reserved.empty()) {
+        const std::string msg =
+            "RegisterTools: tool name(s) reserved by the native search subsystem: "
+            + reserved + ". Rename them; registration rejected, tool cache unchanged.";
+        logToFile(msg);
+        AddError(MB2WCHAR(msg));
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock(toolsMutex);
         cachedToolsJson = utf8;
@@ -1333,6 +1740,114 @@ void HttpServerComponent::doSetAuthToken(const std::u16string& token)
     std::string utf8 = WCHAR2MB(std::basic_string_view<WCHAR_T>(
         reinterpret_cast<const WCHAR_T*>(token.data()), token.size()));
 
-    authToken = utf8;
+    {
+        std::lock_guard<std::mutex> lock(authTokenMutex);
+        authToken = utf8;
+    }
     logToFile("Auth token " + std::string(utf8.empty() ? "disabled" : "set"));
+}
+
+// Build the operational-status JSON. Shared by the Status property (sync) and
+// the GetStatus function (async); the only difference is who reads it.
+std::string HttpServerComponent::buildStatusJson()
+{
+    json status;
+    status["running"] = running.load();
+    status["port"] = listenPort;
+    {
+        std::lock_guard<std::mutex> lock(pendingMutex);
+        status["pending_requests"] = (int)pendingRequests.size();
+    }
+    {
+        std::lock_guard<std::mutex> lock(toolsMutex);
+        json tools = json::parse(cachedToolsJson, nullptr, false);
+        status["tools_registered"] = tools.is_array() ? (int)tools.size() : 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(resourcesMutex);
+        json res = json::parse(cachedResourcesJson, nullptr, false);
+        status["resources_registered"] = res.is_array() ? (int)res.size() : 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(promptsMutex);
+        json pr = json::parse(cachedPromptsJson, nullptr, false);
+        status["prompts_registered"] = pr.is_array() ? (int)pr.size() : 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(sessionMutex);
+        status["active_sessions"] = (int)sessions.size();
+    }
+    {
+        std::lock_guard<std::mutex> lock(loggingMutex);
+        status["logging_enabled"] = loggingEnabled;
+        status["log_path"] = logPath;
+    }
+    status["auth_enabled"] = !authTokenCopy().empty();
+    status["version"] = VERSION_SEMVER;
+    return status.dump();
+}
+
+// Apply a batch of configuration in one async call. Each field is optional;
+// only present keys are touched. This mirrors the per-property setters but is
+// reachable from async-only infobases where property assignment is forbidden.
+void HttpServerComponent::doApplyConfig(const std::u16string& jsonStr)
+{
+    std::string utf8 = WCHAR2MB(std::basic_string_view<WCHAR_T>(
+        reinterpret_cast<const WCHAR_T*>(jsonStr.data()), jsonStr.size()));
+
+    json cfg = json::parse(utf8, nullptr, false);
+    if (cfg.is_discarded() || !cfg.is_object()) {
+        AddError(u"ApplyConfig: expected a JSON object");
+        return;
+    }
+
+    if (cfg.contains("logging_enabled") && cfg["logging_enabled"].is_boolean()) {
+        bool enabled = cfg["logging_enabled"].get<bool>();
+        {
+            std::lock_guard<std::mutex> lock(loggingMutex);
+            loggingEnabled = enabled;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_loggingMutex);
+            g_loggingEnabled = enabled;
+        }
+        logToFile("Logging " + std::string(enabled ? "enabled" : "disabled"));
+    }
+
+    if (cfg.contains("log_path") && cfg["log_path"].is_string()) {
+        std::string p = cfg["log_path"].get<std::string>();
+        if (p.empty()) {
+            p = getDefaultLogPath();
+        }
+        {
+            std::lock_guard<std::mutex> lock(loggingMutex);
+            logPath = p;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_loggingMutex);
+            g_logPath = p;
+        }
+        logToFile("Log path set to: " + p);
+    }
+
+    if (cfg.contains("timeout") && cfg["timeout"].is_number_integer()) {
+        // Non-positive values would make every forwarded call "time out"
+        // instantly (wait_for(seconds(0)) returns immediately) — a
+        // hard-to-diagnose misconfiguration. Clamp to >= 1 second.
+        timeout.store(std::max(1, cfg["timeout"].get<int>()));
+    }
+
+    // Pre-serialized JSON arrays — forward verbatim to the existing handlers.
+    if (cfg.contains("tools_json") && cfg["tools_json"].is_string()) {
+        doRegisterTools(MB2WCHAR(cfg["tools_json"].get<std::string>()));
+    }
+    if (cfg.contains("resources_json") && cfg["resources_json"].is_string()) {
+        doRegisterResources(MB2WCHAR(cfg["resources_json"].get<std::string>()));
+    }
+    if (cfg.contains("prompts_json") && cfg["prompts_json"].is_string()) {
+        doRegisterPrompts(MB2WCHAR(cfg["prompts_json"].get<std::string>()));
+    }
+    if (cfg.contains("auth_token") && cfg["auth_token"].is_string()) {
+        doSetAuthToken(MB2WCHAR(cfg["auth_token"].get<std::string>()));
+    }
 }

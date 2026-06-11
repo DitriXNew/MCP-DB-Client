@@ -1,0 +1,67 @@
+[package]
+name = "rcore"
+version = "0.1.0"
+edition = "2021"
+description = "Semantic + regex search core for the 1C MCP component, exposed over a C ABI (JSON in / JSON out)."
+license = "MIT"
+publish = false
+
+[lib]
+# Single output shape: cdylib (rcore.dll).
+#   ort/onnxruntime requires the dynamic CRT (/MD), but the 1C C++ component
+#   cannot compile under /MD (char16_t streams hit MSVC C2491). So the real
+#   embedder ships as a separate rcore.dll (built /MD, self-contained static
+#   onnxruntime) that the /MT component does NOT link: it loads rcore.dll at
+#   runtime via LoadLibrary + GetProcAddress (see http-1c-dll/src/RustCore.h).
+#   One libhttp1cWin.dll therefore serves both packages — "lite" (no rcore.dll,
+#   search returns "install RAG") and "full" (with rcore.dll, real search). The
+#   FFI ownership convention (rcore_free_string frees Rust-side) keeps the
+#   cross-DLL string boundary safe. The full build is gated by RCORE_FASTEMBED.
+name = "rcore"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Keep the dependency surface minimal for Stage 0. Heavy ML deps
+# (fastembed / ort / tokenizers) are intentionally deferred to Stage 1.
+# Exact versions are pinned ("=x.y.z") so the skeleton build is reproducible.
+serde = { version = "=1.0.219", features = ["derive"] }
+serde_json = "=1.0.140"
+once_cell = "=1.21.3"
+# RE2-style regex engine (finite automata): linear-time matching, no
+# backreferences/lookaround, so user-supplied `grep` patterns can't trigger
+# catastrophic backtracking (ReDoS). Used by the `grep` dispatch method.
+regex = "=1.12.3"
+
+# --- Real embedder (feature-gated) -------------------------------------------
+# fastembed pulls in onnxruntime (ort) + tokenizers — a heavy native stack we do
+# NOT want compiled for the fast, mock-only `cargo test`. It is therefore an
+# OPTIONAL dependency behind the `fastembed` feature (NOT default): the existing
+# 83 unit tests compile/run without ort, and only `cargo test --features
+# fastembed` (or a `--features fastembed` release build) compiles the real path.
+# Pinned exactly to the versions verified working on this machine.
+fastembed = { version = "=5.16.0", optional = true }
+# fastembed's `embed` returns `anyhow::Result`; only needed on the real path.
+anyhow = { version = "=1.0.99", optional = true }
+# onnxruntime bindings, re-exported by fastembed. We name `ort` directly ONLY so
+# we can spell the EP type `ort::ep::DirectML` when building the GPU execution-
+# provider list. Pinned to the EXACT version fastembed depends on
+# (=2.0.0-rc.12) so feature unification reuses a single ort build. Optional and
+# behind the `fastembed` feature → the mock build never compiles ort.
+ort = { version = "=2.0.0-rc.12", optional = true }
+
+[features]
+# Off by default. Enabling it compiles the real FastEmbedder (ort + tokenizers)
+# and wires `configure` to select it when the caller asks for a real model.
+default = []
+# `fastembed/directml` turns on fastembed's DirectML path (it auto-sets the
+# DML-required session opts — memory_pattern(false) + parallel_execution(false)
+# — when a DirectML EP is registered). `dep:ort` + `ort/directml` make the
+# `ort::ep::DirectML` type available so we can build the EP list ourselves.
+# These are additive: fastembed already enables `ort/download-binaries`.
+fastembed = ["dep:fastembed", "dep:anyhow", "dep:ort", "fastembed/directml", "ort/directml"]
+
+[profile.release]
+# A search core is hot-path code; favour optimized release builds.
+opt-level = 3
+lto = true
+codegen-units = 1
