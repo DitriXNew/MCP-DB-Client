@@ -26,11 +26,19 @@
 					<v8:lang>ru</v8:lang>
 					<v8:content>Группа верх</v8:content>
 				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Top group</v8:content>
+				</v8:item>
 			</Title>
 			<ToolTip>
 				<v8:item>
 					<v8:lang>ru</v8:lang>
 					<v8:content>Группа верх</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Top group</v8:content>
 				</v8:item>
 			</ToolTip>
 			<Group>AlwaysHorizontal</Group>
@@ -44,11 +52,19 @@
 							<v8:lang>ru</v8:lang>
 							<v8:content>Группа лево</v8:content>
 						</v8:item>
+						<v8:item>
+							<v8:lang>en</v8:lang>
+							<v8:content>Left group</v8:content>
+						</v8:item>
 					</Title>
 					<ToolTip>
 						<v8:item>
 							<v8:lang>ru</v8:lang>
 							<v8:content>Группа лево</v8:content>
+						</v8:item>
+						<v8:item>
+							<v8:lang>en</v8:lang>
+							<v8:content>Left group</v8:content>
 						</v8:item>
 					</ToolTip>
 					<Representation>None</Representation>
@@ -60,6 +76,10 @@
 								<v8:item>
 									<v8:lang>ru</v8:lang>
 									<v8:content>Управление</v8:content>
+								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>Control</v8:content>
 								</v8:item>
 							</Title>
 							<Group>Vertical</Group>
@@ -75,11 +95,19 @@
 											<v8:lang>ru</v8:lang>
 											<v8:content>Режим работы</v8:content>
 										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Mode</v8:content>
+										</v8:item>
 									</Title>
 									<ToolTip>
 										<v8:item>
 											<v8:lang>ru</v8:lang>
 											<v8:content>MCP — компонента обслуживает инструменты Vanessa Automation. MCP+RAG — дополнительно семантический поиск по шагам (нужны rcore.dll и модель эмбеддинга).</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>MCP — the add-in serves Vanessa Automation tools. MCP+RAG — additionally semantic search over steps (requires rcore.dll and an embedding model).</v8:content>
 										</v8:item>
 									</ToolTip>
 									<RadioButtonType>Tumbler</RadioButtonType>
@@ -155,6 +183,10 @@
 											<v8:lang>ru</v8:lang>
 											<v8:content>Сервер</v8:content>
 										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Server</v8:content>
+										</v8:item>
 									</Title>
 									<HorizontalStretch>true</HorizontalStretch>
 									<ContextMenu name="СтатусСервераContextMenu" id="30"/>
@@ -168,6 +200,10 @@
 											<v8:lang>ru</v8:lang>
 											<v8:content>Индексация</v8:content>
 										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Indexing</v8:content>
+										</v8:item>
 									</Title>
 									<HorizontalStretch>true</HorizontalStretch>
 									<ContextMenu name="СтатусИндексацииContextMenu" id="33"/>
@@ -180,6 +216,10 @@
 										<v8:item>
 											<v8:lang>ru</v8:lang>
 											<v8:content>Инструментов</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Tools</v8:content>
 										</v8:item>
 									</Title>
 									<Width>10</Width>
@@ -195,6 +235,10 @@
 									<v8:lang>ru</v8:lang>
 									<v8:content>Настройки сервера</v8:content>
 								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>Server settings</v8:content>
+								</v8:item>
 							</Title>
 							<Group>Vertical</Group>
 							<Behavior>Usual</Behavior>
@@ -209,11 +253,19 @@
 											<v8:lang>ru</v8:lang>
 											<v8:content>Порт</v8:content>
 										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Port</v8:content>
+										</v8:item>
 									</Title>
 									<ToolTip>
 										<v8:item>
 											<v8:lang>ru</v8:lang>
 											<v8:content>TCP-порт MCP сервера. ИИ-агент подключается к http://localhost:&lt;порт&gt;/mcp</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>TCP port of the MCP server. The AI agent connects to http://localhost:&lt;port&gt;/mcp</v8:content>
 										</v8:item>
 									</ToolTip>
 									<Width>8</Width>
@@ -221,6 +273,10 @@
 									<InputHint>
 										<v8:item>
 											<v8:lang>ru</v8:lang>
+											<v8:content>8765</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
 											<v8:content>8765</v8:content>
 										</v8:item>
 									</InputHint>
@@ -234,11 +290,19 @@
 											<v8:lang>ru</v8:lang>
 											<v8:content>Каталог компоненты</v8:content>
 										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Add-in directory</v8:content>
+										</v8:item>
 									</Title>
 									<ToolTip>
 										<v8:item>
 											<v8:lang>ru</v8:lang>
 											<v8:content>Распакованный бандл http1c-addin-full.zip. Компонента подключается прямо из этой папки (in-place), чтобы rcore.dll был рядом.</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Unpacked http1c-addin-full.zip bundle. The add-in is attached directly from this folder (in-place) so that rcore.dll is next to it.</v8:content>
 										</v8:item>
 									</ToolTip>
 									<HorizontalStretch>true</HorizontalStretch>
@@ -247,6 +311,10 @@
 										<v8:item>
 											<v8:lang>ru</v8:lang>
 											<v8:content>Папка с libhttp1cWin.dll, rcore.dll, DirectML.dll</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Folder with libhttp1cWin.dll, rcore.dll, DirectML.dll</v8:content>
 										</v8:item>
 									</InputHint>
 									<ContextMenu name="КаталогКомпонентыContextMenu" id="43"/>
@@ -267,11 +335,19 @@
 													<v8:lang>ru</v8:lang>
 													<v8:content>Скачать компоненту (последний релиз)</v8:content>
 												</v8:item>
+												<v8:item>
+													<v8:lang>en</v8:lang>
+													<v8:content>Download the add-in (latest release)</v8:content>
+												</v8:item>
 											</Title>
 											<ToolTip>
 												<v8:item>
 													<v8:lang>ru</v8:lang>
 													<v8:content>Скачивает http1c-addin-full.zip (libhttp1cWin.dll + rcore.dll + DirectML.dll) из последнего релиза. Если прямая ссылка не работает — откройте страницу релизов: https://github.com/DitriXNew/MCP-DB-Client/releases</v8:content>
+												</v8:item>
+												<v8:item>
+													<v8:lang>en</v8:lang>
+													<v8:content>Downloads http1c-addin-full.zip (libhttp1cWin.dll + rcore.dll + DirectML.dll) from the latest release. If the direct link does not work, open the releases page: https://github.com/DitriXNew/MCP-DB-Client/releases</v8:content>
 												</v8:item>
 											</ToolTip>
 											<Hyperlink>true</Hyperlink>
@@ -295,11 +371,19 @@
 											<v8:lang>ru</v8:lang>
 											<v8:content>Токен авторизации</v8:content>
 										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Authorization token</v8:content>
+										</v8:item>
 									</Title>
 									<ToolTip>
 										<v8:item>
 											<v8:lang>ru</v8:lang>
 											<v8:content>Если задан, клиент обязан передавать заголовок Authorization: Bearer &lt;токен&gt;.</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>If set, the client must send the Authorization: Bearer &lt;token&gt; header.</v8:content>
 										</v8:item>
 									</ToolTip>
 									<HorizontalStretch>true</HorizontalStretch>
@@ -307,6 +391,10 @@
 										<v8:item>
 											<v8:lang>ru</v8:lang>
 											<v8:content>(необязательно)</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>(optional)</v8:content>
 										</v8:item>
 									</InputHint>
 									<ContextMenu name="ТокенАвторизацииContextMenu" id="46"/>
@@ -319,11 +407,19 @@
 											<v8:lang>ru</v8:lang>
 											<v8:content>Вести лог</v8:content>
 										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Enable logging</v8:content>
+										</v8:item>
 									</Title>
 									<ToolTip>
 										<v8:item>
 											<v8:lang>ru</v8:lang>
 											<v8:content>Писать лог компоненты (укажите файл ниже).</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Write the add-in log (specify the file below).</v8:content>
 										</v8:item>
 									</ToolTip>
 									<ContextMenu name="ВестиЛогContextMenu" id="49"/>
@@ -336,11 +432,19 @@
 											<v8:lang>ru</v8:lang>
 											<v8:content>Файл лога</v8:content>
 										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Log file</v8:content>
+										</v8:item>
 									</Title>
 									<ToolTip>
 										<v8:item>
 											<v8:lang>ru</v8:lang>
 											<v8:content>Полный путь к файлу лога компоненты.</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Full path to the add-in log file.</v8:content>
 										</v8:item>
 									</ToolTip>
 									<HorizontalStretch>true</HorizontalStretch>
@@ -348,6 +452,10 @@
 									<InputHint>
 										<v8:item>
 											<v8:lang>ru</v8:lang>
+											<v8:content>C:\temp\http1c.log</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
 											<v8:content>C:\temp\http1c.log</v8:content>
 										</v8:item>
 									</InputHint>
@@ -367,6 +475,10 @@
 							<v8:lang>ru</v8:lang>
 							<v8:content>Семантический поиск (RAG)</v8:content>
 						</v8:item>
+						<v8:item>
+							<v8:lang>en</v8:lang>
+							<v8:content>Semantic search (RAG)</v8:content>
+						</v8:item>
 					</Title>
 					<Group>Vertical</Group>
 					<Behavior>Usual</Behavior>
@@ -381,11 +493,19 @@
 									<v8:lang>ru</v8:lang>
 									<v8:content>Модель эмбеддинга</v8:content>
 								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>Embedding model</v8:content>
+								</v8:item>
 							</Title>
 							<ToolTip>
 								<v8:item>
 									<v8:lang>ru</v8:lang>
 									<v8:content>Выберите модель из списка — она скачается автоматически при первом запуске (в Каталог моделей). Либо укажите путь к каталогу офлайн-модели (onnx/model.onnx + tokenizer.json и т.д.) — тогда сеть не нужна.</v8:content>
+								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>Pick a model from the list — it will be downloaded automatically on first start (into the Models directory). Or specify the path to an offline model directory (onnx/model.onnx + tokenizer.json etc.) — then no network access is needed.</v8:content>
 								</v8:item>
 							</ToolTip>
 							<HorizontalStretch>true</HorizontalStretch>
@@ -393,6 +513,10 @@
 								<v8:item>
 									<v8:lang>ru</v8:lang>
 									<v8:content>имя из списка или путь к каталогу офлайн-модели</v8:content>
+								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>name from the list or path to an offline model directory</v8:content>
 								</v8:item>
 							</InputHint>
 							<ContextMenu name="МодельContextMenu" id="56"/>
@@ -406,6 +530,10 @@
 								<v8:item>
 									<v8:lang>ru</v8:lang>
 									<v8:content>Страница модели</v8:content>
+								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>Model page</v8:content>
 								</v8:item>
 							</Title>
 							<Hyperlink>true</Hyperlink>
@@ -422,11 +550,19 @@
 									<v8:lang>ru</v8:lang>
 									<v8:content>Каталог моделей</v8:content>
 								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>Models directory</v8:content>
+								</v8:item>
 							</Title>
 							<ToolTip>
 								<v8:item>
 									<v8:lang>ru</v8:lang>
 									<v8:content>Каталог загрузки/кэша модели при первом запуске. Пусто — кэш fastembed по умолчанию (рядом с процессом 1С).</v8:content>
+								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>Model download/cache directory on first start. Empty — default fastembed cache (next to the 1C process).</v8:content>
 								</v8:item>
 							</ToolTip>
 							<HorizontalStretch>true</HorizontalStretch>
@@ -435,6 +571,10 @@
 								<v8:item>
 									<v8:lang>ru</v8:lang>
 									<v8:content>куда скачать/кэшировать модель</v8:content>
+								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>where to download/cache the model</v8:content>
 								</v8:item>
 							</InputHint>
 							<ContextMenu name="КаталогМоделейContextMenu" id="59"/>
@@ -450,11 +590,19 @@
 									<v8:lang>ru</v8:lang>
 									<v8:content>Устройство</v8:content>
 								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>Device</v8:content>
+								</v8:item>
 							</Title>
 							<ToolTip>
 								<v8:item>
 									<v8:lang>ru</v8:lang>
 									<v8:content>auto — GPU (DirectML) с автоматическим откатом на CPU; dml — только GPU; cpu — только процессор.</v8:content>
+								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>auto — GPU (DirectML) with automatic fallback to CPU; dml — GPU only; cpu — CPU only.</v8:content>
 								</v8:item>
 							</ToolTip>
 							<Width>10</Width>
@@ -470,11 +618,19 @@
 									<v8:lang>ru</v8:lang>
 									<v8:content>Коллекции файлов</v8:content>
 								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>File collections</v8:content>
+								</v8:item>
 							</Title>
 							<ToolTip>
 								<v8:item>
 									<v8:lang>ru</v8:lang>
 									<v8:content>Дополнительные коллекции для семантического поиска: файлы из указанных папок (например, фича-файлы проекта) индексируются целиком — работают search, grep и get_segment по строкам файлов.</v8:content>
+								</v8:item>
+								<v8:item>
+									<v8:lang>en</v8:lang>
+									<v8:content>Additional collections for semantic search: files from the specified folders (e.g. project feature files) are indexed in full — search, grep and get_segment over file lines all work.</v8:content>
 								</v8:item>
 							</ToolTip>
 							<RowFilter xsi:nil="true"/>
@@ -513,11 +669,19 @@
 											<v8:lang>ru</v8:lang>
 											<v8:content>Коллекция</v8:content>
 										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Collection</v8:content>
+										</v8:item>
 									</Title>
 									<ToolTip>
 										<v8:item>
 											<v8:lang>ru</v8:lang>
 											<v8:content>Имя коллекции для поиска (желательно латиница, цифры и подчёркивание, например project_features).</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Collection name for search (preferably Latin letters, digits and underscores, e.g. project_features).</v8:content>
 										</v8:item>
 									</ToolTip>
 									<EditMode>EnterOnInput</EditMode>
@@ -532,11 +696,19 @@
 											<v8:lang>ru</v8:lang>
 											<v8:content>Описание</v8:content>
 										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Description</v8:content>
+										</v8:item>
 									</Title>
 									<ToolTip>
 										<v8:item>
 											<v8:lang>ru</v8:lang>
 											<v8:content>Описание коллекции для ИИ-агента (передаётся как collection_description).</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Collection description for the AI agent (passed as collection_description).</v8:content>
 										</v8:item>
 									</ToolTip>
 									<EditMode>EnterOnInput</EditMode>
@@ -551,11 +723,19 @@
 											<v8:lang>ru</v8:lang>
 											<v8:content>Каталог</v8:content>
 										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Directory</v8:content>
+										</v8:item>
 									</Title>
 									<ToolTip>
 										<v8:item>
 											<v8:lang>ru</v8:lang>
 											<v8:content>Путь к папке с файлами (поиск рекурсивный, включая подпапки).</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Path to the folder with files (the scan is recursive, including subfolders).</v8:content>
 										</v8:item>
 									</ToolTip>
 									<EditMode>EnterOnInput</EditMode>
@@ -574,11 +754,19 @@
 											<v8:lang>ru</v8:lang>
 											<v8:content>Расширения</v8:content>
 										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Extensions</v8:content>
+										</v8:item>
 									</Title>
 									<ToolTip>
 										<v8:item>
 											<v8:lang>ru</v8:lang>
 											<v8:content>Фильтр расширений: «feature» или «feature;md;txt» (допускается и «*.feature»). Пусто — feature.</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Extension filter: "feature" or "feature;md;txt" ("*.feature" is also accepted). Empty — feature.</v8:content>
 										</v8:item>
 									</ToolTip>
 									<EditMode>EnterOnInput</EditMode>
@@ -586,6 +774,10 @@
 									<InputHint>
 										<v8:item>
 											<v8:lang>ru</v8:lang>
+											<v8:content>feature</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
 											<v8:content>feature</v8:content>
 										</v8:item>
 									</InputHint>
@@ -612,6 +804,10 @@
 					<v8:lang>ru</v8:lang>
 					<v8:content>Режим работы</v8:content>
 				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Mode</v8:content>
+				</v8:item>
 			</Title>
 			<Type>
 				<v8:Type>xs:string</v8:Type>
@@ -630,6 +826,10 @@
 				<v8:item>
 					<v8:lang>ru</v8:lang>
 					<v8:content>Порт</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Port</v8:content>
 				</v8:item>
 			</Title>
 			<Type>
@@ -651,6 +851,10 @@
 					<v8:lang>ru</v8:lang>
 					<v8:content>Каталог компоненты</v8:content>
 				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Add-in directory</v8:content>
+				</v8:item>
 			</Title>
 			<Type>
 				<v8:Type>xs:string</v8:Type>
@@ -669,6 +873,10 @@
 				<v8:item>
 					<v8:lang>ru</v8:lang>
 					<v8:content>Токен авторизации</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Authorization token</v8:content>
 				</v8:item>
 			</Title>
 			<Type>
@@ -689,6 +897,10 @@
 					<v8:lang>ru</v8:lang>
 					<v8:content>Вести лог</v8:content>
 				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Enable logging</v8:content>
+				</v8:item>
 			</Title>
 			<Type>
 				<v8:Type>xs:boolean</v8:Type>
@@ -703,6 +915,10 @@
 				<v8:item>
 					<v8:lang>ru</v8:lang>
 					<v8:content>Файл лога</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Log file</v8:content>
 				</v8:item>
 			</Title>
 			<Type>
@@ -723,6 +939,10 @@
 					<v8:lang>ru</v8:lang>
 					<v8:content>Модель</v8:content>
 				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Model</v8:content>
+				</v8:item>
 			</Title>
 			<Type>
 				<v8:Type>xs:string</v8:Type>
@@ -741,6 +961,10 @@
 				<v8:item>
 					<v8:lang>ru</v8:lang>
 					<v8:content>Каталог моделей</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Models directory</v8:content>
 				</v8:item>
 			</Title>
 			<Type>
@@ -761,6 +985,10 @@
 					<v8:lang>ru</v8:lang>
 					<v8:content>Устройство</v8:content>
 				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Device</v8:content>
+				</v8:item>
 			</Title>
 			<Type>
 				<v8:Type>xs:string</v8:Type>
@@ -780,6 +1008,10 @@
 					<v8:lang>ru</v8:lang>
 					<v8:content>Статус сервера</v8:content>
 				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Server status</v8:content>
+				</v8:item>
 			</Title>
 			<Type>
 				<v8:Type>xs:string</v8:Type>
@@ -795,6 +1027,10 @@
 					<v8:lang>ru</v8:lang>
 					<v8:content>Статус индексации</v8:content>
 				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Indexing status</v8:content>
+				</v8:item>
 			</Title>
 			<Type>
 				<v8:Type>xs:string</v8:Type>
@@ -809,6 +1045,10 @@
 				<v8:item>
 					<v8:lang>ru</v8:lang>
 					<v8:content>Инструментов MCP</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>MCP tools</v8:content>
 				</v8:item>
 			</Title>
 			<Type>
@@ -826,6 +1066,10 @@
 					<v8:lang>ru</v8:lang>
 					<v8:content>Коллекции файлов</v8:content>
 				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>File collections</v8:content>
+				</v8:item>
 			</Title>
 			<Type>
 				<v8:Type>v8:ValueTable</v8:Type>
@@ -840,6 +1084,10 @@
 						<v8:item>
 							<v8:lang>ru</v8:lang>
 							<v8:content>Коллекция</v8:content>
+						</v8:item>
+						<v8:item>
+							<v8:lang>en</v8:lang>
+							<v8:content>Collection</v8:content>
 						</v8:item>
 					</Title>
 					<Type>
@@ -856,6 +1104,10 @@
 							<v8:lang>ru</v8:lang>
 							<v8:content>Описание</v8:content>
 						</v8:item>
+						<v8:item>
+							<v8:lang>en</v8:lang>
+							<v8:content>Description</v8:content>
+						</v8:item>
 					</Title>
 					<Type>
 						<v8:Type>xs:string</v8:Type>
@@ -871,6 +1123,10 @@
 							<v8:lang>ru</v8:lang>
 							<v8:content>Каталог</v8:content>
 						</v8:item>
+						<v8:item>
+							<v8:lang>en</v8:lang>
+							<v8:content>Directory</v8:content>
+						</v8:item>
 					</Title>
 					<Type>
 						<v8:Type>xs:string</v8:Type>
@@ -885,6 +1141,10 @@
 						<v8:item>
 							<v8:lang>ru</v8:lang>
 							<v8:content>Расширения</v8:content>
+						</v8:item>
+						<v8:item>
+							<v8:lang>en</v8:lang>
+							<v8:content>Extensions</v8:content>
 						</v8:item>
 					</Title>
 					<Type>
@@ -905,11 +1165,19 @@
 					<v8:lang>ru</v8:lang>
 					<v8:content>Запустить</v8:content>
 				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Start</v8:content>
+				</v8:item>
 			</Title>
 			<ToolTip>
 				<v8:item>
 					<v8:lang>ru</v8:lang>
 					<v8:content>Подключить компоненту, собрать инструменты MCPVA и запустить MCP сервер</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Attach the add-in, collect MCPVA tools and start the MCP server</v8:content>
 				</v8:item>
 			</ToolTip>
 			<Action>Запустить</Action>
@@ -920,11 +1188,19 @@
 					<v8:lang>ru</v8:lang>
 					<v8:content>Остановить</v8:content>
 				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Stop</v8:content>
+				</v8:item>
 			</Title>
 			<ToolTip>
 				<v8:item>
 					<v8:lang>ru</v8:lang>
 					<v8:content>Остановить прослушивание и отключить фасад МСП</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Stop listening and detach the MCP facade</v8:content>
 				</v8:item>
 			</ToolTip>
 			<Action>Остановить</Action>
@@ -935,11 +1211,19 @@
 					<v8:lang>ru</v8:lang>
 					<v8:content>Переиндексировать</v8:content>
 				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Reindex</v8:content>
+				</v8:item>
 			</Title>
 			<ToolTip>
 				<v8:item>
 					<v8:lang>ru</v8:lang>
 					<v8:content>Пересоздать коллекцию vanessa_steps и коллекции файлов, проиндексировать всё заново</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Recreate the vanessa_steps collection and the file collections, reindex everything from scratch</v8:content>
 				</v8:item>
 			</ToolTip>
 			<Action>Переиндексировать</Action>
@@ -950,11 +1234,19 @@
 					<v8:lang>ru</v8:lang>
 					<v8:content>Обновить статус</v8:content>
 				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Refresh status</v8:content>
+				</v8:item>
 			</Title>
 			<ToolTip>
 				<v8:item>
 					<v8:lang>ru</v8:lang>
 					<v8:content>Опросить состояние транспорта и индексации</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Poll the transport and indexing state</v8:content>
 				</v8:item>
 			</ToolTip>
 			<Action>ОбновитьСтатус</Action>
@@ -965,11 +1257,19 @@
 					<v8:lang>ru</v8:lang>
 					<v8:content>Установить из папки…</v8:content>
 				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Install from folder…</v8:content>
+				</v8:item>
 			</Title>
 			<ToolTip>
 				<v8:item>
 					<v8:lang>ru</v8:lang>
-					<v8:content>Указать каталог с уже распакованным бандлом (libhttp1cWin.dll + rcore.dll + DirectML.dll) — без архива; проверит состав и подставит каталог в поле «Каталог компоненты»</v8:content>
+					<v8:content>Проверить состав каталога из поля «Каталог компоненты» (распакованный бандл: libhttp1cWin.dll + rcore.dll + DirectML.dll) и принять его</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Validate the contents of the directory from the "Add-in directory" field (unpacked bundle: libhttp1cWin.dll + rcore.dll + DirectML.dll) and accept it</v8:content>
 				</v8:item>
 			</ToolTip>
 			<Action>УстановитьИзПапки</Action>
