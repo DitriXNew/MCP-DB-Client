@@ -1117,11 +1117,11 @@ void HttpServerComponent::handleMcpRequest(const httplib::Request& req, httplib:
 
         // Merge the native search-tool schemas owned by this component. The
         // search subsystem is self-contained: these are always present even if
-        // 1C never registers them. Native names win: tools/call routes them to
-        // the Rust core BEFORE consulting the 1C registry, so a 1C-registered
-        // duplicate would be unreachable — drop it from the listing instead of
-        // advertising two entries with one name (MCP forbids duplicate names).
-        // Pagination below applies to the union.
+        // 1C never registers them. RegisterTools REJECTS reserved native names
+        // with an explicit error, so the dedupe below is defense-in-depth only
+        // (e.g. a cache written by an older component build): native wins, to
+        // stay consistent with tools/call routing. Pagination applies to the
+        // union.
         {
             json merged = json::array();
             for (auto& t : tools) {
@@ -1628,6 +1628,29 @@ void HttpServerComponent::doRegisterTools(const std::u16string& jsonStr)
     json tools = json::parse(utf8, nullptr, false);
     if (tools.is_discarded() || !tools.is_array()) {
         AddError(u"RegisterTools: expected JSON array of tool definitions");
+        return;
+    }
+
+    // Reserved names: the native search subsystem owns search/grep/get_segment/
+    // list_collections, and tools/call routes them to the Rust core BEFORE the
+    // 1C registry — a 1C tool with such a name would be unreachable. Fail the
+    // registration LOUDLY (1C gets an exception) so the developer renames the
+    // tool instead of silently losing it.
+    std::string reserved;
+    for (const auto& t : tools) {
+        const std::string name =
+            t.is_object() ? t.value("name", std::string()) : std::string();
+        if (isNativeTool(name)) {
+            if (!reserved.empty()) reserved += ", ";
+            reserved += name;
+        }
+    }
+    if (!reserved.empty()) {
+        const std::string msg =
+            "RegisterTools: tool name(s) reserved by the native search subsystem: "
+            + reserved + ". Rename them; registration rejected, tool cache unchanged.";
+        logToFile(msg);
+        AddError(MB2WCHAR(msg));
         return;
     }
 
