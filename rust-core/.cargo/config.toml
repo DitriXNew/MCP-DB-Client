@@ -1,15 +1,19 @@
 # -----------------------------------------------------------------------------
-# CRT matching: the Rust staticlib MUST be built with the static CRT so that it
-# matches the C++ DLL's /MT (Release) and /MTd (Debug) settings in
-# http-1c-dll/CMakeLists.txt (lines ~62-68).
+# CRT choice: rcore ships ONLY as a cdylib (rcore.dll) that the C++ component
+# loads at RUNTIME (LoadLibrary, see http-1c-dll/src/RustCore.h) — nothing links
+# it, so it does NOT have to match the C++ DLL's /MT. What it must match is
+# ort/onnxruntime, which requires the DYNAMIC CRT (/MD); a static-CRT fastembed
+# build produces a broken DLL. Memory never crosses the boundary raw either way:
+# every rcore_* string is freed via rcore_free_string inside this DLL.
 #
-# Mixing dynamic CRT (Rust default on *-msvc) with the C++ side's static CRT
-# leads to multiple-CRT linker conflicts and undefined behaviour around heap
-# ownership. `+crt-static` forces the static CRT for the MSVC target so both
-# sides agree.
+# `-crt-static` (the rustc default for *-msvc, pinned here explicitly) keeps a
+# plain `cargo build --release --features fastembed` consistent with the
+# official recipes (build/*.sh, CMakeLists, CI), which also pass
+# RUSTFLAGS=-C target-feature=-crt-static — the env override and this config
+# now agree instead of silently fighting (RUSTFLAGS replaces config rustflags).
 #
 # Note: this scopes the rustflag to the MSVC target only, so a non-Windows
 # `cargo test`/`cargo check` (e.g. on a CI Linux box) is unaffected.
 # -----------------------------------------------------------------------------
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=-crt-static"]

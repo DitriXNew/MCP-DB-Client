@@ -305,10 +305,12 @@ json nativeToolDefinitions() {
                 }},
                 {"line_start", {
                     {"type", "integer"},
+                    {"minimum", 1},
                     {"description", "First line of the range (1-based, inclusive)."}
                 }},
                 {"line_end", {
                     {"type", "integer"},
+                    {"minimum", 1},
                     {"description", "Last line of the range (inclusive)."}
                 }},
                 {"max_lines", {
@@ -642,7 +644,9 @@ HttpServerComponent::HttpServerComponent()
     // Timeout applied to in-flight forwarded requests (read/write property).
     AddProperty(u"Timeout", u"Таймаут",
         [&](VH var) { var = (int64_t)this->timeout.load(); },
-        [&](VH var) { this->timeout.store((int)(int64_t)var); });
+        // Same clamp as ApplyConfig: a non-positive timeout would fail every
+        // forwarded call instantly.
+        [&](VH var) { this->timeout.store(std::max(1, (int)(int64_t)var)); });
 
     // Tool definitions cache (write-only property; expects JSON array).
     AddProperty(u"Tools", u"Инструменты",
@@ -1827,7 +1831,10 @@ void HttpServerComponent::doApplyConfig(const std::u16string& jsonStr)
     }
 
     if (cfg.contains("timeout") && cfg["timeout"].is_number_integer()) {
-        timeout.store(cfg["timeout"].get<int>());
+        // Non-positive values would make every forwarded call "time out"
+        // instantly (wait_for(seconds(0)) returns immediately) — a
+        // hard-to-diagnose misconfiguration. Clamp to >= 1 second.
+        timeout.store(std::max(1, cfg["timeout"].get<int>()));
     }
 
     // Pre-serialized JSON arrays — forward verbatim to the existing handlers.

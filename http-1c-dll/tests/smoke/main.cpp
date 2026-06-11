@@ -576,13 +576,26 @@ int wmain(int argc, wchar_t** argv) {
         REQUIRE(h.applyConfig(cfg), "ApplyConfig(auth_token=sekret)");
 
         auto cli = makeClient(port);
+        // Earlier tests (T5b's id flood) may leave the token bucket drained, so
+        // these deterministic auth checks can hit 429 first — that is the rate
+        // limiter doing its job, not an auth verdict. Retry through 429s
+        // (refill is 20 tokens/s, settles in well under a second).
+        auto postRetrying429 = [&](int id, const RpcOptions& opt) {
+            auto r = mcpPost(*cli, rpcRequest("tools/list", id), opt);
+            for (int i = 0; i < 40 && r && r->status == 429; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                r = mcpPost(*cli, rpcRequest("tools/list", id), opt);
+            }
+            return r;
+        };
+
         RpcOptions noAuth; noAuth.sessionId = sessionId;
-        auto res = mcpPost(*cli, rpcRequest("tools/list", 5), noAuth);
+        auto res = postRetrying429(5, noAuth);
         REQUIRE((bool)res, "request without Authorization got a response");
         if (!g_fatal) CHECK(res->status == 401, "no Authorization -> 401, got " + std::to_string(res->status));
 
         RpcOptions withAuth; withAuth.sessionId = sessionId; withAuth.bearerToken = "sekret";
-        res = mcpPost(*cli, rpcRequest("tools/list", 6), withAuth);
+        res = postRetrying429(6, withAuth);
         REQUIRE((bool)res, "request with Bearer sekret got a response");
         if (!g_fatal) CHECK(res->status == 200, "Bearer sekret -> 200, got " + std::to_string(res->status));
         if (g_fatal) return;
@@ -639,6 +652,24 @@ int wmain(int argc, wchar_t** argv) {
     //     with nobody answering the call returns the timeout error promptly.
     // -----------------------------------------------------------------------
     runTest("T7 timeout + ExternalEvent", [&] {
+        // Non-positive timeouts are clamped to 1s (instant-timeout footgun);
+        // verified through the Timeout property round-trip.
+        auto readTimeoutProp = [&]() -> long long {
+            const long propNum = h.comp->FindProp((const WCHAR_T*)L"Timeout");
+            tVariant val;
+            tVarInit(&val);
+            if (propNum < 0 || !h.comp->GetPropVal(propNum, &val)) return -1;
+            const long long v = variantToInt(val);
+            freeVariant(val);
+            return v;
+        };
+        for (const int bad : {0, -5}) {
+            json cfgBad; cfgBad["timeout"] = bad;
+            CHECK(h.applyConfig(cfgBad), "ApplyConfig(timeout=" + std::to_string(bad) + ") accepted");
+            CHECK(readTimeoutProp() == 1,
+                  "timeout=" + std::to_string(bad) + " clamped to 1 second");
+        }
+
         json cfg; cfg["timeout"] = 1;
         REQUIRE(h.applyConfig(cfg), "ApplyConfig(timeout=1)");
         h.conn.clearEvents();
