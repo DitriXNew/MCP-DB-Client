@@ -264,11 +264,16 @@ pub struct FastEmbedder {
     last_error: Mutex<Option<String>>,
     /// Output dimensionality, probed once at construction. Bound to the index.
     dim: usize,
-    /// ONNX inference sub-batch size handed to fastembed. With `m` concurrent
-    /// bulk sessions, peak memory is `m × sub_batch × seq` — so we shrink it to
-    /// `≈256/m` (the fastembed default is 256) to keep total concurrent memory at
-    /// roughly the single-session level. Otherwise N sessions each padding a
-    /// 256-row tensor of long passages exhausts RAM and ort errors out.
+    /// ONNX inference sub-batch size handed to fastembed. The real constraint
+    /// is *peak* inference memory: attention materializes tensors proportional
+    /// to `sub_batch × seq_len²` per layer, and ort's BFC arena retains that
+    /// high-water mark for the session's lifetime — it never returns the memory
+    /// to the OS. At the fastembed default (256) one session padding 512-token
+    /// passages grows to many GB and stays there until the session is dropped.
+    /// A flat 32 keeps the peak around ~1 GB per session for e5-small at seq
+    /// 512 (scale by session count for the pool total), and the CPU throughput
+    /// loss vs 256 is negligible — intra-op threading dominates, not batch
+    /// amortization.
     embed_batch: usize,
 }
 
@@ -331,7 +336,7 @@ impl FastEmbedder {
             // is 384/768/1024-dim (small/base/large), but we probe rather than
             // hard-code so the value is always truthful for whatever loaded.
             dim: 0,
-            embed_batch: (256 / m).max(8),
+            embed_batch: 32,
         };
         me.dim = me.probe_dim()?;
         Ok(me)
@@ -384,7 +389,7 @@ impl FastEmbedder {
             query: Mutex::new(query),
             last_error: Mutex::new(None),
             dim: 0,
-            embed_batch: (256 / m).max(8),
+            embed_batch: 32,
         };
         me.dim = me.probe_dim()?;
         Ok(me)

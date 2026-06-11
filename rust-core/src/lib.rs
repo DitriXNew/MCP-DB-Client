@@ -339,7 +339,20 @@ fn dispatch(method: &str, payload_json: &str) -> String {
                             .to_json_string()
                     }
                 };
-                let prepared = store::prepare_index_raw(req, max_seq_len);
+                // Prepare compiles the optional `chunk_cfg.boundary_regex`
+                // first: an invalid pattern is the same structural
+                // `bad_pattern` error grep uses, raised BEFORE any state
+                // mutation — nothing gets ingested.
+                let prepared = match store::prepare_index_raw(req, max_seq_len) {
+                    Ok(p) => p,
+                    Err(store::RawIndexError::BadPattern(msg)) => {
+                        return Envelope::err(
+                            codes::BAD_PATTERN,
+                            format!("invalid boundary_regex: {msg}"),
+                        )
+                        .to_json_string()
+                    }
+                };
                 let mut core = match CORE.write() {
                     Ok(c) => c,
                     Err(_) => {
@@ -628,7 +641,8 @@ fn parse_index_request(payload: &Value) -> Result<IndexRequest, String> {
 
 /// Parse an `index_raw` payload. `collection`, `name`, and `text` are required;
 /// `doc_id` is optional (auto-assigned when absent). `chunk_cfg` is an optional
-/// object with `target_tokens` / `max_tokens` / `overlap_lines` overrides.
+/// object with `target_tokens` / `max_tokens` / `overlap_lines` /
+/// `boundary_regex` overrides.
 fn parse_raw_index_request(payload: &Value) -> Result<RawIndexRequest, String> {
     let collection = opt_str(payload, "collection")
         .filter(|s| !s.trim().is_empty())
@@ -656,6 +670,13 @@ fn parse_raw_index_request(payload: &Value) -> Result<RawIndexRequest, String> {
     let overlap_lines = cfg
         .and_then(|c| opt_u64(c, "overlap_lines"))
         .map(|v| v as usize);
+    // Optional boundary pattern: a line matching it must START a new chunk
+    // (per-scenario chunking for Gherkin .feature files). Carried as the raw
+    // string and compiled once in prepare — an invalid pattern is a structural
+    // `bad_pattern` error there. An empty string means "no boundaries".
+    let boundary_regex = cfg
+        .and_then(|c| opt_str(c, "boundary_regex"))
+        .filter(|s| !s.is_empty());
 
     Ok(RawIndexRequest {
         collection,
@@ -667,6 +688,7 @@ fn parse_raw_index_request(payload: &Value) -> Result<RawIndexRequest, String> {
         target_tokens,
         max_tokens,
         overlap_lines,
+        boundary_regex,
     })
 }
 
@@ -1686,6 +1708,94 @@ mod tests {
 
         // It still embeds (truncated) in the background and reaches Ready.
         assert!(store::wait_until_ready("raw", std::time::Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn index_raw_invalid_boundary_regex_is_bad_pattern_and_ingests_nothing() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // An unclosed group is an invalid regex → the whole call fails with
+        // the same structural bad_pattern error grep uses, BEFORE any state
+        // mutation.
+        let v = call(
+            "index_raw",
+            r#"{"collection":"rawbound","doc_id":"bx","text":"a\nb",
+                "chunk_cfg":{"boundary_regex":"(unclosed"}}"#,
+        );
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["error"]["code"], json!(codes::BAD_PATTERN));
+        // Nothing was ingested: the collection must not have been created…
+        let st = call("stats", "");
+        assert!(
+            st["result"]["collections"]["rawbound"].is_null(),
+            "failed index_raw must not create the collection"
+        );
+        // …and the doc must not be readable.
+        let v = call("get_segment", r#"{"doc_id":"bx","line_start":1,"line_end":1}"#);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["error"]["code"], json!(codes::NOT_FOUND));
+    }
+
+    #[test]
+    fn index_raw_boundary_regex_search_hits_section_and_get_segment_slices_it() {
+        let _g = e2e_guard();
+        call("configure", "{}");
+        // Three Gherkin-ish sections (headers at lines 1, 4 and 6). The small
+        // target would blindly pack across sections; the boundary regex forces
+        // per-section chunks, so the banana step (line 7) can only ever live
+        // in section-3 chunks.
+        let text = "Сценарий: Создание заказа\nstep about databases\nstep about pooling\nСценарий: Удаление заказа\nstep about removal\nСценарий: Отчёт\nstep about banana smoothie\nstep about totals";
+        let payload = serde_json::json!({
+            "collection": "feat",
+            "doc_id": "f1",
+            "name": "orders.feature",
+            "text": text,
+            "chunk_cfg": {
+                "target_tokens": 12,
+                "overlap_lines": 2,
+                "boundary_regex": "^Сценарий:"
+            },
+        });
+        let v = call("index_raw", &payload.to_string());
+        assert_eq!(v["ok"], json!(true));
+        assert!(store::wait_until_ready("feat", std::time::Duration::from_secs(5)));
+
+        // Keyword search pins the hits to the banana step. Its section starts
+        // at line 6, so the boundary guarantees no hit chunk leaks lines from
+        // an earlier section.
+        let v = call(
+            "search",
+            r#"{"query":"banana smoothie","collection":"feat","mode":"keyword","k":5}"#,
+        );
+        assert_eq!(v["ok"], json!(true));
+        let hits = v["result"]["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "keyword search must find the banana section");
+        for h in hits {
+            assert_eq!(h["doc_id"], json!("f1"));
+            assert!(
+                h["line_start"].as_u64().unwrap() >= 6,
+                "a banana chunk must not contain lines of a previous section"
+            );
+        }
+        // The section-initial chunk (first line = the «Сценарий:» header at
+        // line 6) is itself one of the hits.
+        assert!(
+            hits.iter().any(|h| h["line_start"] == json!(6)),
+            "the chunk starting at the section header must be a hit"
+        );
+
+        // get_segment must return exactly the hit's line range of the source —
+        // the chunk line numbers and the offset table agree.
+        let ls = hits[0]["line_start"].as_u64().unwrap();
+        let le = hits[0]["line_end"].as_u64().unwrap();
+        let v = call(
+            "get_segment",
+            &format!(r#"{{"doc_id":"f1","line_start":{ls},"line_end":{le}}}"#),
+        );
+        assert_eq!(v["ok"], json!(true));
+        let src: Vec<&str> = text.split('\n').collect();
+        let expected = src[(ls - 1) as usize..=(le - 1) as usize].join("\n");
+        assert_eq!(v["result"]["text"], json!(expected));
     }
 
     // -- Stage 2: hybrid search (mode: dense | keyword | hybrid) -------------

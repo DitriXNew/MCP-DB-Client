@@ -59,6 +59,17 @@ immediately; a background worker pool embeds; collections expose a two-axis
 `text_ready` / `vector_status` state, polled via `stats` /
 `list_collections`).
 
+**Chunking (`index_raw`):** the optional `chunk_cfg` object overrides the
+line-granular token-budget chunker — `target_tokens` (default 300),
+`max_tokens`, `overlap_lines` (default 2) — and `boundary_regex` makes
+chunking **structure-aware**: a line matching the regex always starts a new
+chunk, and no overlap is carried across the boundary, so a chunk never glues
+the tail of one section to the head of the next. The VA plugin uses this to
+chunk `.feature` files per Gherkin scenario. A region bigger than the token
+budget still splits into several chunks with normal overlap *inside* it. An
+invalid `boundary_regex` fails the whole call with `bad_pattern` before any
+state is touched.
+
 **Hit meta:** `search` hits echo the **effective** meta — the document-level
 `meta` overlaid by the segment-level `meta`, segment winning on collision. It
 is the same view the `filter` clauses match against, so what filtered a hit in
@@ -90,8 +101,12 @@ feature compiled in) → `FastEmbedder`, else `MockEmbedder`. `embed_workers`
 sizes the bulk pool: absent ⇒ **1**; `0` ⇒ auto (`ncpu/2` clamped to 1..=4);
 `n` ⇒ exactly n. **Each bulk worker is a separate model session — a full model
 copy in RAM** (e5-small fp32 ≈ 0.5–1.5 GB per session under load, plus one
-query session), so `auto` on a big server can cost ~5 model copies. There is no
-hard memory quota in the core; size the pool to your RAM.
+query session), so `auto` on a big server can cost ~5 model copies. The ONNX
+inference sub-batch is a flat **32 texts per session**: peak inference memory
+scales with `batch × seq_len²` (attention tensors) and onnxruntime's arena
+keeps that high-water mark for the session's lifetime, so a small fixed batch
+bounds the peak at roughly ~1 GB per session with negligible CPU throughput
+loss. There is no hard memory quota in the core; size the pool to your RAM.
 
 **`trim_memory`** drops the bulk sessions to give that RAM back once an ingest
 is done (call it when `stats` reports `vector_status: ready`): the query

@@ -40,6 +40,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use once_cell::sync::Lazy;
+use regex::Regex;
 
 use crate::embed::{dot, Embedder, MockEmbedder};
 use crate::filter::MetaFilter;
@@ -715,9 +716,9 @@ pub fn accept_index(core: &mut Core, req: IndexRequest) -> AcceptResult {
 /// A large ingest (one `index_segments`/`index_raw` call) is split into jobs of
 /// at most this many segments so a single huge document spreads across the
 /// whole worker pool instead of keeping one worker busy while the rest idle.
-/// 256 matches the ONNX sub-batch scale (`FastEmbedder::embed_batch` defaults
-/// to 256/m), so a chunk is a few sub-batches of real work — big enough to
-/// amortize per-job overhead, small enough to parallelize.
+/// 256 segments per job is several ONNX sub-batches of real work
+/// (`FastEmbedder::embed_batch` is 32) — big enough to amortize per-job
+/// overhead, small enough to parallelize.
 const EMBED_JOB_CHUNK: usize = 256;
 
 /// Split one ingest's parallel `(segment_ids, embed_texts)` arrays into
@@ -1105,9 +1106,32 @@ pub fn build_line_offsets(text: &str) -> Vec<usize> {
 ///     line granularity). The caller truncates only its *embed* text to the cap;
 ///     `get_segment` still returns it whole from the stored full text.
 ///
+/// Boundary-aware mode (`boundary: Some(regex)`) — for structured documents
+/// such as Gherkin `.feature` files, where a chunk should never straddle a
+/// section (`chunk_cfg.boundary_regex` on the wire):
+///   * The regex is matched against each **individual line** (the chunker is
+///     line-granular). A matching line is a *boundary line*: it must START a
+///     new chunk. If the current chunk already has content, it is closed
+///     BEFORE the boundary line — a boundary line never appears mid-chunk, so
+///     no chunk contains lines from two sections.
+///   * **No overlap across a boundary**: when the next chunk starts at a
+///     boundary line, the normal `overlap_lines` back-up is suppressed, so a
+///     section-initial chunk never carries trailing lines of the previous
+///     section.
+///   * WITHIN one boundary-delimited region the token-budget logic above is
+///     unchanged: a region bigger than the target still splits into multiple
+///     chunks with normal `overlap_lines` overlap *inside* the region, and the
+///     oversized-single-line rule applies as before.
+///   * A boundary line that already sits at a chunk start (the very first line
+///     of the doc, or right after another boundary close) simply starts its
+///     chunk — an empty chunk is never emitted.
+///
+/// `boundary: None` (or a regex no line matches) is byte-identical to plain
+/// token-budget chunking.
+///
 /// Returns chunks with 1-based inclusive line ranges. An empty document yields a
 /// single empty chunk covering line 1 so the doc is always representable.
-pub fn chunk_text(text: &str, cfg: &ChunkConfig) -> Vec<Chunk> {
+pub fn chunk_text(text: &str, cfg: &ChunkConfig, boundary: Option<&Regex>) -> Vec<Chunk> {
     // Line model matches `build_line_offsets` / grep: split on '\n'. This keeps
     // line numbers consistent across chunking, the offset table, and get_segment.
     let lines: Vec<&str> = text.split('\n').collect();
@@ -1117,6 +1141,10 @@ pub fn chunk_text(text: &str, cfg: &ChunkConfig) -> Vec<Chunk> {
     if n == 0 {
         return chunks; // unreachable (split always yields ≥1), but be safe.
     }
+
+    // Line-level boundary test. With no regex every line is a non-boundary,
+    // which keeps this path byte-identical to plain token-budget chunking.
+    let is_boundary = |idx: usize| boundary.is_some_and(|re| re.is_match(lines[idx]));
 
     let mut start = 0usize; // 0-based index of the current chunk's first line
     while start < n {
@@ -1130,6 +1158,12 @@ pub fn chunk_text(text: &str, cfg: &ChunkConfig) -> Vec<Chunk> {
             // Grow the chunk one line at a time while we stay within the target
             // budget. We always keep at least the starting line (end == start).
             while end + 1 < n {
+                // A boundary line must START its own chunk: close the current
+                // one before it. (The starting line itself may be a boundary —
+                // that is exactly the "boundary starts a chunk" case.)
+                if is_boundary(end + 1) {
+                    break;
+                }
                 let next_tokens = estimate_tokens(lines[end + 1]);
                 if tokens + next_tokens > cfg.target_tokens {
                     break;
@@ -1149,9 +1183,16 @@ pub fn chunk_text(text: &str, cfg: &ChunkConfig) -> Vec<Chunk> {
         });
 
         // Advance. Normally we step to `end + 1`, but back up `overlap_lines` so
-        // consecutive chunks share context. Never let overlap stall progress:
-        // the next start must be strictly greater than the current start.
-        let next_start = (end + 1).saturating_sub(cfg.overlap_lines);
+        // consecutive chunks share context. EXCEPT across a boundary: when the
+        // next chunk starts at a boundary line, the back-up is suppressed so
+        // the section-initial chunk carries no trailing lines of the previous
+        // one. Never let overlap stall progress: the next start must be
+        // strictly greater than the current start.
+        let next_start = if end + 1 < n && is_boundary(end + 1) {
+            end + 1
+        } else {
+            (end + 1).saturating_sub(cfg.overlap_lines)
+        };
         start = next_start.max(start + 1);
     }
 
@@ -1174,6 +1215,14 @@ pub struct RawIndexRequest {
     pub target_tokens: Option<usize>,
     pub max_tokens: Option<usize>,
     pub overlap_lines: Option<usize>,
+    /// Optional boundary pattern (`chunk_cfg.boundary_regex` on the wire),
+    /// carried as the raw string and compiled ONCE per request by
+    /// [`prepare_index_raw`]. A line matching it must START a new chunk — see
+    /// the boundary-aware mode of [`chunk_text`]. An invalid pattern fails the
+    /// whole call with [`RawIndexError::BadPattern`] before any state mutation;
+    /// absent (or empty, filtered at parse) ⇒ plain token-budget chunking,
+    /// byte-identical to the boundary-less behavior.
+    pub boundary_regex: Option<String>,
 }
 
 /// Outcome of the synchronous `index_raw` accept. `doc_id` is always populated
@@ -1182,6 +1231,17 @@ pub struct RawAcceptResult {
     pub collection: String,
     pub doc_id: String,
     pub segment_count: usize,
+}
+
+/// Why an `index_raw` request could not be prepared. The only failure mode is
+/// an uncompilable `chunk_cfg.boundary_regex`, surfaced to the dispatcher as
+/// the same structural `bad_pattern` error `grep` uses for its pattern.
+/// Returned by [`prepare_index_raw`] BEFORE any store mutation, so a failed
+/// call ingests nothing.
+#[derive(Debug)]
+pub enum RawIndexError {
+    /// The supplied `boundary_regex` failed to compile; carries the engine's message.
+    BadPattern(String),
 }
 
 /// Auto-assign a stable, collision-resistant `doc_id` for a fire-and-forget
@@ -1223,7 +1283,24 @@ pub struct PreparedRawIndex {
 /// and (4) of the raw accept (normalize, offsets, chunk + kw multisets), pure
 /// of `&mut Core`. Call this OUTSIDE the global write lock, then hand the
 /// result to [`commit_index_raw`] under the lock.
-pub fn prepare_index_raw(req: RawIndexRequest, max_seq_len: Option<u64>) -> PreparedRawIndex {
+///
+/// Fails — without ingesting anything — only when `boundary_regex` is present
+/// but does not compile ([`RawIndexError::BadPattern`], same precedent as an
+/// invalid `grep` pattern).
+pub fn prepare_index_raw(
+    req: RawIndexRequest,
+    max_seq_len: Option<u64>,
+) -> Result<PreparedRawIndex, RawIndexError> {
+    // (0) Compile the optional boundary regex FIRST, before any other work: an
+    // invalid pattern must fail the whole call structurally (nothing ingested).
+    // An empty pattern is treated as absent (byte-identical chunking to today).
+    let boundary: Option<Regex> = match req.boundary_regex.as_deref().filter(|s| !s.is_empty()) {
+        Some(pat) => {
+            Some(Regex::new(pat).map_err(|e| RawIndexError::BadPattern(e.to_string()))?)
+        }
+        None => None,
+    };
+
     // (1) Normalize newlines once, up front. Everything downstream — offsets,
     // chunk line numbers, stored text — is in terms of this LF-only text.
     let full_text = normalize_newlines(&req.text);
@@ -1240,8 +1317,9 @@ pub fn prepare_index_raw(req: RawIndexRequest, max_seq_len: Option<u64>) -> Prep
         max_seq_len,
     );
 
-    // (4) Chunk the normalized text into line-snapped segments.
-    let chunks = chunk_text(&full_text, &cfg);
+    // (4) Chunk the normalized text into line-snapped segments, honoring the
+    // optional boundary lines (e.g. one chunk run per Gherkin scenario).
+    let chunks = chunk_text(&full_text, &cfg, boundary.as_ref());
 
     // Build the doc's segments + the parallel embed-text list.
     let mut segments: Vec<Segment> = Vec::with_capacity(chunks.len());
@@ -1274,7 +1352,7 @@ pub fn prepare_index_raw(req: RawIndexRequest, max_seq_len: Option<u64>) -> Prep
         });
     }
 
-    PreparedRawIndex {
+    Ok(PreparedRawIndex {
         collection: req.collection,
         description: req.description,
         doc_id: req.doc_id,
@@ -1285,7 +1363,7 @@ pub fn prepare_index_raw(req: RawIndexRequest, max_seq_len: Option<u64>) -> Prep
         segments,
         embed_texts,
         skipped_now,
-    }
+    })
 }
 
 /// The locked *commit* half of an `index_raw` accept — steps (3) and (5):
@@ -1378,11 +1456,16 @@ pub fn commit_index_raw(core: &mut Core, prepared: PreparedRawIndex) -> RawAccep
 /// callers/tests keep working. The dispatcher (`lib.rs`) instead runs
 /// [`prepare_index_raw`] BEFORE taking the write lock and [`commit_index_raw`]
 /// under it, so normalization/offsets/chunking never block concurrent searches.
+/// Propagates [`RawIndexError::BadPattern`] from prepare (invalid
+/// `boundary_regex`) without touching the store.
 /// (Test-only in non-test builds, hence the allow.)
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn accept_index_raw(core: &mut Core, req: RawIndexRequest) -> RawAcceptResult {
+pub fn accept_index_raw(
+    core: &mut Core,
+    req: RawIndexRequest,
+) -> Result<RawAcceptResult, RawIndexError> {
     let max_seq_len = core.config.max_seq_len;
-    commit_index_raw(core, prepare_index_raw(req, max_seq_len))
+    Ok(commit_index_raw(core, prepare_index_raw(req, max_seq_len)?))
 }
 
 /// Truncate `text` to roughly `max_tokens` for *embedding only*. Uses the same
@@ -2888,7 +2971,7 @@ mod tests {
         // Six single-word lines; target 3 tokens means ~3 lines per chunk.
         // overlap=1 → the last line of a chunk repeats as the first of the next.
         let text = "l1\nl2\nl3\nl4\nl5\nl6";
-        let chunks = chunk_text(text, &cfg(3, 100, 1));
+        let chunks = chunk_text(text, &cfg(3, 100, 1), None);
         // Each chunk is at most 3 lines (the target), snapped to whole lines.
         assert!(chunks.len() >= 2, "must split into multiple chunks");
         for ch in &chunks {
@@ -2921,7 +3004,7 @@ mod tests {
         // become exactly one oversized chunk covering just that line.
         let huge = "tok ".repeat(50); // ~50 whitespace tokens, one line
         let text = format!("short before\n{}\nshort after", huge.trim());
-        let chunks = chunk_text(&text, &cfg(3, 5, 1));
+        let chunks = chunk_text(&text, &cfg(3, 5, 1), None);
         // Find the oversized chunk: it must be exactly one line, whole.
         let oversized: Vec<&Chunk> = chunks.iter().filter(|c| c.oversized).collect();
         assert_eq!(oversized.len(), 1, "exactly one oversized chunk");
@@ -2938,6 +3021,127 @@ mod tests {
         assert_eq!(t.chars().count(), 20);
         // Short text is returned unchanged.
         assert_eq!(truncate_to_tokens("hi", 5), "hi");
+    }
+
+    #[test]
+    fn chunker_boundary_lines_start_chunks_without_cross_overlap() {
+        // Gherkin-ish doc: three «Сценарий:» sections. The target is small
+        // enough that blind packing would merge a section tail with the next
+        // section's header (premise-checked below) — the boundary fixes that.
+        let text =
+            "Сценарий: А\nшаг один\nшаг два\nСценарий: Б\nшаг три\nСценарий: В\nшаг четыре\nшаг пять";
+        let lines: Vec<&str> = text.split('\n').collect();
+        let re = Regex::new("^Сценарий:").unwrap();
+
+        // Premise: WITHOUT the boundary the same config puts a section header
+        // mid-chunk, so it is the boundary (not the budget) doing the work.
+        let blind = chunk_text(text, &cfg(4, 100, 2), None);
+        assert!(
+            blind.iter().any(|c| (c.line_start..=c.line_end)
+                .any(|li| li != c.line_start && re.is_match(lines[(li - 1) as usize]))),
+            "premise: blind chunking must merge across a section boundary"
+        );
+
+        let chunks = chunk_text(text, &cfg(4, 100, 2), Some(&re));
+        // A boundary line may only ever be a chunk's FIRST line — i.e. no
+        // chunk contains lines from two sections.
+        for ch in &chunks {
+            for li in ch.line_start..=ch.line_end {
+                if re.is_match(lines[(li - 1) as usize]) {
+                    assert_eq!(
+                        li, ch.line_start,
+                        "boundary line {li} must start its chunk, not sit mid-chunk"
+                    );
+                }
+            }
+        }
+        // Every section header starts some chunk.
+        for (i, l) in lines.iter().enumerate() {
+            if re.is_match(l) {
+                assert!(
+                    chunks.iter().any(|c| c.line_start == (i + 1) as u64),
+                    "boundary line {} must start a chunk",
+                    i + 1
+                );
+            }
+        }
+        // No overlap across a boundary: a chunk starting at a boundary begins
+        // exactly one line after the previous chunk's end — the previous
+        // section's trailing lines never reappear in front of the header.
+        for w in chunks.windows(2) {
+            if re.is_match(lines[(w[1].line_start - 1) as usize]) {
+                assert_eq!(
+                    w[1].line_start,
+                    w[0].line_end + 1,
+                    "overlap must be suppressed across a section boundary"
+                );
+            }
+        }
+        // Coverage is intact: first line in the first chunk, last in the last.
+        assert_eq!(chunks.first().unwrap().line_start, 1);
+        assert_eq!(chunks.last().unwrap().line_end, lines.len() as u64);
+    }
+
+    #[test]
+    fn chunker_oversized_section_splits_inside_with_overlap() {
+        // One section much bigger than the target must still split into
+        // multiple chunks, overlapping normally INSIDE the section, while the
+        // next section starts clean at its boundary line.
+        let mut doc = String::from("Сценарий: Б\n");
+        for i in 1..=8 {
+            doc.push_str(&format!("шаг номер {i}\n"));
+        }
+        doc.push_str("Сценарий: В\nшаг финал");
+        let lines: Vec<&str> = doc.split('\n').collect();
+        let re = Regex::new("^Сценарий:").unwrap();
+        let chunks = chunk_text(&doc, &cfg(6, 100, 1), Some(&re));
+
+        // The big section spans lines 1..=9; it must split…
+        let in_big: Vec<&Chunk> = chunks.iter().filter(|c| c.line_end <= 9).collect();
+        assert!(in_big.len() >= 2, "oversized section must split into multiple chunks");
+        // …with the normal overlap INSIDE the section: each next chunk starts
+        // no later than the previous chunk's last line.
+        for w in in_big.windows(2) {
+            assert!(
+                w[1].line_start <= w[0].line_end,
+                "chunks inside one section must keep the normal overlap"
+            );
+        }
+        // The second section starts exactly at its boundary line (line 10),
+        // with no trailing lines of the big section carried in front of it.
+        let next = chunks
+            .iter()
+            .find(|c| re.is_match(lines[(c.line_start - 1) as usize]) && c.line_start > 1)
+            .expect("the second section must start a chunk");
+        assert_eq!(next.line_start, 10);
+        // And no chunk anywhere holds a boundary line mid-chunk.
+        for ch in &chunks {
+            for li in (ch.line_start + 1)..=ch.line_end {
+                assert!(
+                    !re.is_match(lines[(li - 1) as usize]),
+                    "no chunk may straddle a section boundary"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunker_without_boundary_matches_legacy_packing() {
+        // `boundary: None` must stay byte-identical to the pre-boundary
+        // chunker. Hardcoded expectation for 6 one-token lines with target 3 /
+        // overlap 1, as produced by the original greedy packing.
+        let text = "l1\nl2\nl3\nl4\nl5\nl6";
+        let chunks = chunk_text(text, &cfg(3, 100, 1), None);
+        let ranges: Vec<(u64, u64)> =
+            chunks.iter().map(|c| (c.line_start, c.line_end)).collect();
+        assert_eq!(ranges, vec![(1, 3), (3, 5), (5, 6), (6, 6)]);
+        // A regex that matches no line is equally inert.
+        let re = Regex::new("^Сценарий:").unwrap();
+        let same: Vec<(u64, u64)> = chunk_text(text, &cfg(3, 100, 1), Some(&re))
+            .iter()
+            .map(|c| (c.line_start, c.line_end))
+            .collect();
+        assert_eq!(same, ranges);
     }
 
     // ===================================================================
@@ -2959,8 +3163,10 @@ mod tests {
                 target_tokens: Some(3),
                 max_tokens: Some(8),
                 overlap_lines: Some(1),
+                boundary_regex: None,
             },
-        );
+        )
+        .expect("accept without a boundary_regex cannot fail");
         res.doc_id
     }
 
