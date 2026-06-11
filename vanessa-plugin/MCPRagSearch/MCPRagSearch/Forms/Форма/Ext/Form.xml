@@ -11,554 +11,591 @@
 		</v8:item>
 	</Title>
 	<AutoSaveDataInSettings>Use</AutoSaveDataInSettings>
-	<AutoCommandBar name="ФормаКоманднаяПанель" id="-1"/>
+	<AutoCommandBar name="ФормаКоманднаяПанель" id="-1">
+		<Autofill>false</Autofill>
+	</AutoCommandBar>
 	<Events>
 		<Event name="OnOpen">ПриОткрытии</Event>
 		<Event name="BeforeClose">ПередЗакрытием</Event>
 		<Event name="ExternalEvent">ВнешнееСобытие</Event>
 	</Events>
 	<ChildItems>
-		<UsualGroup name="ГруппаУправление" id="1">
+		<UsualGroup name="ГруппаВерх" id="125">
 			<Title>
 				<v8:item>
 					<v8:lang>ru</v8:lang>
-					<v8:content>Управление</v8:content>
+					<v8:content>Группа верх</v8:content>
 				</v8:item>
 			</Title>
-			<Group>Vertical</Group>
-			<Behavior>Usual</Behavior>
-			<Representation>NormalSeparation</Representation>
-			<ShowTitle>true</ShowTitle>
-			<ExtendedTooltip name="ГруппаУправлениеExtendedTooltip" id="27"/>
+			<ToolTip>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Группа верх</v8:content>
+				</v8:item>
+			</ToolTip>
+			<Group>AlwaysHorizontal</Group>
+			<Representation>None</Representation>
+			<ShowTitle>false</ShowTitle>
+			<ExtendedTooltip name="ГруппаВерхРасширеннаяПодсказка" id="126"/>
 			<ChildItems>
-				<RadioButtonField name="РежимРаботы" id="2">
-					<DataPath>РежимРаботы</DataPath>
+				<UsualGroup name="ГруппаЛево" id="127">
 					<Title>
 						<v8:item>
 							<v8:lang>ru</v8:lang>
-							<v8:content>Режим работы</v8:content>
+							<v8:content>Группа лево</v8:content>
 						</v8:item>
 					</Title>
 					<ToolTip>
 						<v8:item>
 							<v8:lang>ru</v8:lang>
-							<v8:content>MCP — компонента обслуживает инструменты Vanessa Automation. MCP+RAG — дополнительно семантический поиск по шагам (нужны rcore.dll и модель эмбеддинга).</v8:content>
+							<v8:content>Группа лево</v8:content>
 						</v8:item>
 					</ToolTip>
-					<RadioButtonType>Tumbler</RadioButtonType>
-					<Orientation>HorizontalIfPossible</Orientation>
-					<ChoiceList>
-						<xr:Item>
-							<xr:Presentation/>
-							<xr:CheckState>0</xr:CheckState>
-							<xr:Value xsi:type="FormChoiceListDesTimeValue">
-								<Presentation>
-									<v8:item>
-										<v8:lang>ru</v8:lang>
-										<v8:content>MCP</v8:content>
-									</v8:item>
-								</Presentation>
-								<Value xsi:type="xs:string">MCP</Value>
-							</xr:Value>
-						</xr:Item>
-						<xr:Item>
-							<xr:Presentation/>
-							<xr:CheckState>0</xr:CheckState>
-							<xr:Value xsi:type="FormChoiceListDesTimeValue">
-								<Presentation>
-									<v8:item>
-										<v8:lang>ru</v8:lang>
-										<v8:content>MCP+RAG</v8:content>
-									</v8:item>
-								</Presentation>
-								<Value xsi:type="xs:string">MCP+RAG</Value>
-							</xr:Value>
-						</xr:Item>
-					</ChoiceList>
-					<ContextMenu name="РежимРаботыКонтекстноеМеню" id="21"/>
-					<ExtendedTooltip name="РежимРаботыРасширеннаяПодсказка" id="22"/>
-					<Events>
-						<Event name="OnChange">РежимРаботыПриИзменении</Event>
-					</Events>
-				</RadioButtonField>
-				<UsualGroup name="ГруппаКнопки" id="3">
-					<Group>AlwaysHorizontal</Group>
-					<Behavior>Usual</Behavior>
 					<Representation>None</Representation>
-					<ExtendedTooltip name="ГруппаКнопкиExtendedTooltip" id="29"/>
+					<ShowTitle>false</ShowTitle>
+					<ExtendedTooltip name="ГруппаЛевоРасширеннаяПодсказка" id="128"/>
 					<ChildItems>
-						<Button name="Запустить" id="4">
-							<Type>CommandBarButton</Type>
-							<DefaultButton>true</DefaultButton>
-							<CommandName>Form.Command.Запустить</CommandName>
-							<ExtendedTooltip name="ЗапуститьРасширеннаяПодсказка" id="23"/>
-						</Button>
-						<Button name="Остановить" id="5">
-							<Type>CommandBarButton</Type>
-							<CommandName>Form.Command.Остановить</CommandName>
-							<ExtendedTooltip name="ОстановитьРасширеннаяПодсказка" id="24"/>
-						</Button>
-						<Button name="Переиндексировать" id="6">
-							<Type>CommandBarButton</Type>
-							<CommandName>Form.Command.Переиндексировать</CommandName>
-							<ExtendedTooltip name="ПереиндексироватьРасширеннаяПодсказка" id="25"/>
-						</Button>
-						<Button name="ОбновитьСтатус" id="7">
-							<Type>CommandBarButton</Type>
-							<CommandName>Form.Command.ОбновитьСтатус</CommandName>
-							<ExtendedTooltip name="ОбновитьСтатусРасширеннаяПодсказка" id="26"/>
-						</Button>
+						<UsualGroup name="ГруппаУправление" id="1">
+							<Title>
+								<v8:item>
+									<v8:lang>ru</v8:lang>
+									<v8:content>Управление</v8:content>
+								</v8:item>
+							</Title>
+							<Group>Vertical</Group>
+							<Behavior>Usual</Behavior>
+							<Representation>NormalSeparation</Representation>
+							<ShowTitle>true</ShowTitle>
+							<ExtendedTooltip name="ГруппаУправлениеExtendedTooltip" id="27"/>
+							<ChildItems>
+								<RadioButtonField name="РежимРаботы" id="2">
+									<DataPath>РежимРаботы</DataPath>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Режим работы</v8:content>
+										</v8:item>
+									</Title>
+									<ToolTip>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>MCP — компонента обслуживает инструменты Vanessa Automation. MCP+RAG — дополнительно семантический поиск по шагам (нужны rcore.dll и модель эмбеддинга).</v8:content>
+										</v8:item>
+									</ToolTip>
+									<RadioButtonType>Tumbler</RadioButtonType>
+									<Orientation>HorizontalIfPossible</Orientation>
+									<ChoiceList>
+										<xr:Item>
+											<xr:Presentation/>
+											<xr:CheckState>0</xr:CheckState>
+											<xr:Value xsi:type="FormChoiceListDesTimeValue">
+												<Presentation>
+													<v8:item>
+														<v8:lang>ru</v8:lang>
+														<v8:content>MCP</v8:content>
+													</v8:item>
+												</Presentation>
+												<Value xsi:type="xs:string">MCP</Value>
+											</xr:Value>
+										</xr:Item>
+										<xr:Item>
+											<xr:Presentation/>
+											<xr:CheckState>0</xr:CheckState>
+											<xr:Value xsi:type="FormChoiceListDesTimeValue">
+												<Presentation>
+													<v8:item>
+														<v8:lang>ru</v8:lang>
+														<v8:content>MCP+RAG</v8:content>
+													</v8:item>
+												</Presentation>
+												<Value xsi:type="xs:string">MCP+RAG</Value>
+											</xr:Value>
+										</xr:Item>
+									</ChoiceList>
+									<ContextMenu name="РежимРаботыКонтекстноеМеню" id="21"/>
+									<ExtendedTooltip name="РежимРаботыРасширеннаяПодсказка" id="22"/>
+									<Events>
+										<Event name="OnChange">РежимРаботыПриИзменении</Event>
+									</Events>
+								</RadioButtonField>
+								<UsualGroup name="ГруппаКнопки" id="3">
+									<Group>AlwaysHorizontal</Group>
+									<Behavior>Usual</Behavior>
+									<Representation>None</Representation>
+									<ExtendedTooltip name="ГруппаКнопкиExtendedTooltip" id="29"/>
+									<ChildItems>
+										<Button name="Запустить" id="4">
+											<Type>CommandBarButton</Type>
+											<DefaultButton>true</DefaultButton>
+											<CommandName>Form.Command.Запустить</CommandName>
+											<ExtendedTooltip name="ЗапуститьРасширеннаяПодсказка" id="23"/>
+										</Button>
+										<Button name="Остановить" id="5">
+											<Type>CommandBarButton</Type>
+											<CommandName>Form.Command.Остановить</CommandName>
+											<ExtendedTooltip name="ОстановитьРасширеннаяПодсказка" id="24"/>
+										</Button>
+										<Button name="Переиндексировать" id="6">
+											<Type>CommandBarButton</Type>
+											<CommandName>Form.Command.Переиндексировать</CommandName>
+											<ExtendedTooltip name="ПереиндексироватьРасширеннаяПодсказка" id="25"/>
+										</Button>
+										<Button name="ОбновитьСтатус" id="7">
+											<Type>CommandBarButton</Type>
+											<CommandName>Form.Command.ОбновитьСтатус</CommandName>
+											<ExtendedTooltip name="ОбновитьСтатусРасширеннаяПодсказка" id="26"/>
+										</Button>
+									</ChildItems>
+								</UsualGroup>
+								<InputField name="СтатусСервера" id="8">
+									<DataPath>СтатусСервера</DataPath>
+									<ReadOnly>true</ReadOnly>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Сервер</v8:content>
+										</v8:item>
+									</Title>
+									<HorizontalStretch>true</HorizontalStretch>
+									<ContextMenu name="СтатусСервераContextMenu" id="30"/>
+									<ExtendedTooltip name="СтатусСервераExtendedTooltip" id="31"/>
+								</InputField>
+								<InputField name="СтатусИндексации" id="9">
+									<DataPath>СтатусИндексации</DataPath>
+									<ReadOnly>true</ReadOnly>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Индексация</v8:content>
+										</v8:item>
+									</Title>
+									<HorizontalStretch>true</HorizontalStretch>
+									<ContextMenu name="СтатусИндексацииContextMenu" id="33"/>
+									<ExtendedTooltip name="СтатусИндексацииExtendedTooltip" id="34"/>
+								</InputField>
+								<InputField name="СчетчикИнструментов" id="10">
+									<DataPath>СчетчикИнструментов</DataPath>
+									<ReadOnly>true</ReadOnly>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Инструментов</v8:content>
+										</v8:item>
+									</Title>
+									<Width>10</Width>
+									<HorizontalStretch>false</HorizontalStretch>
+									<ContextMenu name="СчетчикИнструментовContextMenu" id="36"/>
+									<ExtendedTooltip name="СчетчикИнструментовExtendedTooltip" id="37"/>
+								</InputField>
+							</ChildItems>
+						</UsualGroup>
+						<UsualGroup name="ГруппаНастройки" id="11">
+							<Title>
+								<v8:item>
+									<v8:lang>ru</v8:lang>
+									<v8:content>Настройки сервера</v8:content>
+								</v8:item>
+							</Title>
+							<Group>Vertical</Group>
+							<Behavior>Usual</Behavior>
+							<Representation>NormalSeparation</Representation>
+							<ShowTitle>true</ShowTitle>
+							<ExtendedTooltip name="ГруппаНастройкиExtendedTooltip" id="39"/>
+							<ChildItems>
+								<InputField name="Порт" id="12">
+									<DataPath>Порт</DataPath>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Порт</v8:content>
+										</v8:item>
+									</Title>
+									<ToolTip>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>TCP-порт MCP сервера. ИИ-агент подключается к http://localhost:&lt;порт&gt;/mcp</v8:content>
+										</v8:item>
+									</ToolTip>
+									<Width>8</Width>
+									<HorizontalStretch>false</HorizontalStretch>
+									<InputHint>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>8765</v8:content>
+										</v8:item>
+									</InputHint>
+									<ContextMenu name="ПортContextMenu" id="40"/>
+									<ExtendedTooltip name="ПортExtendedTooltip" id="41"/>
+								</InputField>
+								<InputField name="КаталогКомпоненты" id="13">
+									<DataPath>КаталогКомпоненты</DataPath>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Каталог компоненты</v8:content>
+										</v8:item>
+									</Title>
+									<ToolTip>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Распакованный бандл http1c-addin-full.zip. Компонента подключается прямо из этой папки (in-place), чтобы rcore.dll был рядом.</v8:content>
+										</v8:item>
+									</ToolTip>
+									<HorizontalStretch>true</HorizontalStretch>
+									<ChoiceButton>true</ChoiceButton>
+									<InputHint>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Папка с libhttp1cWin.dll, rcore.dll, DirectML.dll</v8:content>
+										</v8:item>
+									</InputHint>
+									<ContextMenu name="КаталогКомпонентыContextMenu" id="43"/>
+									<ExtendedTooltip name="КаталогКомпонентыExtendedTooltip" id="44"/>
+									<Events>
+										<Event name="StartChoice">КаталогКомпонентыНачалоВыбора</Event>
+									</Events>
+								</InputField>
+								<UsualGroup name="ГруппаУстановкаКомпоненты" id="67">
+									<Group>AlwaysHorizontal</Group>
+									<Behavior>Usual</Behavior>
+									<Representation>None</Representation>
+									<ExtendedTooltip name="ГруппаУстановкаКомпонентыExtendedTooltip" id="68"/>
+									<ChildItems>
+										<LabelDecoration name="СсылкаСкачатьКомпоненту" id="69">
+											<Title formatted="false">
+												<v8:item>
+													<v8:lang>ru</v8:lang>
+													<v8:content>Скачать компоненту (последний релиз)</v8:content>
+												</v8:item>
+											</Title>
+											<ToolTip>
+												<v8:item>
+													<v8:lang>ru</v8:lang>
+													<v8:content>Скачивает http1c-addin-full.zip (libhttp1cWin.dll + rcore.dll + DirectML.dll) из последнего релиза. Если прямая ссылка не работает — откройте страницу релизов: https://github.com/DitriXNew/MCP-DB-Client/releases</v8:content>
+												</v8:item>
+											</ToolTip>
+											<Hyperlink>true</Hyperlink>
+											<ContextMenu name="СсылкаСкачатьКомпонентуКонтекстноеМеню" id="70"/>
+											<ExtendedTooltip name="СсылкаСкачатьКомпонентуРасширеннаяПодсказка" id="71"/>
+											<Events>
+												<Event name="Click">СсылкаСкачатьКомпонентуНажатие</Event>
+											</Events>
+										</LabelDecoration>
+										<Button name="УстановитьИзПапки" id="99">
+											<Type>UsualButton</Type>
+											<CommandName>Form.Command.УстановитьИзПапки</CommandName>
+											<ExtendedTooltip name="УстановитьИзПапкиРасширеннаяПодсказка" id="100"/>
+										</Button>
+									</ChildItems>
+								</UsualGroup>
+								<InputField name="ТокенАвторизации" id="14">
+									<DataPath>ТокенАвторизации</DataPath>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Токен авторизации</v8:content>
+										</v8:item>
+									</Title>
+									<ToolTip>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Если задан, клиент обязан передавать заголовок Authorization: Bearer &lt;токен&gt;.</v8:content>
+										</v8:item>
+									</ToolTip>
+									<HorizontalStretch>true</HorizontalStretch>
+									<InputHint>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>(необязательно)</v8:content>
+										</v8:item>
+									</InputHint>
+									<ContextMenu name="ТокенАвторизацииContextMenu" id="46"/>
+									<ExtendedTooltip name="ТокенАвторизацииExtendedTooltip" id="47"/>
+								</InputField>
+								<CheckBoxField name="ВестиЛог" id="15">
+									<DataPath>ВестиЛог</DataPath>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Вести лог</v8:content>
+										</v8:item>
+									</Title>
+									<ToolTip>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Писать лог компоненты (укажите файл ниже).</v8:content>
+										</v8:item>
+									</ToolTip>
+									<ContextMenu name="ВестиЛогContextMenu" id="49"/>
+									<ExtendedTooltip name="ВестиЛогExtendedTooltip" id="50"/>
+								</CheckBoxField>
+								<InputField name="ФайлЛога" id="16">
+									<DataPath>ФайлЛога</DataPath>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Файл лога</v8:content>
+										</v8:item>
+									</Title>
+									<ToolTip>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Полный путь к файлу лога компоненты.</v8:content>
+										</v8:item>
+									</ToolTip>
+									<HorizontalStretch>true</HorizontalStretch>
+									<ChoiceButton>true</ChoiceButton>
+									<InputHint>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>C:\temp\http1c.log</v8:content>
+										</v8:item>
+									</InputHint>
+									<ContextMenu name="ФайлЛогаContextMenu" id="52"/>
+									<ExtendedTooltip name="ФайлЛогаExtendedTooltip" id="53"/>
+									<Events>
+										<Event name="StartChoice">ФайлЛогаНачалоВыбора</Event>
+									</Events>
+								</InputField>
+							</ChildItems>
+						</UsualGroup>
 					</ChildItems>
 				</UsualGroup>
-				<InputField name="СтатусСервера" id="8">
-					<DataPath>СтатусСервера</DataPath>
-					<ReadOnly>true</ReadOnly>
+				<UsualGroup name="ГруппаRAG" id="17">
 					<Title>
 						<v8:item>
 							<v8:lang>ru</v8:lang>
-							<v8:content>Сервер</v8:content>
+							<v8:content>Семантический поиск (RAG)</v8:content>
 						</v8:item>
 					</Title>
-					<HorizontalStretch>true</HorizontalStretch>
-					<ContextMenu name="СтатусСервераContextMenu" id="30"/>
-					<ExtendedTooltip name="СтатусСервераExtendedTooltip" id="31"/>
-				</InputField>
-				<InputField name="СтатусИндексации" id="9">
-					<DataPath>СтатусИндексации</DataPath>
-					<ReadOnly>true</ReadOnly>
-					<Title>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Индексация</v8:content>
-						</v8:item>
-					</Title>
-					<HorizontalStretch>true</HorizontalStretch>
-					<ContextMenu name="СтатусИндексацииContextMenu" id="33"/>
-					<ExtendedTooltip name="СтатусИндексацииExtendedTooltip" id="34"/>
-				</InputField>
-				<InputField name="СчетчикИнструментов" id="10">
-					<DataPath>СчетчикИнструментов</DataPath>
-					<ReadOnly>true</ReadOnly>
-					<Title>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Инструментов</v8:content>
-						</v8:item>
-					</Title>
-					<Width>10</Width>
-					<HorizontalStretch>false</HorizontalStretch>
-					<ContextMenu name="СчетчикИнструментовContextMenu" id="36"/>
-					<ExtendedTooltip name="СчетчикИнструментовExtendedTooltip" id="37"/>
-				</InputField>
-			</ChildItems>
-		</UsualGroup>
-		<UsualGroup name="ГруппаНастройки" id="11">
-			<Title>
-				<v8:item>
-					<v8:lang>ru</v8:lang>
-					<v8:content>Настройки сервера</v8:content>
-				</v8:item>
-			</Title>
-			<Group>Vertical</Group>
-			<Behavior>Usual</Behavior>
-			<Representation>NormalSeparation</Representation>
-			<ShowTitle>true</ShowTitle>
-			<ExtendedTooltip name="ГруппаНастройкиExtendedTooltip" id="39"/>
-			<ChildItems>
-				<InputField name="Порт" id="12">
-					<DataPath>Порт</DataPath>
-					<Title>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Порт</v8:content>
-						</v8:item>
-					</Title>
-					<ToolTip>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>TCP-порт MCP сервера. ИИ-агент подключается к http://localhost:&lt;порт&gt;/mcp</v8:content>
-						</v8:item>
-					</ToolTip>
-					<Width>8</Width>
-					<HorizontalStretch>false</HorizontalStretch>
-					<InputHint>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>8765</v8:content>
-						</v8:item>
-					</InputHint>
-					<ContextMenu name="ПортContextMenu" id="40"/>
-					<ExtendedTooltip name="ПортExtendedTooltip" id="41"/>
-				</InputField>
-				<InputField name="КаталогКомпоненты" id="13">
-					<DataPath>КаталогКомпоненты</DataPath>
-					<Title>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Каталог компоненты</v8:content>
-						</v8:item>
-					</Title>
-					<ToolTip>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Распакованный бандл http1c-addin-full.zip. Компонента подключается прямо из этой папки (in-place), чтобы rcore.dll был рядом.</v8:content>
-						</v8:item>
-					</ToolTip>
-					<HorizontalStretch>true</HorizontalStretch>
-					<ChoiceButton>true</ChoiceButton>
-					<InputHint>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Папка с libhttp1cWin.dll, rcore.dll, DirectML.dll</v8:content>
-						</v8:item>
-					</InputHint>
-					<ContextMenu name="КаталогКомпонентыContextMenu" id="43"/>
-					<ExtendedTooltip name="КаталогКомпонентыExtendedTooltip" id="44"/>
-					<Events>
-						<Event name="StartChoice">КаталогКомпонентыНачалоВыбора</Event>
-					</Events>
-				</InputField>
-				<UsualGroup name="ГруппаУстановкаКомпоненты" id="67">
-					<Group>AlwaysHorizontal</Group>
+					<Group>Vertical</Group>
 					<Behavior>Usual</Behavior>
-					<Representation>None</Representation>
-					<ExtendedTooltip name="ГруппаУстановкаКомпонентыExtendedTooltip" id="68"/>
+					<Representation>NormalSeparation</Representation>
+					<ShowTitle>true</ShowTitle>
+					<ExtendedTooltip name="ГруппаRAGExtendedTooltip" id="55"/>
 					<ChildItems>
-						<LabelDecoration name="СсылкаСкачатьКомпоненту" id="69">
-							<Title formatted="false">
-								<v8:item>
-									<v8:lang>ru</v8:lang>
-									<v8:content>Скачать компоненту (последний релиз)</v8:content>
-								</v8:item>
-							</Title>
-							<ToolTip>
-								<v8:item>
-									<v8:lang>ru</v8:lang>
-									<v8:content>Скачивает http1c-addin-full.zip (libhttp1cWin.dll + rcore.dll + DirectML.dll) из последнего релиза. Если прямая ссылка не работает — откройте страницу релизов: https://github.com/DitriXNew/MCP-DB-Client/releases</v8:content>
-								</v8:item>
-							</ToolTip>
-							<Hyperlink>true</Hyperlink>
-							<ContextMenu name="СсылкаСкачатьКомпонентуКонтекстноеМеню" id="70"/>
-							<ExtendedTooltip name="СсылкаСкачатьКомпонентуРасширеннаяПодсказка" id="71"/>
-							<Events>
-								<Event name="Click">СсылкаСкачатьКомпонентуНажатие</Event>
-							</Events>
-						</LabelDecoration>
-						<Button name="УстановитьИзАрхива" id="72">
-							<Type>UsualButton</Type>
-							<CommandName>Form.Command.УстановитьИзАрхива</CommandName>
-							<ExtendedTooltip name="УстановитьИзАрхиваРасширеннаяПодсказка" id="73"/>
-						</Button>
-						<Button name="УстановитьИзПапки" id="99">
-							<Type>UsualButton</Type>
-							<CommandName>Form.Command.УстановитьИзПапки</CommandName>
-							<ExtendedTooltip name="УстановитьИзПапкиРасширеннаяПодсказка" id="100"/>
-						</Button>
-					</ChildItems>
-				</UsualGroup>
-				<InputField name="ТокенАвторизации" id="14">
-					<DataPath>ТокенАвторизации</DataPath>
-					<Title>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Токен авторизации</v8:content>
-						</v8:item>
-					</Title>
-					<ToolTip>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Если задан, клиент обязан передавать заголовок Authorization: Bearer &lt;токен&gt;.</v8:content>
-						</v8:item>
-					</ToolTip>
-					<HorizontalStretch>true</HorizontalStretch>
-					<InputHint>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>(необязательно)</v8:content>
-						</v8:item>
-					</InputHint>
-					<ContextMenu name="ТокенАвторизацииContextMenu" id="46"/>
-					<ExtendedTooltip name="ТокенАвторизацииExtendedTooltip" id="47"/>
-				</InputField>
-				<CheckBoxField name="ВестиЛог" id="15">
-					<DataPath>ВестиЛог</DataPath>
-					<Title>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Вести лог</v8:content>
-						</v8:item>
-					</Title>
-					<ToolTip>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Писать лог компоненты (укажите файл ниже).</v8:content>
-						</v8:item>
-					</ToolTip>
-					<ContextMenu name="ВестиЛогContextMenu" id="49"/>
-					<ExtendedTooltip name="ВестиЛогExtendedTooltip" id="50"/>
-				</CheckBoxField>
-				<InputField name="ФайлЛога" id="16">
-					<DataPath>ФайлЛога</DataPath>
-					<Title>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Файл лога</v8:content>
-						</v8:item>
-					</Title>
-					<ToolTip>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Полный путь к файлу лога компоненты.</v8:content>
-						</v8:item>
-					</ToolTip>
-					<HorizontalStretch>true</HorizontalStretch>
-					<ChoiceButton>true</ChoiceButton>
-					<InputHint>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>C:\temp\http1c.log</v8:content>
-						</v8:item>
-					</InputHint>
-					<ContextMenu name="ФайлЛогаContextMenu" id="52"/>
-					<ExtendedTooltip name="ФайлЛогаExtendedTooltip" id="53"/>
-					<Events>
-						<Event name="StartChoice">ФайлЛогаНачалоВыбора</Event>
-					</Events>
-				</InputField>
-			</ChildItems>
-		</UsualGroup>
-		<UsualGroup name="ГруппаRAG" id="17">
-			<Title>
-				<v8:item>
-					<v8:lang>ru</v8:lang>
-					<v8:content>Семантический поиск (RAG)</v8:content>
-				</v8:item>
-			</Title>
-			<Group>Vertical</Group>
-			<Behavior>Usual</Behavior>
-			<Representation>NormalSeparation</Representation>
-			<ShowTitle>true</ShowTitle>
-			<ExtendedTooltip name="ГруппаRAGExtendedTooltip" id="55"/>
-			<ChildItems>
-				<InputField name="Модель" id="18">
-					<DataPath>Модель</DataPath>
-					<Title>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Модель эмбеддинга</v8:content>
-						</v8:item>
-					</Title>
-					<ToolTip>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Выберите модель из списка — она скачается автоматически при первом запуске (в Каталог моделей). Либо укажите путь к каталогу офлайн-модели (onnx/model.onnx + tokenizer.json и т.д.) — тогда сеть не нужна.</v8:content>
-						</v8:item>
-					</ToolTip>
-					<HorizontalStretch>true</HorizontalStretch>
-					<InputHint>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>имя из списка или путь к каталогу офлайн-модели</v8:content>
-						</v8:item>
-					</InputHint>
-					<ContextMenu name="МодельContextMenu" id="56"/>
-					<ExtendedTooltip name="МодельExtendedTooltip" id="57"/>
-					<Events>
-						<Event name="OnChange">МодельПриИзменении</Event>
-					</Events>
-				</InputField>
-				<LabelDecoration name="СсылкаНаМодель" id="64">
-					<Title formatted="false">
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Страница модели</v8:content>
-						</v8:item>
-					</Title>
-					<Hyperlink>true</Hyperlink>
-					<ContextMenu name="СсылкаНаМодельКонтекстноеМеню" id="65"/>
-					<ExtendedTooltip name="СсылкаНаМодельРасширеннаяПодсказка" id="66"/>
-					<Events>
-						<Event name="Click">СсылкаНаМодельНажатие</Event>
-					</Events>
-				</LabelDecoration>
-				<InputField name="КаталогМоделей" id="19">
-					<DataPath>КаталогМоделей</DataPath>
-					<Title>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Каталог моделей</v8:content>
-						</v8:item>
-					</Title>
-					<ToolTip>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Каталог загрузки/кэша модели при первом запуске. Пусто — кэш fastembed по умолчанию (рядом с процессом 1С).</v8:content>
-						</v8:item>
-					</ToolTip>
-					<HorizontalStretch>true</HorizontalStretch>
-					<ChoiceButton>true</ChoiceButton>
-					<InputHint>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>куда скачать/кэшировать модель</v8:content>
-						</v8:item>
-					</InputHint>
-					<ContextMenu name="КаталогМоделейContextMenu" id="59"/>
-					<ExtendedTooltip name="КаталогМоделейExtendedTooltip" id="60"/>
-					<Events>
-						<Event name="StartChoice">КаталогМоделейНачалоВыбора</Event>
-					</Events>
-				</InputField>
-				<InputField name="Устройство" id="20">
-					<DataPath>Устройство</DataPath>
-					<Title>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Устройство</v8:content>
-						</v8:item>
-					</Title>
-					<ToolTip>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>auto — GPU (DirectML) с автоматическим откатом на CPU; dml — только GPU; cpu — только процессор.</v8:content>
-						</v8:item>
-					</ToolTip>
-					<Width>10</Width>
-					<HorizontalStretch>false</HorizontalStretch>
-					<ContextMenu name="УстройствоContextMenu" id="62"/>
-					<ExtendedTooltip name="УстройствоExtendedTooltip" id="63"/>
-				</InputField>
-				<Table name="ТаблицаКоллекций" id="74">
-					<HeightInTableRows>4</HeightInTableRows>
-					<DataPath>ТаблицаКоллекций</DataPath>
-					<Title>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Коллекции файлов</v8:content>
-						</v8:item>
-					</Title>
-					<ToolTip>
-						<v8:item>
-							<v8:lang>ru</v8:lang>
-							<v8:content>Дополнительные коллекции для семантического поиска: файлы из указанных папок (например, фича-файлы проекта) индексируются целиком — работают search, grep и get_segment по строкам файлов.</v8:content>
-						</v8:item>
-					</ToolTip>
-					<ContextMenu name="ТаблицаКоллекцийКонтекстноеМеню" id="75"/>
-					<AutoCommandBar name="ТаблицаКоллекцийКоманднаяПанель" id="76"/>
-					<ExtendedTooltip name="ТаблицаКоллекцийРасширеннаяПодсказка" id="77"/>
-					<SearchStringAddition name="ТаблицаКоллекцийСтрокаПоиска" id="78">
-						<AdditionSource>
-							<Item>ТаблицаКоллекций</Item>
-							<Type>SearchStringRepresentation</Type>
-						</AdditionSource>
-						<ContextMenu name="ТаблицаКоллекцийСтрокаПоискаКонтекстноеМеню" id="79"/>
-						<ExtendedTooltip name="ТаблицаКоллекцийСтрокаПоискаРасширеннаяПодсказка" id="80"/>
-					</SearchStringAddition>
-					<ViewStatusAddition name="ТаблицаКоллекцийСостояниеПросмотра" id="81">
-						<AdditionSource>
-							<Item>ТаблицаКоллекций</Item>
-							<Type>ViewStatusRepresentation</Type>
-						</AdditionSource>
-						<ContextMenu name="ТаблицаКоллекцийСостояниеПросмотраКонтекстноеМеню" id="82"/>
-						<ExtendedTooltip name="ТаблицаКоллекцийСостояниеПросмотраРасширеннаяПодсказка" id="83"/>
-					</ViewStatusAddition>
-					<SearchControlAddition name="ТаблицаКоллекцийУправлениеПоиском" id="84">
-						<AdditionSource>
-							<Item>ТаблицаКоллекций</Item>
-							<Type>SearchControl</Type>
-						</AdditionSource>
-						<ContextMenu name="ТаблицаКоллекцийУправлениеПоискомКонтекстноеМеню" id="85"/>
-						<ExtendedTooltip name="ТаблицаКоллекцийУправлениеПоискомРасширеннаяПодсказка" id="86"/>
-					</SearchControlAddition>
-					<ChildItems>
-						<InputField name="ТаблицаКоллекцийКоллекция" id="87">
-							<DataPath>ТаблицаКоллекций.Коллекция</DataPath>
+						<InputField name="Модель" id="18">
+							<DataPath>Модель</DataPath>
 							<Title>
 								<v8:item>
 									<v8:lang>ru</v8:lang>
-									<v8:content>Коллекция</v8:content>
+									<v8:content>Модель эмбеддинга</v8:content>
 								</v8:item>
 							</Title>
 							<ToolTip>
 								<v8:item>
 									<v8:lang>ru</v8:lang>
-									<v8:content>Имя коллекции для поиска (желательно латиница, цифры и подчёркивание, например project_features).</v8:content>
+									<v8:content>Выберите модель из списка — она скачается автоматически при первом запуске (в Каталог моделей). Либо укажите путь к каталогу офлайн-модели (onnx/model.onnx + tokenizer.json и т.д.) — тогда сеть не нужна.</v8:content>
 								</v8:item>
 							</ToolTip>
-							<EditMode>EnterOnInput</EditMode>
-							<Width>15</Width>
-							<ContextMenu name="ТаблицаКоллекцийКоллекцияКонтекстноеМеню" id="88"/>
-							<ExtendedTooltip name="ТаблицаКоллекцийКоллекцияРасширеннаяПодсказка" id="89"/>
-						</InputField>
-						<InputField name="ТаблицаКоллекцийОписание" id="90">
-							<DataPath>ТаблицаКоллекций.Описание</DataPath>
-							<Title>
-								<v8:item>
-									<v8:lang>ru</v8:lang>
-									<v8:content>Описание</v8:content>
-								</v8:item>
-							</Title>
-							<ToolTip>
-								<v8:item>
-									<v8:lang>ru</v8:lang>
-									<v8:content>Описание коллекции для ИИ-агента (передаётся как collection_description).</v8:content>
-								</v8:item>
-							</ToolTip>
-							<EditMode>EnterOnInput</EditMode>
-							<Width>25</Width>
-							<ContextMenu name="ТаблицаКоллекцийОписаниеКонтекстноеМеню" id="91"/>
-							<ExtendedTooltip name="ТаблицаКоллекцийОписаниеРасширеннаяПодсказка" id="92"/>
-						</InputField>
-						<InputField name="ТаблицаКоллекцийКаталог" id="93">
-							<DataPath>ТаблицаКоллекций.Каталог</DataPath>
-							<Title>
-								<v8:item>
-									<v8:lang>ru</v8:lang>
-									<v8:content>Каталог</v8:content>
-								</v8:item>
-							</Title>
-							<ToolTip>
-								<v8:item>
-									<v8:lang>ru</v8:lang>
-									<v8:content>Путь к папке с файлами (поиск рекурсивный, включая подпапки).</v8:content>
-								</v8:item>
-							</ToolTip>
-							<EditMode>EnterOnInput</EditMode>
-							<Width>30</Width>
-							<ChoiceButton>true</ChoiceButton>
-							<ContextMenu name="ТаблицаКоллекцийКаталогКонтекстноеМеню" id="94"/>
-							<ExtendedTooltip name="ТаблицаКоллекцийКаталогРасширеннаяПодсказка" id="95"/>
-							<Events>
-								<Event name="StartChoice">ТаблицаКоллекцийКаталогНачалоВыбора</Event>
-							</Events>
-						</InputField>
-						<InputField name="ТаблицаКоллекцийРасширения" id="96">
-							<DataPath>ТаблицаКоллекций.Расширения</DataPath>
-							<Title>
-								<v8:item>
-									<v8:lang>ru</v8:lang>
-									<v8:content>Расширения</v8:content>
-								</v8:item>
-							</Title>
-							<ToolTip>
-								<v8:item>
-									<v8:lang>ru</v8:lang>
-									<v8:content>Фильтр расширений: «feature» или «feature;md;txt» (допускается и «*.feature»). Пусто — feature.</v8:content>
-								</v8:item>
-							</ToolTip>
-							<EditMode>EnterOnInput</EditMode>
-							<Width>12</Width>
+							<HorizontalStretch>true</HorizontalStretch>
 							<InputHint>
 								<v8:item>
 									<v8:lang>ru</v8:lang>
-									<v8:content>feature</v8:content>
+									<v8:content>имя из списка или путь к каталогу офлайн-модели</v8:content>
 								</v8:item>
 							</InputHint>
-							<ContextMenu name="ТаблицаКоллекцийРасширенияКонтекстноеМеню" id="97"/>
-							<ExtendedTooltip name="ТаблицаКоллекцийРасширенияРасширеннаяПодсказка" id="98"/>
+							<ContextMenu name="МодельContextMenu" id="56"/>
+							<ExtendedTooltip name="МодельExtendedTooltip" id="57"/>
+							<Events>
+								<Event name="OnChange">МодельПриИзменении</Event>
+							</Events>
 						</InputField>
+						<LabelDecoration name="СсылкаНаМодель" id="64">
+							<Title formatted="false">
+								<v8:item>
+									<v8:lang>ru</v8:lang>
+									<v8:content>Страница модели</v8:content>
+								</v8:item>
+							</Title>
+							<Hyperlink>true</Hyperlink>
+							<ContextMenu name="СсылкаНаМодельКонтекстноеМеню" id="65"/>
+							<ExtendedTooltip name="СсылкаНаМодельРасширеннаяПодсказка" id="66"/>
+							<Events>
+								<Event name="Click">СсылкаНаМодельНажатие</Event>
+							</Events>
+						</LabelDecoration>
+						<InputField name="КаталогМоделей" id="19">
+							<DataPath>КаталогМоделей</DataPath>
+							<Title>
+								<v8:item>
+									<v8:lang>ru</v8:lang>
+									<v8:content>Каталог моделей</v8:content>
+								</v8:item>
+							</Title>
+							<ToolTip>
+								<v8:item>
+									<v8:lang>ru</v8:lang>
+									<v8:content>Каталог загрузки/кэша модели при первом запуске. Пусто — кэш fastembed по умолчанию (рядом с процессом 1С).</v8:content>
+								</v8:item>
+							</ToolTip>
+							<HorizontalStretch>true</HorizontalStretch>
+							<ChoiceButton>true</ChoiceButton>
+							<InputHint>
+								<v8:item>
+									<v8:lang>ru</v8:lang>
+									<v8:content>куда скачать/кэшировать модель</v8:content>
+								</v8:item>
+							</InputHint>
+							<ContextMenu name="КаталогМоделейContextMenu" id="59"/>
+							<ExtendedTooltip name="КаталогМоделейExtendedTooltip" id="60"/>
+							<Events>
+								<Event name="StartChoice">КаталогМоделейНачалоВыбора</Event>
+							</Events>
+						</InputField>
+						<InputField name="Устройство" id="20">
+							<DataPath>Устройство</DataPath>
+							<Title>
+								<v8:item>
+									<v8:lang>ru</v8:lang>
+									<v8:content>Устройство</v8:content>
+								</v8:item>
+							</Title>
+							<ToolTip>
+								<v8:item>
+									<v8:lang>ru</v8:lang>
+									<v8:content>auto — GPU (DirectML) с автоматическим откатом на CPU; dml — только GPU; cpu — только процессор.</v8:content>
+								</v8:item>
+							</ToolTip>
+							<Width>10</Width>
+							<HorizontalStretch>false</HorizontalStretch>
+							<ContextMenu name="УстройствоContextMenu" id="62"/>
+							<ExtendedTooltip name="УстройствоExtendedTooltip" id="63"/>
+						</InputField>
+						<Table name="ТаблицаКоллекций" id="74">
+							<HeightInTableRows>4</HeightInTableRows>
+							<DataPath>ТаблицаКоллекций</DataPath>
+							<Title>
+								<v8:item>
+									<v8:lang>ru</v8:lang>
+									<v8:content>Коллекции файлов</v8:content>
+								</v8:item>
+							</Title>
+							<ToolTip>
+								<v8:item>
+									<v8:lang>ru</v8:lang>
+									<v8:content>Дополнительные коллекции для семантического поиска: файлы из указанных папок (например, фича-файлы проекта) индексируются целиком — работают search, grep и get_segment по строкам файлов.</v8:content>
+								</v8:item>
+							</ToolTip>
+							<RowFilter xsi:nil="true"/>
+							<ContextMenu name="ТаблицаКоллекцийКонтекстноеМеню" id="75"/>
+							<AutoCommandBar name="ТаблицаКоллекцийКоманднаяПанель" id="76"/>
+							<ExtendedTooltip name="ТаблицаКоллекцийРасширеннаяПодсказка" id="77"/>
+							<SearchStringAddition name="ТаблицаКоллекцийСтрокаПоиска" id="78">
+								<AdditionSource>
+									<Item>ТаблицаКоллекций</Item>
+									<Type>SearchStringRepresentation</Type>
+								</AdditionSource>
+								<ContextMenu name="ТаблицаКоллекцийСтрокаПоискаКонтекстноеМеню" id="79"/>
+								<ExtendedTooltip name="ТаблицаКоллекцийСтрокаПоискаРасширеннаяПодсказка" id="80"/>
+							</SearchStringAddition>
+							<ViewStatusAddition name="ТаблицаКоллекцийСостояниеПросмотра" id="81">
+								<AdditionSource>
+									<Item>ТаблицаКоллекций</Item>
+									<Type>ViewStatusRepresentation</Type>
+								</AdditionSource>
+								<ContextMenu name="ТаблицаКоллекцийСостояниеПросмотраКонтекстноеМеню" id="82"/>
+								<ExtendedTooltip name="ТаблицаКоллекцийСостояниеПросмотраРасширеннаяПодсказка" id="83"/>
+							</ViewStatusAddition>
+							<SearchControlAddition name="ТаблицаКоллекцийУправлениеПоиском" id="84">
+								<AdditionSource>
+									<Item>ТаблицаКоллекций</Item>
+									<Type>SearchControl</Type>
+								</AdditionSource>
+								<ContextMenu name="ТаблицаКоллекцийУправлениеПоискомКонтекстноеМеню" id="85"/>
+								<ExtendedTooltip name="ТаблицаКоллекцийУправлениеПоискомРасширеннаяПодсказка" id="86"/>
+							</SearchControlAddition>
+							<ChildItems>
+								<InputField name="ТаблицаКоллекцийКоллекция" id="87">
+									<DataPath>ТаблицаКоллекций.Коллекция</DataPath>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Коллекция</v8:content>
+										</v8:item>
+									</Title>
+									<ToolTip>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Имя коллекции для поиска (желательно латиница, цифры и подчёркивание, например project_features).</v8:content>
+										</v8:item>
+									</ToolTip>
+									<EditMode>EnterOnInput</EditMode>
+									<Width>15</Width>
+									<ContextMenu name="ТаблицаКоллекцийКоллекцияКонтекстноеМеню" id="88"/>
+									<ExtendedTooltip name="ТаблицаКоллекцийКоллекцияРасширеннаяПодсказка" id="89"/>
+								</InputField>
+								<InputField name="ТаблицаКоллекцийОписание" id="90">
+									<DataPath>ТаблицаКоллекций.Описание</DataPath>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Описание</v8:content>
+										</v8:item>
+									</Title>
+									<ToolTip>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Описание коллекции для ИИ-агента (передаётся как collection_description).</v8:content>
+										</v8:item>
+									</ToolTip>
+									<EditMode>EnterOnInput</EditMode>
+									<Width>25</Width>
+									<ContextMenu name="ТаблицаКоллекцийОписаниеКонтекстноеМеню" id="91"/>
+									<ExtendedTooltip name="ТаблицаКоллекцийОписаниеРасширеннаяПодсказка" id="92"/>
+								</InputField>
+								<InputField name="ТаблицаКоллекцийКаталог" id="93">
+									<DataPath>ТаблицаКоллекций.Каталог</DataPath>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Каталог</v8:content>
+										</v8:item>
+									</Title>
+									<ToolTip>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Путь к папке с файлами (поиск рекурсивный, включая подпапки).</v8:content>
+										</v8:item>
+									</ToolTip>
+									<EditMode>EnterOnInput</EditMode>
+									<Width>30</Width>
+									<ChoiceButton>true</ChoiceButton>
+									<ContextMenu name="ТаблицаКоллекцийКаталогКонтекстноеМеню" id="94"/>
+									<ExtendedTooltip name="ТаблицаКоллекцийКаталогРасширеннаяПодсказка" id="95"/>
+									<Events>
+										<Event name="StartChoice">ТаблицаКоллекцийКаталогНачалоВыбора</Event>
+									</Events>
+								</InputField>
+								<InputField name="ТаблицаКоллекцийРасширения" id="96">
+									<DataPath>ТаблицаКоллекций.Расширения</DataPath>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Расширения</v8:content>
+										</v8:item>
+									</Title>
+									<ToolTip>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Фильтр расширений: «feature» или «feature;md;txt» (допускается и «*.feature»). Пусто — feature.</v8:content>
+										</v8:item>
+									</ToolTip>
+									<EditMode>EnterOnInput</EditMode>
+									<Width>12</Width>
+									<InputHint>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>feature</v8:content>
+										</v8:item>
+									</InputHint>
+									<ContextMenu name="ТаблицаКоллекцийРасширенияКонтекстноеМеню" id="97"/>
+									<ExtendedTooltip name="ТаблицаКоллекцийРасширенияРасширеннаяПодсказка" id="98"/>
+								</InputField>
+							</ChildItems>
+						</Table>
 					</ChildItems>
-				</Table>
+				</UsualGroup>
 			</ChildItems>
 		</UsualGroup>
 	</ChildItems>
@@ -921,21 +958,6 @@
 				</v8:item>
 			</ToolTip>
 			<Action>ОбновитьСтатус</Action>
-		</Command>
-		<Command name="УстановитьИзАрхива" id="5">
-			<Title>
-				<v8:item>
-					<v8:lang>ru</v8:lang>
-					<v8:content>Установить из архива…</v8:content>
-				</v8:item>
-			</Title>
-			<ToolTip>
-				<v8:item>
-					<v8:lang>ru</v8:lang>
-					<v8:content>Выбрать скачанный http1c-addin-full.zip, распаковать в каталог и подставить его в поле «Каталог компоненты»</v8:content>
-				</v8:item>
-			</ToolTip>
-			<Action>УстановитьИзАрхива</Action>
 		</Command>
 		<Command name="УстановитьИзПапки" id="6">
 			<Title>
