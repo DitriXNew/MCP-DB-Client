@@ -303,6 +303,87 @@
 									<ContextMenu name="ПортContextMenu" id="40"/>
 									<ExtendedTooltip name="ПортExtendedTooltip" id="41"/>
 								</InputField>
+								<InputField name="КаталогКомпоненты" id="13">
+									<DataPath>КаталогКомпоненты</DataPath>
+									<Title>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Каталог компоненты</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Add-in directory</v8:content>
+										</v8:item>
+									</Title>
+									<ToolTip>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Каталог с распакованным бандлом компоненты: libhttp1cWin.dll + rcore.dll + DirectML.dll (для RAG). Скачайте http1c-addin-full.zip и распакуйте.</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Directory with the unpacked add-in bundle: libhttp1cWin.dll + rcore.dll + DirectML.dll (for RAG). Download http1c-addin-full.zip and unpack it.</v8:content>
+										</v8:item>
+									</ToolTip>
+									<HorizontalStretch>true</HorizontalStretch>
+									<ChoiceButton>true</ChoiceButton>
+									<InputHint>
+										<v8:item>
+											<v8:lang>ru</v8:lang>
+											<v8:content>Папка с libhttp1cWin.dll, rcore.dll, DirectML.dll</v8:content>
+										</v8:item>
+										<v8:item>
+											<v8:lang>en</v8:lang>
+											<v8:content>Folder with libhttp1cWin.dll, rcore.dll, DirectML.dll</v8:content>
+										</v8:item>
+									</InputHint>
+									<ContextMenu name="КаталогКомпонентыContextMenu" id="43"/>
+									<ExtendedTooltip name="КаталогКомпонентыExtendedTooltip" id="44"/>
+									<Events>
+										<Event name="StartChoice">КаталогКомпонентыНачалоВыбора</Event>
+									</Events>
+								</InputField>
+								<UsualGroup name="ГруппаУстановкаКомпоненты" id="67">
+									<Group>AlwaysHorizontal</Group>
+									<Behavior>Usual</Behavior>
+									<Representation>None</Representation>
+									<ExtendedTooltip name="ГруппаУстановкаКомпонентыExtendedTooltip" id="68"/>
+									<ChildItems>
+										<LabelDecoration name="СсылкаСкачатьКомпоненту" id="69">
+											<Title formatted="false">
+												<v8:item>
+													<v8:lang>ru</v8:lang>
+													<v8:content>Скачать компоненту (последний релиз)</v8:content>
+												</v8:item>
+												<v8:item>
+													<v8:lang>en</v8:lang>
+													<v8:content>Download the add-in (latest release)</v8:content>
+												</v8:item>
+											</Title>
+											<ToolTip>
+												<v8:item>
+													<v8:lang>ru</v8:lang>
+													<v8:content>Скачивает http1c-addin-full.zip (libhttp1cWin.dll + rcore.dll + DirectML.dll) из последнего релиза. Если прямая ссылка не работает — откройте страницу релизов: https://github.com/DitriXNew/MCP-DB-Client/releases</v8:content>
+												</v8:item>
+												<v8:item>
+													<v8:lang>en</v8:lang>
+													<v8:content>Downloads http1c-addin-full.zip (libhttp1cWin.dll + rcore.dll + DirectML.dll) from the latest release. If the direct link does not work, open the releases page: https://github.com/DitriXNew/MCP-DB-Client/releases</v8:content>
+												</v8:item>
+											</ToolTip>
+											<Hyperlink>true</Hyperlink>
+											<ContextMenu name="СсылкаСкачатьКомпонентуКонтекстноеМеню" id="70"/>
+											<ExtendedTooltip name="СсылкаСкачатьКомпонентуРасширеннаяПодсказка" id="71"/>
+											<Events>
+												<Event name="Click">СсылкаСкачатьКомпонентуНажатие</Event>
+											</Events>
+										</LabelDecoration>
+										<Button name="УстановитьИзПапки" id="99">
+											<Type>UsualButton</Type>
+											<CommandName>Form.Command.УстановитьИзПапки</CommandName>
+											<ExtendedTooltip name="УстановитьИзПапкиРасширеннаяПодсказка" id="100"/>
+										</Button>
+									</ChildItems>
+								</UsualGroup>
 								<InputField name="ТокенАвторизации" id="14">
 									<DataPath>ТокенАвторизации</DataPath>
 									<Title>
@@ -811,6 +892,29 @@
 				<Field>Порт</Field>
 			</Save>
 		</Attribute>
+		<Attribute name="КаталогКомпоненты" id="4">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Каталог компоненты</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Add-in directory</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+			<SavedData>true</SavedData>
+			<Save>
+				<Field>КаталогКомпоненты</Field>
+			</Save>
+		</Attribute>
 		<Attribute name="ТокенАвторизации" id="5">
 			<Title>
 				<v8:item>
@@ -1232,6 +1336,29 @@
 				</v8:item>
 			</ToolTip>
 			<Action>ОбновитьСтатус</Action>
+		</Command>
+		<Command name="УстановитьИзПапки" id="6">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Установить из папки…</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Install from folder…</v8:content>
+				</v8:item>
+			</Title>
+			<ToolTip>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Проверить состав каталога из поля «Каталог компоненты» (распакованный бандл: libhttp1cWin.dll + rcore.dll + DirectML.dll) и принять его</v8:content>
+				</v8:item>
+				<v8:item>
+					<v8:lang>en</v8:lang>
+					<v8:content>Validate the contents of the directory from the "Add-in directory" field (unpacked bundle: libhttp1cWin.dll + rcore.dll + DirectML.dll) and accept it</v8:content>
+				</v8:item>
+			</ToolTip>
+			<Action>УстановитьИзПапки</Action>
 		</Command>
 	</Commands>
 </Form>
