@@ -65,7 +65,7 @@ The harness never enables component logging and always finishes with
 
 Tests are split into two groups:
 
-- **Tests 1–9, 16–18**: Use the MCP tools directly via Copilot Chat (`getStatus`, `evaluate`, `execute`, `openForm`, `runLongTask`). These are the 5 registered MCP tools.
+- **Tests 1–9, 16–18**: Use the MCP tools directly via Copilot Chat (`getStatus`, `evaluate`, `execute`, `query`, `openForm`, `runLongTask`).
 - **Tests 10–15, 19+**: Use `curl` (or equivalent HTTP client) to test MCP primitives that are not tools — `resources/list`, `resources/read`, `prompts/list`, `prompts/get`, and HTTP-level behavior (session management, security, error codes).
 
 After each test, state what you observed and whether it matches the expected result. If a test fails, report the actual response and move to the next test.
@@ -79,8 +79,9 @@ After each test, state what you observed and whether it matches the expected res
 **Expected:** Five tools are listed:
 - `getStatus` — returns component and runtime status
 - `openForm` — opens a 1C form by path
-- `execute` — executes arbitrary BSL code
+- `execute` — executes arbitrary BSL code (on the server or, with `location: "client"`, on the thin client)
 - `evaluate` — evaluates a BSL expression
+- `query` — runs a 1C query with typed parameters and returns a Markdown table
 - `runLongTask` — runs a long operation with progress
 
 **Verify:**
@@ -159,6 +160,43 @@ code: "S = New Structure; S.Insert(""name"", ""test""); S.Insert(""value"", 42);
 **Expected result:** The tool returns with `isError: true` and an error message describing a division by zero.
 
 **Verify:** The response indicates an error occurred. The error text references division by zero.
+
+---
+
+## Test 7a: execute — Run on the Client
+
+**Action:** Call the `execute` tool with `code`: `"Result = ""hi from "" + ?(IsBlankString(""""), """", String(CurrentDate()));"` and `location`: `"client"`.
+
+(A simpler smoke variant: `code`: `"Result = String(CurrentDate());"`, `location`: `"client"`.)
+
+**Expected result:** The tool returns `isError: false`. The progress message mentions executing **client** code, and the result is the string produced on the thin client.
+
+**Verify:**
+- `isError` is `false`.
+- With `location` omitted or `"server"`, the same code still runs on the server (backward compatible).
+
+---
+
+## Test 7b: query — Typed Parameters → Markdown
+
+**Action:** Call the `query` tool with:
+
+```json
+{
+  "query": "SELECT TOP 5 Description AS Name, Code FROM Catalog.Users WHERE DeletionMark = &Mark",
+  "parameters": [ { "name": "Mark", "type": "Boolean", "value": false } ],
+  "limit": 100
+}
+```
+
+(Adjust the catalog to one that exists in the test infobase.)
+
+**Expected result:** The tool returns `isError: false` and a Markdown table: a header row (`Name`, `Code`), a `| --- | --- |` separator, up to `limit` data rows, and a trailing `_N row(s)._` / `_Shown N of M rows…_` note. A query with no rows returns `_Query returned 0 rows._`.
+
+**Verify:**
+- The result is valid GitHub-flavored Markdown.
+- `Date` / `Ref:<Kind.Name>` parameters bind without a type-conversion error.
+- A malformed query text returns `isError: true` with the 1C error description (no crash).
 
 ---
 

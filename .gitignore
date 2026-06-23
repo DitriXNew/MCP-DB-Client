@@ -39,10 +39,6 @@ build/tools/
 # Packaged add-in artifacts
 build/artifacts/
 
-# Embedded full add-in bundle inside the VA plugin (45 MB build artifact;
-# regenerated from build/artifacts/http1c-addin-full.zip before the .epf build).
-vanessa-plugin/MCPRagSearch/MCPRagSearch/Templates/КомпонентаHttp1c/Ext/Template.bin
-
 # CMake and out-of-source build directories
 http-1c-dll/build/
 http-1c-dll/build-smoke/

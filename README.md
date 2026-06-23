@@ -107,8 +107,11 @@ build/compile-http1c-epf.sh
 
 ### 4. Open in 1C
 
-1. Open the `http1c.epf` data processor in your 1C infobase.
-2. Click **Connect** — the MCP server starts on the configured port.
+1. Open the `http1c.epf` data processor in your 1C infobase. The MCP server
+   **starts automatically on open** (attaches the component, registers the tool /
+   resource / prompt catalogs, and begins listening on port `8888` by default).
+2. To restart it on a different port, set the port field and click **Connect**.
+   (The `Connect` button remains available for manual control.)
 3. Configure your MCP client to connect to `http://localhost:PORT/mcp`.
 
 ### 5. VS Code configuration
@@ -368,8 +371,9 @@ Events sent from the native component to 1C:
 |------|---------|-------------|
 | `getStatus` | Component + runtime status | readOnly |
 | `openForm` | Open a 1C form by path | idempotent |
-| `execute` | Execute arbitrary 1C code | destructive |
+| `execute` | Execute arbitrary 1C code on the server **or** the thin client (`location` param) | destructive |
 | `evaluate` | Evaluate a 1C expression | readOnly, idempotent |
+| `query` | Run a 1C query with typed parameters, return the result as a Markdown table | readOnly, idempotent |
 | `runLongTask` | Test progress notification | readOnly |
 
 ## Reference Resources

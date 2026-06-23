@@ -134,6 +134,14 @@ Procedure OnOpen(Cancel)
 	// instead attaches the on-disk DLL in ExtCompT IN-PLACE so rcore.dll is found
 	// beside libhttp1cWin.dll (real search) — its location comes from the launch
 	// config, never hardcoded.
+	// Headless probe for the query/execute tools — exercises the new server/client
+	// code paths directly (no MCP transport or add-in needed) and writes a report
+	// to toolselftest-result.txt. Triggered by the /Ctoolselftest launch parameter.
+	If StrFind(Lower(String(LaunchParameter)), "toolselftest") > 0 Then
+		AttachIdleHandler("RunToolSelfTestDeferred", 1, True);
+		Return;
+	EndIf;
+
 	If SelfTestCfg.selftest Then
 		AttachSelfTestComponent(0);
 	Else
@@ -261,7 +269,7 @@ EndProcedure
 &AtClient
 Function BuildVersion()
 	// Bump on EVERY source change so the log proves a fresh .epf is running.
-	Return "selftest-build-26-async-config";
+	Return "selftest-build-30-autostart";
 EndFunction
 
 &AtClient
@@ -300,14 +308,19 @@ Procedure OnOpenAttachEnd(Connected, AdditionalParameters) Export
 	// Config via the async ApplyConfig method — property assignment is blocked
 	// in async-only infobases ("Cannot call synchronous methods on the client").
 	// The self-test scheduling continues in OnOpenConfigEnd once config lands.
+	// Register the MCP tool/resource/prompt catalogs on a normal open so the
+	// auto-started server (see OnOpenConfigEnd) serves them; the RAG self-test
+	// attach skips them (it drives the search core directly via RagDispatch).
 	Try
 		Component.BeginCallingApplyConfig(
 			New NotifyDescription("OnOpenConfigEnd", ThisObject),
-			BuildConfigJson(False));
+			BuildConfigJson(Not SelfTestCfg.selftest));
 	Except
 		TraceLine("ApplyConfig dispatch EXCEPTION: " + ErrorDescription());
-		// Still schedule the self-test — logging config is non-essential.
-		OnOpenConfigEnd(Undefined, Undefined, Undefined);
+		// Still schedule the self-test — logging config is non-essential. Pass a
+		// marker so a plain open does NOT auto-start a server whose MCP catalogs
+		// were never applied.
+		OnOpenConfigEnd(Undefined, Undefined, "configfailed");
 	EndTry;
 
 EndProcedure
@@ -331,7 +344,51 @@ Procedure OnOpenConfigEnd(ResultCall, ParametersCall, AdditionalParameters) Expo
 	ElsIf StrFind(LP, "ragselftest") > 0 Then
 		TraceLine("scheduling RunRagSelfTestDeferred");
 		AttachIdleHandler("RunRagSelfTestDeferred", 1, True);
+	ElsIf AdditionalParameters = "configfailed" Then
+		// Config (and therefore the MCP tool catalogs) never applied — do not bring
+		// up a half-configured server on a plain open.
+		TraceLine("skip auto-start: ApplyConfig did not run");
+	Else
+		// Plain open (no dev/test launch trigger): start the MCP HTTP server now so
+		// the processor is ready for clients without a manual Connect click.
+		StartListenOnOpen();
 	EndIf;
+
+EndProcedure
+
+// Auto-start the MCP HTTP server on form open. Mirrors AttachConfigEnd but stays
+// silent (no modal on open) and only traces the outcome.
+&AtClient
+Procedure StartListenOnOpen()
+
+	If Component = Undefined Then
+		Return;
+	EndIf;
+
+	PortValue = Port;
+	If PortValue = 0 Then
+		PortValue = 8888;
+		Port = PortValue;
+	EndIf;
+
+	Try
+		Component.BeginCallingStartListen(
+			New NotifyDescription("StartListenOnOpenEnd", ThisObject),
+			PortValue);
+	Except
+		TraceLine("StartListen (on open) dispatch EXCEPTION: " + ErrorDescription());
+	EndTry;
+
+EndProcedure
+
+&AtClient
+Procedure StartListenOnOpenEnd(ResultCall, ParametersCall, AdditionalParameters) Export
+
+	PortValue = Port;
+	If PortValue = 0 Then
+		PortValue = 8888;
+	EndIf;
+	TraceLine("MCP server auto-started on port " + Format(PortValue, "NG=0"));
 
 EndProcedure
 
@@ -746,6 +803,7 @@ Function McpToolsJson()
 	Tools.Add(ToolOpenForm());
 	Tools.Add(ToolExecute());
 	Tools.Add(ToolEvaluate());
+	Tools.Add(ToolQuery());
 	Tools.Add(ToolRunLongTask());
 	Tools.Add(ToolTakeScreenshot());
 	Tools.Add(ToolTestScreenshot());
@@ -906,9 +964,11 @@ EndFunction
 Function ToolExecute()
 	
 	Tool = NewTool("execute",
-		"Execute arbitrary 1C:Enterprise code on the server. The code must assign a string value to the Result variable.");
+		"Execute arbitrary 1C:Enterprise code on the server (default) or on the thin client. The code must assign a string value to the Result variable.");
 	AddToolParam(Tool, "code", "string",
-		"Server-side 1C code. Example: Result = String(CurrentDate());");
+		"1C code to execute. Example: Result = String(CurrentDate());");
+	AddToolParam(Tool, "location", "string",
+		"Execution context: 'server' (default — full DB access and business logic) or 'client' (thin-client UI/forms context).", False);
 	AddToolAnnotations(Tool, False, True);  // potentially destructive
 	
 	// outputSchema — the execution result
@@ -936,6 +996,56 @@ Function ToolEvaluate()
 	
 	Return Tool;
 	
+EndFunction
+
+&AtClient
+Function ToolQuery()
+
+	Tool = NewTool("query",
+		"Execute a 1C:Enterprise query (query language) against the infobase and return the result as a Markdown table. Use typed parameters to safely bind values such as dates and references.");
+
+	AddToolParam(Tool, "query", "string",
+		"Query text in the 1C query language. Example: SELECT Description AS Name, Code FROM Catalog.Products WHERE DeletionMark = FALSE");
+
+	// parameters: array of { name, type, value } objects.
+	ItemProps = New Structure;
+	ItemProps.Insert("name",
+		New Structure("type,description", "string", "Parameter name as used in the query (without the & prefix)."));
+	ItemProps.Insert("type",
+		New Structure("type,description", "string",
+			"1C type to cast the value to: String, Number, Boolean, Date, UUID, Null, or Ref:<FullMetadataName> (for example Ref:Catalog.Counterparties). Russian aliases (Строка, Число, Дата, Ссылка:...) are also accepted."));
+	ValueTypes = New Array;
+	ValueTypes.Add("string");
+	ValueTypes.Add("number");
+	ValueTypes.Add("boolean");
+	ValueTypes.Add("null");
+	ValueTypes.Add("array");
+	ItemProps.Insert("value",
+		New Structure("type,description", ValueTypes, "Raw value to bind; it is cast to the 1C type given above."));
+
+	ParamItemSchema = New Structure;
+	ParamItemSchema.Insert("type", "object");
+	ParamItemSchema.Insert("properties", ItemProps);
+	ParamItemSchema.Insert("required", New Array);
+
+	ParamsSchema = New Structure;
+	ParamsSchema.Insert("type", "array");
+	ParamsSchema.Insert("description", "Typed query parameters. Each item is an object { name, type, value }.");
+	ParamsSchema.Insert("items", ParamItemSchema);
+	Tool.inputSchema.properties.Insert("parameters", ParamsSchema);
+
+	AddToolParam(Tool, "limit", "number",
+		"Maximum number of result rows to render in the Markdown table (default 100, hard-capped at 1000).", False);
+
+	AddToolAnnotations(Tool, True, False, True);  // read-only, idempotent
+
+	// outputSchema — the Markdown result
+	Schema = NewOutputSchema();
+	AddOutputProperty(Schema, "result", "string", "Markdown table with the query result");
+	SetToolOutputSchema(Tool, Schema);
+
+	Return Tool;
+
 EndFunction
 
 &AtClient
@@ -1030,6 +1140,8 @@ Procedure ProcessToolCall(Data)
 			HandleExecute(RequestID, Arguments);
 		ElsIf ToolName = "evaluate" Then
 			HandleEvaluate(RequestID, Arguments);
+		ElsIf ToolName = "query" Then
+			HandleQuery(RequestID, Arguments);
 		ElsIf ToolName = "runLongTask" Then
 			HandleRunLongTask(RequestID, Arguments);
 		ElsIf ToolName = "takeScreenshot" Then
@@ -1307,12 +1419,28 @@ Procedure HandleExecute(RequestID, Arguments)
 		Return;
 	EndIf;
 	
+	Location = GetArg(Arguments, "location");
+	If Not ValueIsFilled(Location) Then
+		Location = "server";
+	EndIf;
+	NormalizedLocation = Lower(TrimAll(Location));
+	If NormalizedLocation <> "server" And NormalizedLocation <> "client" Then
+		SendToolError(RequestID,
+			"Parameter 'location' must be 'server' or 'client' (got '" + String(Location) + "').");
+		Return;
+	EndIf;
+	RunOnClient = (NormalizedLocation = "client");
+
 	MarkRuntimeStart(RequestID, "execute", 1);
-	SendToolProgress(RequestID, 0, 1, "Executing server code.");
+	SendToolProgress(RequestID, 0, 1, "Executing " + ?(RunOnClient, "client", "server") + " code.");
 	
 	Try
-		ExecutionResult = ExecuteCodeOnServer(Code);
-		MarkRuntimeProgress(1, 1, "Server code execution completed.");
+		If RunOnClient Then
+			ExecutionResult = ExecuteCodeOnClient(Code);
+		Else
+			ExecutionResult = ExecuteCodeOnServer(Code);
+		EndIf;
+		MarkRuntimeProgress(1, 1, "Code execution completed.");
 		SendToolProgress(RequestID, 1, 1, RuntimeStatus.ProgressMessage);
 		MarkRuntimeSuccess(ExecutionResult);
 		SendToolResult(RequestID, RuntimeStatus.LastResult);
@@ -1322,6 +1450,17 @@ Procedure HandleExecute(RequestID, Arguments)
 	EndTry;
 	
 EndProcedure
+
+// Run BSL code in the thin-client context (UI/forms). Mirrors
+// ExecuteCodeOnServer: the code must assign a string to the Result variable.
+&AtClient
+Function ExecuteCodeOnClient(Val Code)
+
+	Result = "";
+	Execute(Code);
+	Return String(Result);
+
+EndFunction
 
 &AtServer
 Function ExecuteCodeOnServer(Val Code)
@@ -1333,8 +1472,307 @@ Function ExecuteCodeOnServer(Val Code)
 EndFunction
 
 &AtClient
+Procedure HandleQuery(RequestID, Arguments)
+
+	QueryText = GetArg(Arguments, "query");
+	If Not ValueIsFilled(QueryText) Then
+		SendToolError(RequestID, "Parameter 'query' is required.");
+		Return;
+	EndIf;
+
+	// Accept the parameters either as an already-parsed JSON array or as a JSON
+	// string (some clients send nested JSON as a string).
+	RawParams = GetArg(Arguments, "parameters");
+	If TypeOf(RawParams) = Type("String") Then
+		RawParams = ParseJsonArgument(RawParams, New Array);
+	EndIf;
+
+	Limit = NumberOrDefault(GetArg(Arguments, "limit"), 100);
+	If Limit <= 0 Then
+		Limit = 100;
+	EndIf;
+
+	MarkRuntimeStart(RequestID, "query", 1);
+	SendToolProgress(RequestID, 0, 1, "Executing query.");
+
+	Try
+		QueryResult = RunQueryToMarkdown(QueryText, RawParams, Limit);
+		If QueryResult.success Then
+			MarkRuntimeProgress(1, 1, "Query completed.");
+			SendToolProgress(RequestID, 1, 1, RuntimeStatus.ProgressMessage);
+			MarkRuntimeSuccess(QueryResult.markdown);
+			SendToolResult(RequestID, RuntimeStatus.LastResult);
+		Else
+			MarkRuntimeFailure("Query error: " + QueryResult.error);
+			SendToolError(RequestID, RuntimeStatus.LastError);
+		EndIf;
+	Except
+		MarkRuntimeFailure("Query error: " + ErrorDescription());
+		SendToolError(RequestID, RuntimeStatus.LastError);
+	EndTry;
+
+EndProcedure
+
+// Execute a query on the server and render its result as a Markdown table.
+// Returns a structure { success, markdown, error } so query-language errors
+// come back as a clean MCP error instead of an unhandled exception.
+&AtServer
+Function RunQueryToMarkdown(Val QueryText, Val ParamsRaw, Val Limit)
+
+	QueryResult = New Structure("success, markdown, error", False, "", "");
+
+	Try
+		Query = New Query(QueryText);
+	Except
+		QueryResult.error = "Invalid query: " + ErrorDescription();
+		Return QueryResult;
+	EndTry;
+
+	If TypeOf(ParamsRaw) = Type("Array") Then
+		For Each ParamItem In ParamsRaw Do
+			ParamName = QueryParamField(ParamItem, "name");
+			If Not ValueIsFilled(ParamName) Then
+				Continue;
+			EndIf;
+			ParamType = QueryParamField(ParamItem, "type");
+			ParamValue = QueryParamField(ParamItem, "value");
+			Try
+				Query.SetParameter(ParamName, CastQueryParam(ParamValue, ParamType));
+			Except
+				QueryResult.error = "Parameter '" + ParamName + "' (" + String(ParamType) + "): " + ErrorDescription();
+				Return QueryResult;
+			EndTry;
+		EndDo;
+	EndIf;
+
+	Try
+		Executed = Query.Execute();
+	Except
+		QueryResult.error = ErrorDescription();
+		Return QueryResult;
+	EndTry;
+
+	QueryResult.markdown = QueryResultToMarkdown(Executed, Limit);
+	QueryResult.success = True;
+	Return QueryResult;
+
+EndFunction
+
+// Read a named field from a query-parameter item (Map from parsed JSON, or a
+// Structure when supplied programmatically).
+&AtServer
+Function QueryParamField(Val ParamItem, Val FieldName)
+
+	If TypeOf(ParamItem) = Type("Map") Then
+		Return ParamItem[FieldName];
+	ElsIf TypeOf(ParamItem) = Type("Structure") Then
+		FieldValue = Undefined;
+		ParamItem.Property(FieldName, FieldValue);
+		Return FieldValue;
+	EndIf;
+	Return Undefined;
+
+EndFunction
+
+// Cast a raw JSON value to the 1C type requested for a query parameter.
+&AtServer
+Function CastQueryParam(Val Value, Val TypeName)
+
+	If Not ValueIsFilled(TypeName) Then
+		// No explicit type — bind the JSON-native value as-is.
+		Return Value;
+	EndIf;
+
+	Normalized = Lower(TrimAll(TypeName));
+
+	If Normalized = "string" Or Normalized = "строка" Then
+		Return ?(Value = Undefined, "", String(Value));
+	ElsIf Normalized = "number" Or Normalized = "число" Then
+		If TypeOf(Value) = Type("Number") Then
+			Return Value;
+		EndIf;
+		Return Number(StrReplace(TrimAll(String(Value)), ",", "."));
+	ElsIf Normalized = "boolean" Or Normalized = "булево" Then
+		If TypeOf(Value) = Type("Boolean") Then
+			Return Value;
+		EndIf;
+		Flag = Lower(TrimAll(String(Value)));
+		Return (Flag = "true" Or Flag = "1" Or Flag = "да" Or Flag = "истина");
+	ElsIf Normalized = "date" Or Normalized = "дата" Then
+		Return ParseDateValue(Value);
+	ElsIf Normalized = "uuid" Or Normalized = "уникальныйидентификатор" Then
+		Return New UUID(TrimAll(String(Value)));
+	ElsIf Normalized = "null" Then
+		Return Null;
+	ElsIf Normalized = "undefined" Or Normalized = "неопределено" Then
+		Return Undefined;
+	ElsIf StrStartsWith(Normalized, "ref:") Or StrStartsWith(Normalized, "ссылка:") Then
+		MetaFullName = TrimAll(Mid(TypeName, StrFind(TypeName, ":") + 1));
+		Return RefFromUuid(MetaFullName, String(Value));
+	Else
+		// Unknown type hint — fall back to a string binding.
+		Return String(Value);
+	EndIf;
+
+EndFunction
+
+// Parse a JSON date (ISO "2026-01-01[THH:MM:SS]" or a 1C "YYYYMMDD..." string)
+// into a 1C Date. Non-digit separators are ignored.
+&AtServer
+Function ParseDateValue(Val Value)
+
+	Source = TrimAll(String(Value));
+	If Not ValueIsFilled(Source) Then
+		Return '00010101';
+	EndIf;
+
+	Digits = "";
+	For Position = 1 To StrLen(Source) Do
+		Symbol = Mid(Source, Position, 1);
+		If Symbol >= "0" And Symbol <= "9" Then
+			Digits = Digits + Symbol;
+		EndIf;
+	EndDo;
+
+	If StrLen(Digits) >= 14 Then
+		Return Date(Left(Digits, 14));
+	ElsIf StrLen(Digits) = 12 Then
+		Return Date(Digits + "00");
+	ElsIf StrLen(Digits) >= 8 Then
+		Return Date(Left(Digits, 8));
+	EndIf;
+
+	Return Date(Digits);
+
+EndFunction
+
+// Build a reference value from a UUID string and a metadata full name such as
+// "Catalog.Counterparties" / "Справочник.Контрагенты". Uses XMLValue against the
+// matching reference type so it works for every reference-bearing object kind.
+&AtServer
+Function RefFromUuid(Val MetaFullName, Val UuidString)
+
+	Parts = StrSplit(MetaFullName, ".", False);
+	If Parts.Count() < 2 Then
+		Raise "Invalid reference metadata name: '" + MetaFullName + "'. Expected Kind.Name, e.g. Catalog.Counterparties.";
+	EndIf;
+
+	RefTypeName = RefTypeForKind(Parts[0]) + "." + TrimAll(Parts[1]);
+	Return XMLValue(Type(RefTypeName), TrimAll(UuidString));
+
+EndFunction
+
+// Map a metadata object kind (RU or EN) to its reference type name.
+&AtServer
+Function RefTypeForKind(Val Kind)
+
+	Normalized = Lower(TrimAll(Kind));
+
+	KindMap = New Map;
+	// Russian kinds
+	KindMap.Insert("справочник", "СправочникСсылка");
+	KindMap.Insert("документ", "ДокументСсылка");
+	KindMap.Insert("перечисление", "ПеречислениеСсылка");
+	KindMap.Insert("планвидовхарактеристик", "ПланВидовХарактеристикСсылка");
+	KindMap.Insert("плансчетов", "ПланСчетовСсылка");
+	KindMap.Insert("планвидоврасчета", "ПланВидовРасчетаСсылка");
+	KindMap.Insert("бизнеспроцесс", "БизнесПроцессСсылка");
+	KindMap.Insert("задача", "ЗадачаСсылка");
+	// English kinds
+	KindMap.Insert("catalog", "CatalogRef");
+	KindMap.Insert("document", "DocumentRef");
+	KindMap.Insert("enum", "EnumRef");
+	KindMap.Insert("chartofcharacteristictypes", "ChartOfCharacteristicTypesRef");
+	KindMap.Insert("chartofaccounts", "ChartOfAccountsRef");
+	KindMap.Insert("chartofcalculationtypes", "ChartOfCalculationTypesRef");
+	KindMap.Insert("businessprocess", "BusinessProcessRef");
+	KindMap.Insert("task", "TaskRef");
+
+	RefKind = KindMap[Normalized];
+	If RefKind = Undefined Then
+		Raise "Unsupported reference kind: '" + Kind + "'.";
+	EndIf;
+	Return RefKind;
+
+EndFunction
+
+// Render a query result as a GitHub-flavored Markdown table. Streams rows via
+// Select() (never Unload()s the whole result into memory) and stops at one past
+// the effective limit, so a huge result set neither exhausts memory nor floods
+// the inline response. The effective limit is capped by MaxQueryRows().
+&AtServer
+Function QueryResultToMarkdown(Val Executed, Val Limit)
+
+	Columns = Executed.Columns;
+	If Columns.Count() = 0 Then
+		Return "_Query returned no columns._";
+	EndIf;
+
+	EffectiveLimit = Min(Limit, MaxQueryRows());
+
+	Lines = New Array;
+
+	HeaderRow = "|";
+	SeparatorRow = "|";
+	For Each Column In Columns Do
+		HeaderRow = HeaderRow + " " + MarkdownCell(Column.Name) + " |";
+		SeparatorRow = SeparatorRow + " --- |";
+	EndDo;
+	Lines.Add(HeaderRow);
+	Lines.Add(SeparatorRow);
+
+	Selection = Executed.Select();
+	Shown = 0;
+	HasMore = False;
+	While Selection.Next() Do
+		If Shown >= EffectiveLimit Then
+			HasMore = True;
+			Break;
+		EndIf;
+		RowText = "|";
+		For Each Column In Columns Do
+			RowText = RowText + " " + MarkdownCell(String(Selection[Column.Name])) + " |";
+		EndDo;
+		Lines.Add(RowText);
+		Shown = Shown + 1;
+	EndDo;
+
+	Markdown = StrConcat(Lines, Chars.LF);
+
+	If Shown = 0 Then
+		Markdown = Markdown + Chars.LF + Chars.LF + "_Query returned 0 rows._";
+	ElsIf HasMore Then
+		Markdown = Markdown + Chars.LF + Chars.LF
+			+ "_Showing the first " + String(Shown) + " rows (limit " + String(EffectiveLimit) + "); more rows exist._";
+	Else
+		Markdown = Markdown + Chars.LF + Chars.LF + "_" + String(Shown) + " row(s)._";
+	EndIf;
+
+	Return Markdown;
+
+EndFunction
+
+// Hard ceiling on rows rendered inline, regardless of the requested limit.
+&AtServer
+Function MaxQueryRows()
+	Return 1000;
+EndFunction
+
+// Escape a single Markdown table cell: pipes and line breaks would corrupt the
+// table layout.
+&AtServer
+Function MarkdownCell(Val Text)
+
+	Escaped = StrReplace(String(Text), "|", "\|");
+	Escaped = StrReplace(Escaped, Chars.LF, "<br>");
+	Escaped = StrReplace(Escaped, Chars.CR, " ");
+	Return Escaped;
+
+EndFunction
+
+&AtClient
 Procedure HandleEvaluate(RequestID, Arguments)
-	
+
 	Expression = GetArg(Arguments, "expression");
 	If Not ValueIsFilled(Expression) Then
 		SendToolError(RequestID, "Parameter 'expression' is required.");
@@ -3752,6 +4190,156 @@ Function ClientsPayload(Unique)
 	EndDo;
 	Return SegmentsPayload("clients", "clients-catalog", "Clients", Segments);
 EndFunction
+
+// Headless runtime probe for the query / execute tools. Exercises the new
+// server-side and client-side code paths directly and records PASS/FAIL lines
+// in toolselftest-result.txt. None of the assertions touch infobase-specific
+// metadata, so it runs in any file infobase.
+&AtClient
+Procedure RunToolSelfTestDeferred()
+
+	Ctx = New Structure("Log, Pass, Fail", New Array, 0, 0);
+	ToolTestAppend(Ctx, "STARTED " + String(CurrentDate()) + " build=" + BuildVersion());
+
+	// execute — server context
+	Try
+		ToolTestAssertEquals(Ctx, "execute/server", ExecuteCodeOnServer("Result = String(2 + 2);"), "4");
+	Except
+		ToolTestFail(Ctx, "execute/server EXC: " + ErrorDescription());
+	EndTry;
+
+	// execute — client context
+	Try
+		ToolTestAssertEquals(Ctx, "execute/client", ExecuteCodeOnClient("Result = Upper(""abc"");"), "ABC");
+	Except
+		ToolTestFail(Ctx, "execute/client EXC: " + ErrorDescription());
+	EndTry;
+
+	// query — typed parameters rendered to Markdown (no FROM, so metadata-free)
+	Try
+		Params = New Array;
+		Params.Add(New Structure("name, type, value", "N", "Number", 42));
+		Params.Add(New Structure("name, type, value", "S", "String", "a|b"));
+		Params.Add(New Structure("name, type, value", "B", "Boolean", "true"));
+		Params.Add(New Structure("name, type, value", "D", "Date", "2026-01-15"));
+		QR = RunQueryToMarkdown("SELECT &N AS Num, &S AS Str, &B AS Flg, &D AS Dt", Params, 100);
+		If QR.success Then
+			ToolTestAppend(Ctx, "query/markdown ->");
+			ToolTestAppend(Ctx, QR.markdown);
+			ToolTestAssertTrue(Ctx, "query header",      StrFind(QR.markdown, "| Num |") > 0);
+			ToolTestAssertTrue(Ctx, "query pipe-escape", StrFind(QR.markdown, "a\|b") > 0);
+			ToolTestAssertTrue(Ctx, "query row count",   StrFind(QR.markdown, "1 row") > 0);
+		Else
+			ToolTestFail(Ctx, "query/markdown error: " + QR.error);
+		EndIf;
+	Except
+		ToolTestFail(Ctx, "query EXC: " + ErrorDescription());
+	EndTry;
+
+	// query — a broken query must come back as a clean error, not an exception
+	Try
+		BadQR = RunQueryToMarkdown("SELECT FROM NoSuchSource", New Array, 100);
+		ToolTestAssertTrue(Ctx, "query bad handled", (Not BadQR.success) And ValueIsFilled(BadQR.error));
+	Except
+		ToolTestFail(Ctx, "query bad EXC (should have been caught): " + ErrorDescription());
+	EndTry;
+
+	// query — parameters delivered the way MCP actually delivers them: an Array of
+	// Map (parsed JSON) crossing the client/server boundary, plus the JSON-string
+	// fallback parsed by ParseJsonArgument.
+	Try
+		MapParams = New Array;
+		ItemMap = New Map;
+		ItemMap.Insert("name", "N");
+		ItemMap.Insert("type", "Number");
+		ItemMap.Insert("value", 7);
+		MapParams.Add(ItemMap);
+		MapQR = RunQueryToMarkdown("SELECT &N AS Num", MapParams, 100);
+		ToolTestAssertTrue(Ctx, "query Array<Map> params",
+			MapQR.success And StrFind(MapQR.markdown, "| 7 |") > 0);
+
+		JsonParams = ParseJsonArgument("[{""name"":""N"",""type"":""Number"",""value"":9}]", New Array);
+		JsonQR = RunQueryToMarkdown("SELECT &N AS Num", JsonParams, 100);
+		ToolTestAssertTrue(Ctx, "query JSON-string params",
+			JsonQR.success And StrFind(JsonQR.markdown, "| 9 |") > 0);
+	Except
+		ToolTestFail(Ctx, "query Map/JSON params EXC: " + ErrorDescription());
+	EndTry;
+
+	// parameter casting unit checks
+	Try
+		ToolTestAssertTrue(Ctx, "cast Date",   CastQueryParam("2026-01-15", "Date") = Date("20260115"));
+		ToolTestAssertTrue(Ctx, "cast Number", CastQueryParam("12.5", "Number") = 12.5);
+		ToolTestAssertTrue(Ctx, "cast Bool",   CastQueryParam("да", "Булево") = True);
+		ToolTestAssertTrue(Ctx, "cast UUID",
+			TypeOf(CastQueryParam("a1b2c3d4-0000-0000-0000-000000000000", "UUID")) = Type("UUID"));
+	Except
+		ToolTestFail(Ctx, "cast EXC: " + ErrorDescription());
+	EndTry;
+
+	// reference kind mapping — an unknown kind must raise a clean error
+	Try
+		Raised = False;
+		Try
+			RefFromUuid("NoSuchKind.X", "a1b2c3d4-0000-0000-0000-000000000000");
+		Except
+			Raised = True;
+		EndTry;
+		ToolTestAssertTrue(Ctx, "ref unknown-kind raises", Raised);
+	Except
+		ToolTestFail(Ctx, "ref EXC: " + ErrorDescription());
+	EndTry;
+
+	Total = Ctx.Pass + Ctx.Fail;
+	ToolTestAppend(Ctx, "RESULT: " + ?(Ctx.Fail = 0, "PASS", "FAIL")
+		+ " (" + String(Ctx.Pass) + "/" + String(Total) + ")");
+	ToolTestAppend(Ctx, "DONE");
+
+EndProcedure
+
+&AtClient
+Procedure ToolTestAppend(Ctx, Line)
+
+	Ctx.Log.Add(Line);
+	Try
+		IsFirst = (Ctx.Log.Count() = 1);
+		Writer = New TextWriter(SelfTestOutFile("toolselftest-result.txt"), TextEncoding.UTF8, Chars.LF, Not IsFirst);
+		Writer.WriteLine(Line);
+		Writer.Close();
+	Except
+	EndTry;
+
+EndProcedure
+
+&AtClient
+Procedure ToolTestPass(Ctx, Name)
+	Ctx.Pass = Ctx.Pass + 1;
+	ToolTestAppend(Ctx, "PASS: " + Name);
+EndProcedure
+
+&AtClient
+Procedure ToolTestFail(Ctx, Name)
+	Ctx.Fail = Ctx.Fail + 1;
+	ToolTestAppend(Ctx, "FAIL: " + Name);
+EndProcedure
+
+&AtClient
+Procedure ToolTestAssertTrue(Ctx, Name, Condition)
+	If Condition = True Then
+		ToolTestPass(Ctx, Name);
+	Else
+		ToolTestFail(Ctx, Name + " (expected True)");
+	EndIf;
+EndProcedure
+
+&AtClient
+Procedure ToolTestAssertEquals(Ctx, Name, Actual, Expected)
+	If Actual = Expected Then
+		ToolTestPass(Ctx, Name);
+	Else
+		ToolTestFail(Ctx, Name + " (expected '" + String(Expected) + "', got '" + String(Actual) + "')");
+	EndIf;
+EndProcedure
 
 &AtClient
 Procedure SelfTestAppend(Ctx, Line)
